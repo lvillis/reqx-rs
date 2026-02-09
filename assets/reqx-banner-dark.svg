@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">reqx transport banner dark</title>
+  <desc id="desc">Dark theme banner for reqx: SDK request flow, retry core, and TLS transport.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#08101c"/>
+      <stop offset="100%" stop-color="#13263b"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0 L0 0 0 28" fill="none" stroke="#21344e" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="24" markerHeight="24" refX="21" refY="12" orient="auto">
+      <path d="M0 0 L24 12 L0 24 Z" fill="#38bdf8"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="360" fill="url(#bg)"/>
+  <rect width="1200" height="360" fill="url(#grid)" opacity="0.34"/>
+
+  <text x="56" y="74" fill="#e2e8f0" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="54" font-weight="700">reqx</text>
+  <text x="236" y="74" fill="#7dd3fc" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="26" font-weight="500">Resilient HTTP Transport for Rust SDKs</text>
+
+  <rect x="56" y="108" width="320" height="184" rx="20" fill="#0f1e31" stroke="#3b82f6" stroke-width="2"/>
+  <text x="86" y="154" fill="#bfdbfe" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="30" font-weight="650">SDK Request</text>
+  <text x="86" y="188" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Builder + Defaults</text>
+  <text x="86" y="216" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Headers / Query / Body</text>
+  <text x="86" y="244" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Structured Error Codes</text>
+
+  <line x1="388" y1="200" x2="436" y2="200" stroke="url(#flow)" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <rect x="448" y="108" width="304" height="184" rx="20" fill="#0f1e31" stroke="#f59e0b" stroke-width="2"/>
+  <circle cx="600" cy="180" r="62" fill="#0b1628" stroke="#f59e0b" stroke-width="3"/>
+  <circle cx="600" cy="180" r="44" fill="none" stroke="#f59e0b" stroke-width="4.5" stroke-dasharray="96 16" transform="rotate(-18 600 180)"/>
+  <path d="M638 160 L652 180 L624 182 Z" fill="#f59e0b"/>
+  <text x="600" y="187" text-anchor="middle" fill="#fde68a" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="22" font-weight="700">Retry Core</text>
+  <text x="600" y="252" text-anchor="middle" fill="#fcd34d" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="15">adaptive backoff</text>
+  <text x="600" y="272" text-anchor="middle" fill="#fcd34d" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="15">timeout-aware + idempotency-safe</text>
+
+  <line x1="764" y1="200" x2="812" y2="200" stroke="url(#flow)" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <rect x="824" y="108" width="320" height="184" rx="20" fill="#0f1e31" stroke="#22d3ee" stroke-width="2"/>
+  <line x1="1038" y1="124" x2="1038" y2="276" stroke="#164e63" stroke-width="2"/>
+  <text x="848" y="154" fill="#a5f3fc" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="30" font-weight="650">TLS Transport</text>
+  <text x="848" y="188" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">rustls / native-tls</text>
+  <text x="848" y="216" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Custom root CA support</text>
+  <text x="848" y="244" fill="#94a3b8" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Proxy + no_proxy + metrics</text>
+
+  <g>
+    <path d="M1090 130 L1122 142 V198 C1122 224 1109 246 1090 259 C1071 246 1058 224 1058 198 V142 Z" fill="#0a304b" stroke="#22d3ee" stroke-width="2.2" stroke-linejoin="round"/>
+    <path d="M1090 140 L1114 149 V197 C1114 217 1104 234 1090 244 C1076 234 1066 217 1066 197 V149 Z" fill="url(#shield)"/>
+    <rect x="1078" y="184" width="24" height="24" rx="6" ry="6" fill="#e0f2fe"/>
+    <path d="M1083 184 V176 C1083 167 1086 160 1090 160 C1094 160 1097 167 1097 176 V184" fill="none" stroke="#0369a1" stroke-width="3.6" stroke-linecap="round"/>
+    <circle cx="1090" cy="196" r="3" fill="#0369a1"/>
+    <path d="M1090 199 V203" fill="none" stroke="#0369a1" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
+
+  <text x="56" y="336" fill="#93c5fd" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Built for SDK transport concerns: retries, deadlines, proxy behavior, and stable error semantics.</text>
+</svg>

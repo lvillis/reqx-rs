@@ -1,0 +1,847 @@
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use http::Uri;
+use http_body_util::BodyExt;
+use reqx::prelude::{HttpClient, HttpClientError, RetryClassifier, RetryDecision, RetryPolicy};
+
+#[derive(Clone)]
+struct ResponseSpec {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    delay: Duration,
+}
+
+impl ResponseSpec {
+    fn new(
+        status: u16,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+        body: impl Into<Vec<u8>>,
+        delay: Duration,
+    ) -> Self {
+        Self {
+            status,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            body: body.into(),
+            delay,
+        }
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(raw_headers: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(raw_headers);
+    for line in text.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+            && let Ok(parsed) = value.trim().parse::<usize>()
+        {
+            return parsed;
+        }
+    }
+    0
+}
+
+fn read_http_message(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+    let mut raw = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+
+        if let Some(header_end) = find_header_end(&raw) {
+            let content_length = parse_content_length(&raw[..header_end]);
+            let expected_total = header_end + 4 + content_length;
+            if raw.len() >= expected_total {
+                break;
+            }
+        }
+    }
+
+    Ok(raw)
+}
+
+fn write_http_response(stream: &mut TcpStream, response: &ResponseSpec) -> std::io::Result<()> {
+    let mut raw = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        status_text(response.status),
+        response.body.len()
+    )
+    .into_bytes();
+
+    for (name, value) in &response.headers {
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(value.as_bytes());
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(&response.body);
+
+    stream.write_all(&raw)?;
+    stream.flush()
+}
+
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
+struct NeverRetryClassifier;
+
+impl RetryClassifier for NeverRetryClassifier {
+    fn should_retry(&self, _decision: &RetryDecision) -> bool {
+        false
+    }
+}
+
+fn update_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct CountingServer {
+    authority: String,
+    served: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CountingServer {
+    fn start(expected_requests: usize, response: ResponseSpec) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting server");
+        let authority = listener
+            .local_addr()
+            .expect("read local address")
+            .to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let response = Arc::new(response);
+
+        let served_clone = Arc::clone(&served);
+        let active_clone = Arc::clone(&active);
+        let max_active_clone = Arc::clone(&max_active);
+
+        let join = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut workers = Vec::new();
+
+            while Instant::now() < deadline {
+                if served_clone.load(Ordering::SeqCst) >= expected_requests {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let served = Arc::clone(&served_clone);
+                        let active = Arc::clone(&active_clone);
+                        let max_active = Arc::clone(&max_active_clone);
+                        let response = Arc::clone(&response);
+
+                        workers.push(thread::spawn(move || {
+                            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            update_max(&max_active, now_active);
+
+                            if !response.delay.is_zero() {
+                                thread::sleep(response.delay);
+                            }
+
+                            let _ = read_http_message(&mut stream);
+                            let _ = write_http_response(&mut stream, &response);
+
+                            served.fetch_add(1, Ordering::SeqCst);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+
+        Self {
+            authority,
+            served,
+            max_active,
+            join: Some(join),
+        }
+    }
+
+    fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    fn served_count(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CountingServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct ConnectProxyServer {
+    uri: String,
+    tunnel_targets: Arc<Mutex<Vec<String>>>,
+    proxy_authorization_values: Arc<Mutex<Vec<String>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ConnectProxyServer {
+    fn start(expected_tunnels: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy server");
+        let authority = listener
+            .local_addr()
+            .expect("read proxy address")
+            .to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set proxy listener nonblocking");
+
+        let tunnel_targets = Arc::new(Mutex::new(Vec::new()));
+        let proxy_authorization_values = Arc::new(Mutex::new(Vec::new()));
+        let tunnel_targets_clone = Arc::clone(&tunnel_targets);
+        let proxy_authorization_values_clone = Arc::clone(&proxy_authorization_values);
+
+        let join = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut workers = Vec::new();
+            let mut accepted = 0;
+
+            while Instant::now() < deadline && accepted < expected_tunnels {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted += 1;
+                        let tunnel_targets = Arc::clone(&tunnel_targets_clone);
+                        let proxy_authorization_values =
+                            Arc::clone(&proxy_authorization_values_clone);
+                        workers.push(thread::spawn(move || {
+                            handle_proxy_connection(
+                                stream,
+                                tunnel_targets,
+                                proxy_authorization_values,
+                            );
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+
+        Self {
+            uri: format!("http://{authority}"),
+            tunnel_targets,
+            proxy_authorization_values,
+            join: Some(join),
+        }
+    }
+
+    fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn tunnel_targets(&self) -> Vec<String> {
+        lock_unpoisoned(&self.tunnel_targets).clone()
+    }
+
+    fn proxy_authorization_values(&self) -> Vec<String> {
+        lock_unpoisoned(&self.proxy_authorization_values).clone()
+    }
+}
+
+impl Drop for ConnectProxyServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn handle_proxy_connection(
+    mut client: TcpStream,
+    tunnel_targets: Arc<Mutex<Vec<String>>>,
+    proxy_authorization_values: Arc<Mutex<Vec<String>>>,
+) {
+    if let Ok(connect_request) = read_http_message(&mut client)
+        && let Some(header_end) = find_header_end(&connect_request)
+    {
+        let text = String::from_utf8_lossy(&connect_request[..header_end]);
+        for line in text.split("\r\n").skip(1) {
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("proxy-authorization")
+            {
+                lock_unpoisoned(&proxy_authorization_values).push(value.trim().to_owned());
+            }
+        }
+        let mut line_parts = text
+            .split("\r\n")
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        let method = line_parts.next().unwrap_or_default();
+        let authority = line_parts.next().unwrap_or_default().to_owned();
+
+        if method != "CONNECT" || authority.is_empty() {
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return;
+        }
+
+        lock_unpoisoned(&tunnel_targets).push(authority.clone());
+
+        let mut upstream = match TcpStream::connect(&authority) {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
+        };
+
+        let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+        if let Ok(request) = read_http_message(&mut client) {
+            let _ = upstream.write_all(&request);
+            let _ = upstream.flush();
+            if let Ok(response) = read_http_message(&mut upstream) {
+                let _ = client.write_all(&response);
+                let _ = client.flush();
+            }
+        }
+    }
+}
+
+struct RawTcpServer {
+    authority: String,
+    accepted: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl RawTcpServer {
+    fn start(expected_connections: usize, payload: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw server");
+        let authority = listener.local_addr().expect("read raw address").to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set raw listener nonblocking");
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_clone = Arc::clone(&accepted);
+
+        let join = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                if accepted_clone.load(Ordering::SeqCst) >= expected_connections {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted_clone.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(&payload);
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            authority,
+            accepted,
+            join: Some(join),
+        }
+    }
+
+    fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    fn accepted_count(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for RawTcpServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_connect_tunnels_http_request() {
+    let upstream = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            b"proxy-ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let proxy = ConnectProxyServer::start(1);
+
+    let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
+    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+        .http_proxy(proxy_uri)
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let response = client
+        .get("/through-proxy")
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "proxy-ok");
+    assert_eq!(upstream.served_count(), 1);
+
+    let tunnel_targets = proxy.tunnel_targets();
+    assert_eq!(tunnel_targets.len(), 1);
+    assert_eq!(tunnel_targets[0], upstream.authority());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_authorization_header_is_forwarded() {
+    let upstream = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            b"proxy-auth-ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let proxy = ConnectProxyServer::start(1);
+    let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
+
+    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+        .http_proxy(proxy_uri)
+        .try_proxy_authorization("Basic dXNlcjpwYXNz")
+        .expect("valid proxy authorization header")
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let response = client
+        .get("/proxy-auth")
+        .send()
+        .await
+        .expect("request through proxy should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let proxy_auth_values = proxy.proxy_authorization_values();
+    assert_eq!(proxy_auth_values.len(), 1);
+    assert_eq!(proxy_auth_values[0], "Basic dXNlcjpwYXNz");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_proxy_bypasses_proxy_for_matching_host() {
+    let upstream = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            b"direct-ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let proxy = ConnectProxyServer::start(0);
+    let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
+
+    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+        .http_proxy(proxy_uri)
+        .no_proxy(["127.0.0.1"])
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let response = client
+        .get("/no-proxy")
+        .send()
+        .await
+        .expect("request should bypass proxy and succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    assert_eq!(upstream.served_count(), 1);
+    assert!(proxy.tunnel_targets().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_enforces_single_active_request() {
+    let server = CountingServer::start(
+        3,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let cloned = client.clone();
+        tasks.push(tokio::spawn(async move {
+            cloned
+                .get("/slow")
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+        }));
+    }
+
+    for task in tasks {
+        let status = task
+            .await
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(server.served_count(), 3);
+    assert_eq!(server.max_active(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_per_host_limits_each_host_independently() {
+    let server_a = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok-a".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let server_b = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok-b".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+
+    let client = HttpClient::builder(format!("http://{}", server_a.authority()))
+        .max_in_flight_per_host(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+    let server_b_port = server_b
+        .authority()
+        .rsplit(':')
+        .next()
+        .expect("server authority should include port");
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for idx in 0..4 {
+        let cloned = client.clone();
+        let path = if idx % 2 == 0 {
+            "/host-a".to_owned()
+        } else {
+            format!("http://localhost:{server_b_port}/host-b")
+        };
+        tasks.push(tokio::spawn(async move {
+            cloned
+                .get(path)
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+        }));
+    }
+
+    for task in tasks {
+        let status = task
+            .await
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(220));
+    assert!(
+        elapsed < Duration::from_millis(460),
+        "per-host run took too long: {elapsed:?}"
+    );
+
+    assert_eq!(server_a.served_count(), 2);
+    assert_eq!(server_b.served_count(), 2);
+    assert_eq!(server_a.max_active(), 1);
+    assert_eq!(server_b.max_active(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn total_timeout_interrupts_retry_loop_with_retry_after() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            vec![("Retry-After", "1")],
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(80))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(3)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(3))
+                .jitter_ratio(0.0),
+        )
+        .build();
+
+    let error = client
+        .get("/busy")
+        .send()
+        .await
+        .expect_err("total timeout should stop retry loop");
+
+    match error {
+        HttpClientError::DeadlineExceeded { .. } => {}
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    assert_eq!(server.served_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_response_body_limit_returns_specific_error() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .max_response_body_bytes(8)
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let error = client
+        .get("/large")
+        .send()
+        .await
+        .expect_err("response body should exceed max bytes");
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 8);
+            assert!(actual_bytes > limit_bytes);
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_classifier_can_disable_retries() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(3)
+                .retry_classifier(Arc::new(NeverRetryClassifier)),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build();
+
+    let error = client
+        .get("/disabled-retry")
+        .send()
+        .await
+        .expect_err("custom classifier should disable retries");
+    match error {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert_eq!(server.served_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .allow_non_idempotent_retries(true)
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(5))
+                .jitter_ratio(0.0),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build();
+
+    let error = client
+        .post("/post-no-key")
+        .body("payload")
+        .send()
+        .await
+        .expect_err("server always returns 503");
+    match error {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn https_path_returns_transport_error_on_non_tls_server() {
+    let raw_server = RawTcpServer::start(
+        1,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    );
+    let client = HttpClient::builder(format!("https://{}", raw_server.authority()))
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let error = client
+        .get("/tls-required")
+        .send()
+        .await
+        .expect_err("non-tls server should fail https transport");
+
+    match error {
+        HttpClientError::Transport { uri, .. } => {
+            assert!(uri.starts_with("https://"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    assert_eq!(raw_server.accepted_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_stream_downloads_body_without_buffered_send_path() {
+    let payload = b"stream-response-body".to_vec();
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "application/octet-stream")],
+            payload.clone(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/stream-body")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    assert_eq!(streamed.status().as_u16(), 200);
+
+    let collected = streamed
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body collect should succeed");
+    assert_eq!(collected.to_bytes().to_vec(), payload);
+}
