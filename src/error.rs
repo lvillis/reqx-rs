@@ -62,6 +62,10 @@ pub enum HttpClientErrorCode {
     TlsBackendUnavailable,
     TlsBackendInit,
     TlsConfig,
+    MissingRedirectLocation,
+    InvalidRedirectLocation,
+    RedirectLimitExceeded,
+    RedirectBodyNotReplayable,
 }
 
 impl HttpClientErrorCode {
@@ -86,6 +90,10 @@ impl HttpClientErrorCode {
             Self::TlsBackendUnavailable => "tls_backend_unavailable",
             Self::TlsBackendInit => "tls_backend_init",
             Self::TlsConfig => "tls_config",
+            Self::MissingRedirectLocation => "missing_redirect_location",
+            Self::InvalidRedirectLocation => "invalid_redirect_location",
+            Self::RedirectLimitExceeded => "redirect_limit_exceeded",
+            Self::RedirectBodyNotReplayable => "redirect_body_not_replayable",
         }
     }
 }
@@ -196,6 +204,26 @@ pub enum HttpClientError {
         backend: &'static str,
         message: String,
     },
+    #[error("redirect response {status} missing location header for {method} {uri}")]
+    MissingRedirectLocation {
+        status: u16,
+        method: Method,
+        uri: String,
+    },
+    #[error("invalid redirect location {location} for {method} {uri}")]
+    InvalidRedirectLocation {
+        location: String,
+        method: Method,
+        uri: String,
+    },
+    #[error("redirect limit exceeded ({max_redirects}) for {method} {uri}")]
+    RedirectLimitExceeded {
+        max_redirects: usize,
+        method: Method,
+        uri: String,
+    },
+    #[error("cannot follow redirect for non-replayable request body: {method} {uri}")]
+    RedirectBodyNotReplayable { method: Method, uri: String },
 }
 
 impl HttpClientError {
@@ -220,6 +248,12 @@ impl HttpClientError {
             Self::TlsBackendUnavailable { .. } => HttpClientErrorCode::TlsBackendUnavailable,
             Self::TlsBackendInit { .. } => HttpClientErrorCode::TlsBackendInit,
             Self::TlsConfig { .. } => HttpClientErrorCode::TlsConfig,
+            Self::MissingRedirectLocation { .. } => HttpClientErrorCode::MissingRedirectLocation,
+            Self::InvalidRedirectLocation { .. } => HttpClientErrorCode::InvalidRedirectLocation,
+            Self::RedirectLimitExceeded { .. } => HttpClientErrorCode::RedirectLimitExceeded,
+            Self::RedirectBodyNotReplayable { .. } => {
+                HttpClientErrorCode::RedirectBodyNotReplayable
+            }
         }
     }
 }

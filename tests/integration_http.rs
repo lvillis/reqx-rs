@@ -12,8 +12,11 @@ use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
-use http::header::CONTENT_LENGTH;
-use reqx::prelude::{HttpClient, HttpClientError, RetryPolicy, TimeoutPhase};
+use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use reqx::prelude::{
+    HttpClient, HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
+    TimeoutPhase,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -748,4 +751,111 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     );
     assert_eq!(metrics.in_flight, 0);
     assert_eq!(metrics.latency_samples, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_policy_follows_relative_location() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            302,
+            vec![("Location", "/v1/new")],
+            "redirect",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            r#"{"ok":true}"#,
+            Duration::ZERO,
+        ),
+    ]);
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build();
+
+    let body: Value = client
+        .get("/v1/old")
+        .send_json()
+        .await
+        .expect("redirect should be followed");
+    assert_eq!(body["ok"], Value::Bool(true));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/old");
+    assert_eq!(requests[1].path, "/v1/new");
+}
+
+struct HeaderInjectingInterceptor {
+    request_hits: Arc<AtomicUsize>,
+    response_hits: Arc<AtomicUsize>,
+    error_hits: Arc<AtomicUsize>,
+}
+
+impl HttpInterceptor for HeaderInjectingInterceptor {
+    fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
+        self.request_hits.fetch_add(1, Ordering::SeqCst);
+        headers.insert(
+            HeaderName::from_static("x-interceptor"),
+            HeaderValue::from_static("active"),
+        );
+    }
+
+    fn on_response(
+        &self,
+        _context: &RequestContext,
+        _status: http::StatusCode,
+        _headers: &http::HeaderMap,
+    ) {
+        self.response_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_error(&self, _context: &RequestContext, _error: &HttpClientError) {
+        self.error_hits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_can_mutate_headers_and_observe_lifecycle() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+        Duration::ZERO,
+    )]);
+
+    let request_hits = Arc::new(AtomicUsize::new(0));
+    let response_hits = Arc::new(AtomicUsize::new(0));
+    let error_hits = Arc::new(AtomicUsize::new(0));
+    let interceptor = Arc::new(HeaderInjectingInterceptor {
+        request_hits: Arc::clone(&request_hits),
+        response_hits: Arc::clone(&response_hits),
+        error_hits: Arc::clone(&error_hits),
+    });
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .interceptor_arc(interceptor)
+        .build();
+
+    let body: Value = client
+        .get("/v1/interceptor")
+        .send_json()
+        .await
+        .expect("request should succeed");
+    assert_eq!(body["ok"], Value::Bool(true));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/interceptor");
+    assert_eq!(
+        requests[0].headers.get("x-interceptor").map(String::as_str),
+        Some("active")
+    );
+    assert_eq!(request_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(error_hits.load(Ordering::SeqCst), 0);
 }

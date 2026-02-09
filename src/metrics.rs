@@ -203,6 +203,18 @@ impl HttpClientMetrics {
             HttpClientError::TlsConfig { .. } => {
                 self.add_error_count("tls_config".to_owned());
             }
+            HttpClientError::MissingRedirectLocation { .. } => {
+                self.add_error_count("missing_redirect_location".to_owned());
+            }
+            HttpClientError::InvalidRedirectLocation { .. } => {
+                self.add_error_count("invalid_redirect_location".to_owned());
+            }
+            HttpClientError::RedirectLimitExceeded { .. } => {
+                self.add_error_count("redirect_limit_exceeded".to_owned());
+            }
+            HttpClientError::RedirectBodyNotReplayable { .. } => {
+                self.add_error_count("redirect_body_not_replayable".to_owned());
+            }
         }
     }
 

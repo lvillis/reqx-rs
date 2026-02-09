@@ -12,6 +12,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::body::{RequestBody, stream_req_body};
 use crate::client::{HttpClient, RequestExecutionOptions};
+use crate::policy::RedirectPolicy;
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
 use crate::{IDEMPOTENCY_KEY_HEADER, ReqxResult};
@@ -28,6 +29,7 @@ pub struct RequestBuilder<'a> {
     total_timeout: Option<Duration>,
     max_response_body_bytes: Option<usize>,
     retry_policy: Option<RetryPolicy>,
+    redirect_policy: Option<RedirectPolicy>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -43,6 +45,7 @@ impl<'a> RequestBuilder<'a> {
             total_timeout: None,
             max_response_body_bytes: None,
             retry_policy: None,
+            redirect_policy: None,
         }
     }
 
@@ -162,6 +165,11 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
+        self.redirect_policy = Some(redirect_policy);
+        self
+    }
+
     pub async fn send(self) -> ReqxResult<crate::response::HttpResponse> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
@@ -169,6 +177,7 @@ impl<'a> RequestBuilder<'a> {
             total_timeout: self.total_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
+            redirect_policy: self.redirect_policy,
         };
         self.client
             .send_request(
@@ -188,6 +197,7 @@ impl<'a> RequestBuilder<'a> {
             total_timeout: self.total_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
+            redirect_policy: self.redirect_policy,
         };
         self.client
             .send_request_stream(

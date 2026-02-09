@@ -124,10 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - global defaults + per-request overrides
 - idempotency-aware retries
+- bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
+- separate connect timeout (`connect_timeout(...)`)
 - streaming upload and streaming response path
 - buffered-path automatic decoding: `gzip`, `br`, `deflate`, `zstd`
 - proxy support with auth and `no_proxy`
+- interceptor hooks for SDK concerns (`HttpInterceptor`)
 - response body size limit
 - structured error variants + machine error codes
 - metrics snapshot for retries, latency, status and error buckets
@@ -146,6 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `cargo run --example proxy_and_no_proxy`
 - `cargo run --example tls_backends`
 - `cargo run --example custom_ca_mtls`
+- `cargo run --example interceptor_redirect`
 - `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring`
 
 ## Error Model

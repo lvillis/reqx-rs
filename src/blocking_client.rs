@@ -13,6 +13,7 @@ use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::ReqxResult;
 use crate::error::{HttpClientError, TimeoutPhase, TransportErrorKind};
 use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
+use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::response::HttpResponse;
 use crate::retry::{
@@ -22,11 +23,13 @@ use crate::retry::{
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
 use crate::util::{
     append_query_pairs, bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding,
-    merge_headers, parse_header_name, parse_header_value, parse_retry_after, phase_timeout,
-    redact_uri_for_logs, resolve_uri, truncate_body,
+    is_redirect_status, merge_headers, parse_header_name, parse_header_value, parse_retry_after,
+    phase_timeout, redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri,
+    resolve_uri, same_origin, sanitize_headers_for_redirect, truncate_body,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const DEFAULT_POOL_MAX_IDLE_CONNECTIONS: usize = 16;
@@ -326,6 +329,7 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) total_timeout: Option<Duration>,
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) max_response_body_bytes: Option<usize>,
+    pub(crate) redirect_policy: Option<RedirectPolicy>,
 }
 
 enum RequestBody {
@@ -339,6 +343,7 @@ pub struct HttpClientBuilder {
     request_timeout: Duration,
     total_timeout: Option<Duration>,
     max_response_body_bytes: usize,
+    connect_timeout: Duration,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     pool_max_idle_connections: usize,
@@ -347,9 +352,11 @@ pub struct HttpClientBuilder {
     no_proxy_rules: Vec<NoProxyRule>,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
+    redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
     client_name: String,
+    interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
 impl HttpClientBuilder {
@@ -360,6 +367,7 @@ impl HttpClientBuilder {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             total_timeout: None,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
             pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
             pool_max_idle_connections: DEFAULT_POOL_MAX_IDLE_CONNECTIONS,
@@ -368,9 +376,11 @@ impl HttpClientBuilder {
             no_proxy_rules: Vec::new(),
             retry_policy: RetryPolicy::standard(),
             retry_eligibility: Arc::new(StrictRetryEligibility),
+            redirect_policy: RedirectPolicy::none(),
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
+            interceptors: Vec::new(),
         }
     }
 
@@ -386,6 +396,11 @@ impl HttpClientBuilder {
 
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
         self.max_response_body_bytes = max_response_body_bytes.max(1);
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -460,6 +475,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
+        self.redirect_policy = redirect_policy;
+        self
+    }
+
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
         self
@@ -527,6 +547,18 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    pub fn interceptor<I>(self, interceptor: I) -> Self
+    where
+        I: HttpInterceptor + 'static,
+    {
+        self.interceptor_arc(Arc::new(interceptor))
+    }
+
     pub fn try_build(self) -> ReqxResult<HttpClient> {
         if !backend_is_available(self.tls_backend) {
             return Err(HttpClientError::TlsBackendUnavailable {
@@ -578,13 +610,16 @@ impl HttpClientBuilder {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             retry_eligibility: self.retry_eligibility,
+            redirect_policy: self.redirect_policy,
             tls_backend: self.tls_backend,
             transport: TransportAgents {
                 direct,
                 proxy: proxied,
             },
             proxy_config,
+            connect_timeout: self.connect_timeout,
             metrics: HttpClientMetrics::default(),
+            interceptors: self.interceptors,
         })
     }
 
@@ -602,10 +637,13 @@ pub struct HttpClient {
     max_response_body_bytes: usize,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
+    redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     transport: TransportAgents,
     proxy_config: Option<ProxyConfig>,
+    connect_timeout: Duration,
     metrics: HttpClientMetrics,
+    interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
 impl HttpClient {
@@ -643,6 +681,29 @@ impl HttpClient {
 
     pub fn tls_backend(&self) -> TlsBackend {
         self.tls_backend
+    }
+
+    fn run_request_interceptors(&self, context: &RequestContext, headers: &mut HeaderMap) {
+        for interceptor in &self.interceptors {
+            interceptor.on_request(context, headers);
+        }
+    }
+
+    fn run_response_interceptors(
+        &self,
+        context: &RequestContext,
+        status: http::StatusCode,
+        headers: &HeaderMap,
+    ) {
+        for interceptor in &self.interceptors {
+            interceptor.on_response(context, status, headers);
+        }
+    }
+
+    fn run_error_interceptors(&self, context: &RequestContext, error: &HttpClientError) {
+        for interceptor in &self.interceptors {
+            interceptor.on_error(context, error);
+        }
     }
 
     fn select_agent(&self, uri: &Uri) -> (&ureq::Agent, bool) {
@@ -720,6 +781,7 @@ impl HttpClient {
             .configure_request(request)
             .timeout_global(Some(timeout_value))
             .timeout_per_call(Some(timeout_value))
+            .timeout_connect(Some(self.connect_timeout))
             .timeout_recv_response(Some(timeout_value))
             .timeout_recv_body(Some(timeout_value))
             .build();
@@ -812,7 +874,10 @@ impl HttpClient {
         let retry_policy = execution_options
             .retry_policy
             .unwrap_or_else(|| self.retry_policy.clone());
-        let max_attempts = if self
+        let redirect_policy = execution_options
+            .redirect_policy
+            .unwrap_or(self.redirect_policy);
+        let mut max_attempts = if self
             .retry_eligibility
             .supports_retry(&method, &merged_headers)
             && body_replayable
@@ -823,18 +888,36 @@ impl HttpClient {
         };
 
         let request_started_at = Instant::now();
-        let uri_text = uri.to_string();
+        let mut attempt = 1_usize;
+        let mut redirect_count = 0_usize;
+        let mut current_method = method;
+        let mut current_uri = uri;
+        let mut current_redacted_uri = redacted_uri_text;
+        let mut current_headers = merged_headers;
 
-        for attempt in 1..=max_attempts {
+        while attempt <= max_attempts {
             let Some(transport_timeout) =
                 phase_timeout(timeout_value, total_timeout, request_started_at)
             else {
-                return Err(deadline_exceeded_error(
-                    total_timeout,
-                    &method,
-                    &redacted_uri_text,
-                ));
+                let error =
+                    deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
+                let context = RequestContext::new(
+                    current_method.clone(),
+                    current_redacted_uri.clone(),
+                    attempt,
+                    max_attempts,
+                    redirect_count,
+                );
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
             };
+            let context = RequestContext::new(
+                current_method.clone(),
+                current_redacted_uri.clone(),
+                attempt,
+                max_attempts,
+                redirect_count,
+            );
 
             let request_body = if let Some(body) = &buffered_body {
                 RequestBody::Buffered(body.clone())
@@ -844,12 +927,15 @@ impl HttpClient {
                     None => RequestBody::Buffered(Bytes::new()),
                 }
             };
+            let mut attempt_headers = current_headers.clone();
+            self.run_request_interceptors(&context, &mut attempt_headers);
+            let current_uri_text = current_uri.to_string();
 
             let mut response = match self.run_once(
-                method.clone(),
-                &uri,
-                &uri_text,
-                &merged_headers,
+                current_method.clone(),
+                &current_uri,
+                &current_uri_text,
+                &attempt_headers,
                 request_body,
                 transport_timeout,
             ) {
@@ -859,8 +945,8 @@ impl HttpClient {
                         HttpClientError::Transport { kind, .. } => RetryDecision {
                             attempt,
                             max_attempts,
-                            method: method.clone(),
-                            uri: redacted_uri_text.clone(),
+                            method: current_method.clone(),
+                            uri: current_redacted_uri.clone(),
                             status: None,
                             transport_error_kind: Some(*kind),
                             timeout_phase: None,
@@ -869,8 +955,8 @@ impl HttpClient {
                         HttpClientError::Timeout { phase, .. } => RetryDecision {
                             attempt,
                             max_attempts,
-                            method: method.clone(),
-                            uri: redacted_uri_text.clone(),
+                            method: current_method.clone(),
+                            uri: current_redacted_uri.clone(),
                             status: None,
                             transport_error_kind: None,
                             timeout_phase: Some(*phase),
@@ -887,35 +973,109 @@ impl HttpClient {
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
                         else {
-                            return Err(deadline_exceeded_error(
+                            let error = deadline_exceeded_error(
                                 total_timeout,
-                                &method,
-                                &redacted_uri_text,
-                            ));
+                                &current_method,
+                                &current_redacted_uri,
+                            );
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
                         };
                         self.metrics.record_retry();
                         if !retry_delay.is_zero() {
                             sleep(retry_delay);
                         }
+                        attempt += 1;
                         continue;
                     }
+                    self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
             };
 
             let status = response.status();
             let mut response_headers = response.headers().clone();
+            if redirect_policy.enabled() && is_redirect_status(status) {
+                if redirect_count >= redirect_policy.max_redirects() {
+                    let error = HttpClientError::RedirectLimitExceeded {
+                        max_redirects: redirect_policy.max_redirects(),
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
+                    };
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+                if !body_replayable
+                    && !matches!(
+                        current_method,
+                        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+                    )
+                {
+                    let error = HttpClientError::RedirectBodyNotReplayable {
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
+                    };
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+                let Some(location) = redirect_location(&response_headers) else {
+                    let error = HttpClientError::MissingRedirectLocation {
+                        status: status.as_u16(),
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
+                    };
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                };
+                let Some(next_uri) = resolve_redirect_uri(&current_uri, &location) else {
+                    let error = HttpClientError::InvalidRedirectLocation {
+                        location,
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
+                    };
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                };
+                self.run_response_interceptors(&context, status, &response_headers);
+                let next_method = redirect_method(&current_method, status);
+                let method_changed_to_get =
+                    next_method == Method::GET && current_method != Method::GET;
+                let same_origin_redirect = same_origin(&current_uri, &next_uri);
+                sanitize_headers_for_redirect(
+                    &mut current_headers,
+                    method_changed_to_get,
+                    same_origin_redirect,
+                );
+                if method_changed_to_get {
+                    reader_body = None;
+                }
+                current_method = next_method;
+                current_uri = next_uri;
+                current_redacted_uri = redact_uri_for_logs(&current_uri.to_string());
+                redirect_count += 1;
+                if max_attempts == 1
+                    && body_replayable
+                    && self
+                        .retry_eligibility
+                        .supports_retry(&current_method, &current_headers)
+                {
+                    max_attempts = retry_policy.max_attempts_value();
+                }
+                continue;
+            }
 
             let response_body = match read_all_body_limited(&mut response, max_response_body_bytes)
             {
                 Ok(body) => body,
                 Err(ReadBodyError::TooLarge { actual_bytes }) => {
-                    return Err(HttpClientError::ResponseBodyTooLarge {
+                    let error = HttpClientError::ResponseBodyTooLarge {
                         limit_bytes: max_response_body_bytes,
                         actual_bytes,
-                        method: method.clone(),
-                        uri: redacted_uri_text.clone(),
-                    });
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
+                    };
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
                 }
                 Err(ReadBodyError::Read(source)) => {
                     if let Some(ureq_error) = wrapped_ureq_error(&source) {
@@ -924,14 +1084,14 @@ impl HttpClient {
                             let error = HttpClientError::Timeout {
                                 phase: timeout_phase,
                                 timeout_ms: transport_timeout.as_millis(),
-                                method: method.clone(),
-                                uri: redacted_uri_text.clone(),
+                                method: current_method.clone(),
+                                uri: current_redacted_uri.clone(),
                             };
                             let retry_decision = RetryDecision {
                                 attempt,
                                 max_attempts,
-                                method: method.clone(),
-                                uri: redacted_uri_text.clone(),
+                                method: current_method.clone(),
+                                uri: current_redacted_uri.clone(),
                                 status: None,
                                 transport_error_kind: None,
                                 timeout_phase: Some(timeout_phase),
@@ -946,18 +1106,22 @@ impl HttpClient {
                                     total_timeout,
                                     request_started_at,
                                 ) else {
-                                    return Err(deadline_exceeded_error(
+                                    let error = deadline_exceeded_error(
                                         total_timeout,
-                                        &method,
-                                        &redacted_uri_text,
-                                    ));
+                                        &current_method,
+                                        &current_redacted_uri,
+                                    );
+                                    self.run_error_interceptors(&context, &error);
+                                    return Err(error);
                                 };
                                 self.metrics.record_retry();
                                 if !retry_delay.is_zero() {
                                     sleep(retry_delay);
                                 }
+                                attempt += 1;
                                 continue;
                             }
+                            self.run_error_interceptors(&context, &error);
                             return Err(error);
                         }
 
@@ -967,12 +1131,14 @@ impl HttpClient {
                             feature = "blocking-tls-native"
                         ))]
                         if let ureq::Error::Decompress(encoding, decode_error) = ureq_error {
-                            return Err(decode_content_encoding_error(
+                            let error = decode_content_encoding_error(
                                 encoding.to_string(),
                                 decode_error.to_string(),
-                                &method,
-                                &redacted_uri_text,
-                            ));
+                                &current_method,
+                                &current_redacted_uri,
+                            );
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
                         }
                     }
 
@@ -982,8 +1148,8 @@ impl HttpClient {
                     let retry_decision = RetryDecision {
                         attempt,
                         max_attempts,
-                        method: method.clone(),
-                        uri: redacted_uri_text.clone(),
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.clone(),
                         status: None,
                         transport_error_kind: None,
                         timeout_phase: None,
@@ -995,18 +1161,22 @@ impl HttpClient {
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
                         else {
-                            return Err(deadline_exceeded_error(
+                            let error = deadline_exceeded_error(
                                 total_timeout,
-                                &method,
-                                &redacted_uri_text,
-                            ));
+                                &current_method,
+                                &current_redacted_uri,
+                            );
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
                         };
                         self.metrics.record_retry();
                         if !retry_delay.is_zero() {
                             sleep(retry_delay);
                         }
+                        attempt += 1;
                         continue;
                     }
+                    self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
             };
@@ -1014,19 +1184,20 @@ impl HttpClient {
             if response_headers.contains_key(CONTENT_ENCODING) {
                 remove_content_encoding_headers(&mut response_headers);
             }
+            self.run_response_interceptors(&context, status, &response_headers);
 
             if !status.is_success() {
                 let error = HttpClientError::HttpStatus {
                     status: status.as_u16(),
-                    method: method.clone(),
-                    uri: redacted_uri_text.clone(),
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
                     body: truncate_body(&response_body),
                 };
                 let retry_decision = RetryDecision {
                     attempt,
                     max_attempts,
-                    method: method.clone(),
-                    uri: redacted_uri_text.clone(),
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
                     status: Some(status),
                     transport_error_kind: None,
                     timeout_phase: None,
@@ -1039,30 +1210,39 @@ impl HttpClient {
                     let Some(retry_delay) =
                         bounded_retry_delay(retry_delay, total_timeout, request_started_at)
                     else {
-                        return Err(deadline_exceeded_error(
+                        let error = deadline_exceeded_error(
                             total_timeout,
-                            &method,
-                            &redacted_uri_text,
-                        ));
+                            &current_method,
+                            &current_redacted_uri,
+                        );
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
                     };
                     self.metrics.record_retry();
                     if !retry_delay.is_zero() {
                         sleep(retry_delay);
                     }
+                    attempt += 1;
                     continue;
                 }
 
+                self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
 
             return Ok(HttpResponse::new(status, response_headers, response_body));
         }
 
-        Err(deadline_exceeded_error(
-            total_timeout,
-            &method,
-            &redacted_uri_text,
-        ))
+        let error = deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
+        let context = RequestContext::new(
+            current_method,
+            current_redacted_uri,
+            attempt,
+            max_attempts,
+            redirect_count,
+        );
+        self.run_error_interceptors(&context, &error);
+        Err(error)
     }
 }
 
@@ -1078,6 +1258,7 @@ pub struct RequestBuilder<'a> {
     total_timeout: Option<Duration>,
     max_response_body_bytes: Option<usize>,
     retry_policy: Option<RetryPolicy>,
+    redirect_policy: Option<RedirectPolicy>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -1093,6 +1274,7 @@ impl<'a> RequestBuilder<'a> {
             total_timeout: None,
             max_response_body_bytes: None,
             retry_policy: None,
+            redirect_policy: None,
         }
     }
 
@@ -1204,6 +1386,11 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
+        self.redirect_policy = Some(redirect_policy);
+        self
+    }
+
     pub fn send(self) -> ReqxResult<HttpResponse> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
@@ -1211,6 +1398,7 @@ impl<'a> RequestBuilder<'a> {
             total_timeout: self.total_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
+            redirect_policy: self.redirect_policy,
         };
         self.client.send_request(
             self.method,

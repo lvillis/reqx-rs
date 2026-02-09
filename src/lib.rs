@@ -83,6 +83,7 @@ mod error;
 #[cfg(feature = "_async")]
 mod limiters;
 mod metrics;
+mod policy;
 mod proxy;
 #[cfg(feature = "_async")]
 mod request;
@@ -100,6 +101,7 @@ pub use crate::blocking_client::{
 pub use crate::client::{HttpClient, HttpClientBuilder};
 pub use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
+pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::response::HttpResponse;
@@ -126,9 +128,10 @@ pub mod prelude {
     #[cfg(feature = "_async")]
     pub use crate::{HttpClient, HttpResponseStream};
     pub use crate::{
-        HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot, HttpResponse,
-        PermissiveRetryEligibility, ReqxResult, RetryClassifier, RetryDecision, RetryEligibility,
-        RetryPolicy, StrictRetryEligibility, TimeoutPhase, TlsBackend, TransportErrorKind,
+        HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot, HttpInterceptor,
+        HttpResponse, PermissiveRetryEligibility, RedirectPolicy, RequestContext, ReqxResult,
+        RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility,
+        TimeoutPhase, TlsBackend, TransportErrorKind,
     };
 }
 

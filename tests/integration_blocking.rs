@@ -8,8 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
-use reqx::prelude::{HttpClientError, RetryPolicy};
+use reqx::prelude::{
+    HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
+};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -321,4 +324,102 @@ fn blocking_response_body_limit_returns_specific_error() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn blocking_redirect_policy_follows_relative_location() {
+    let server = MockServer::start(vec![
+        MockResponse::new(302, vec![("Location", "/v1/new")], b"redirect".to_vec()),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+    ]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build();
+
+    let body: Value = client
+        .get("/v1/old")
+        .send_json()
+        .expect("redirect should be followed");
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/old");
+    assert_eq!(requests[1].path, "/v1/new");
+}
+
+struct BlockingHeaderInterceptor {
+    request_hits: Arc<AtomicUsize>,
+    response_hits: Arc<AtomicUsize>,
+    error_hits: Arc<AtomicUsize>,
+}
+
+impl HttpInterceptor for BlockingHeaderInterceptor {
+    fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
+        self.request_hits.fetch_add(1, Ordering::SeqCst);
+        headers.insert(
+            HeaderName::from_static("x-interceptor"),
+            HeaderValue::from_static("active"),
+        );
+    }
+
+    fn on_response(
+        &self,
+        _context: &RequestContext,
+        _status: http::StatusCode,
+        _headers: &http::HeaderMap,
+    ) {
+        self.response_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_error(&self, _context: &RequestContext, _error: &HttpClientError) {
+        self.error_hits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn blocking_interceptor_can_mutate_headers_and_observe_lifecycle() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        br#"{"ok":true}"#.to_vec(),
+    )]);
+
+    let request_hits = Arc::new(AtomicUsize::new(0));
+    let response_hits = Arc::new(AtomicUsize::new(0));
+    let error_hits = Arc::new(AtomicUsize::new(0));
+    let interceptor = Arc::new(BlockingHeaderInterceptor {
+        request_hits: Arc::clone(&request_hits),
+        response_hits: Arc::clone(&response_hits),
+        error_hits: Arc::clone(&error_hits),
+    });
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .interceptor_arc(interceptor)
+        .build();
+
+    let body: Value = client
+        .get("/v1/interceptor")
+        .send_json()
+        .expect("request should succeed");
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/interceptor");
+    assert_eq!(
+        requests[0].headers.get("x-interceptor").map(String::as_str),
+        Some("active")
+    );
+    assert_eq!(request_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(error_hits.load(Ordering::SeqCst), 0);
 }

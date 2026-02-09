@@ -1,8 +1,11 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use http::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, RETRY_AFTER};
-use http::{HeaderMap, Method, Uri};
+use http::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName, HeaderValue,
+    LOCATION, RETRY_AFTER,
+};
+use http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::error::HttpClientError;
 #[cfg(feature = "_async")]
@@ -261,6 +264,77 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<
     match date.duration_since(now) {
         Ok(duration) => Some(duration),
         Err(_) => Some(Duration::ZERO),
+    }
+}
+
+pub(crate) fn is_redirect_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+pub(crate) fn redirect_method(method: &Method, status: StatusCode) -> Method {
+    match status {
+        StatusCode::SEE_OTHER => Method::GET,
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => Method::GET,
+        _ => method.clone(),
+    }
+}
+
+pub(crate) fn redirect_location(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn default_port(uri: &Uri) -> Option<u16> {
+    uri.port_u16().or_else(|| match uri.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    })
+}
+
+pub(crate) fn same_origin(left: &Uri, right: &Uri) -> bool {
+    let left_scheme = left.scheme_str().unwrap_or_default();
+    let right_scheme = right.scheme_str().unwrap_or_default();
+    if !left_scheme.eq_ignore_ascii_case(right_scheme) {
+        return false;
+    }
+
+    let left_host = left.host().unwrap_or_default();
+    let right_host = right.host().unwrap_or_default();
+    if !left_host.eq_ignore_ascii_case(right_host) {
+        return false;
+    }
+
+    default_port(left) == default_port(right)
+}
+
+pub(crate) fn resolve_redirect_uri(current_uri: &Uri, location: &str) -> Option<Uri> {
+    let base = url::Url::parse(&current_uri.to_string()).ok()?;
+    let joined = base.join(location).ok()?;
+    joined.as_str().parse().ok()
+}
+
+pub(crate) fn sanitize_headers_for_redirect(
+    headers: &mut HeaderMap,
+    method_changed_to_get: bool,
+    same_origin_redirect: bool,
+) {
+    if method_changed_to_get {
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(CONTENT_TYPE);
+    }
+    if !same_origin_redirect {
+        headers.remove(AUTHORIZATION);
+        headers.remove(COOKIE);
     }
 }
 

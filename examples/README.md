@@ -21,7 +21,8 @@ cargo run --example <name>
 9. `proxy_and_no_proxy` - Proxy routing and bypass rules.
 10. `tls_backends` - Runtime TLS backend selection.
 11. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
-12. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
+12. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
+13. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
 
 ## Example Index
 
@@ -38,6 +39,7 @@ cargo run --example <name>
 | `proxy_and_no_proxy.rs` | Configure proxy auth and `no_proxy` rules           | `cargo run --example proxy_and_no_proxy` |
 | `tls_backends.rs`       | Choose TLS backend based on enabled features        | `cargo run --example tls_backends`       |
 | `custom_ca_mtls.rs`     | Configure custom CA trust and mTLS client identity  | `cargo run --example custom_ca_mtls`     |
+| `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy      | `cargo run --example interceptor_redirect` |
 | `blocking_basic.rs`     | Blocking request flow with sync transport           | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
 
 ## Feature-Specific TLS Runs

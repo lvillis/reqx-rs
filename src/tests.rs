@@ -228,6 +228,17 @@ fn error_code_maps_tls_config_variant() {
 }
 
 #[test]
+fn error_code_maps_redirect_limit_exceeded_variant() {
+    let error = HttpClientError::RedirectLimitExceeded {
+        max_redirects: 3,
+        method: http::Method::GET,
+        uri: "https://example.com/a".to_owned(),
+    };
+    assert_eq!(error.code(), HttpClientErrorCode::RedirectLimitExceeded);
+    assert_eq!(error.code().as_str(), "redirect_limit_exceeded");
+}
+
+#[test]
 fn invalid_tls_root_ca_pem_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_ca_pem("not-a-pem-certificate")

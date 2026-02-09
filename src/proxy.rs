@@ -6,6 +6,8 @@ use std::future::Future;
 use std::pin::Pin;
 #[cfg(feature = "_async")]
 use std::task::{Context, Poll};
+#[cfg(feature = "_async")]
+use std::time::Duration;
 
 use http::Uri;
 use http::header::HeaderValue;
@@ -101,9 +103,10 @@ pub(crate) struct ProxyConnector {
 
 #[cfg(feature = "_async")]
 impl ProxyConnector {
-    pub(crate) fn new(proxy_config: Option<ProxyConfig>) -> Self {
+    pub(crate) fn new(proxy_config: Option<ProxyConfig>, connect_timeout: Duration) -> Self {
         let mut direct = HttpConnector::new();
         direct.enforce_http(false);
+        direct.set_connect_timeout(Some(connect_timeout));
         let proxy = proxy_config.map(|config| {
             let mut tunnel = Tunnel::new(config.uri, direct.clone());
             if let Some(authorization) = config.authorization {
