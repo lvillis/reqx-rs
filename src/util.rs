@@ -4,7 +4,9 @@ use std::time::{Duration, Instant, SystemTime};
 use http::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, RETRY_AFTER};
 use http::{HeaderMap, Method, Uri};
 
-use crate::error::{HttpClientError, TransportErrorKind};
+use crate::error::HttpClientError;
+#[cfg(feature = "_async")]
+use crate::error::TransportErrorKind;
 
 const MAX_ERROR_BODY_LEN: usize = 2048;
 
@@ -138,6 +140,7 @@ fn build_query_string(existing: &[(String, String)], appended: &[(String, String
     serializer.finish()
 }
 
+#[cfg(feature = "_async")]
 pub(crate) fn classify_transport_error(
     error: &hyper_util::client::legacy::Error,
 ) -> TransportErrorKind {

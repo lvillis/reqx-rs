@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
-use hyper::body::Incoming;
 use serde::de::DeserializeOwned;
 
 use crate::ReqxResult;
@@ -50,31 +49,40 @@ impl HttpResponse {
     }
 }
 
-#[derive(Debug)]
-pub struct HttpResponseStream {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Incoming,
-}
+#[cfg(feature = "_async")]
+mod stream {
+    use http::{HeaderMap, StatusCode};
+    use hyper::body::Incoming;
 
-impl HttpResponseStream {
-    pub(crate) fn new(status: StatusCode, headers: HeaderMap, body: Incoming) -> Self {
-        Self {
-            status,
-            headers,
-            body,
+    #[derive(Debug)]
+    pub struct HttpResponseStream {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Incoming,
+    }
+
+    impl HttpResponseStream {
+        pub(crate) fn new(status: StatusCode, headers: HeaderMap, body: Incoming) -> Self {
+            Self {
+                status,
+                headers,
+                body,
+            }
+        }
+
+        pub fn status(&self) -> StatusCode {
+            self.status
+        }
+
+        pub fn headers(&self) -> &HeaderMap {
+            &self.headers
+        }
+
+        pub fn into_body(self) -> Incoming {
+            self.body
         }
     }
-
-    pub fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    pub fn headers(&self) -> &HeaderMap {
-        &self.headers
-    }
-
-    pub fn into_body(self) -> Incoming {
-        self.body
-    }
 }
+
+#[cfg(feature = "_async")]
+pub use stream::HttpResponseStream;

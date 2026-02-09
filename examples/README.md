@@ -20,6 +20,8 @@ cargo run --example <name>
 8. `retry_classifier` - Custom `RetryClassifier`.
 9. `proxy_and_no_proxy` - Proxy routing and bypass rules.
 10. `tls_backends` - Runtime TLS backend selection.
+11. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
+12. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
 
 ## Example Index
 
@@ -35,17 +37,25 @@ cargo run --example <name>
 | `retry_classifier.rs`   | Plug in custom retry classifier logic               | `cargo run --example retry_classifier`   |
 | `proxy_and_no_proxy.rs` | Configure proxy auth and `no_proxy` rules           | `cargo run --example proxy_and_no_proxy` |
 | `tls_backends.rs`       | Choose TLS backend based on enabled features        | `cargo run --example tls_backends`       |
+| `custom_ca_mtls.rs`     | Configure custom CA trust and mTLS client identity  | `cargo run --example custom_ca_mtls`     |
+| `blocking_basic.rs`     | Blocking request flow with sync transport           | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
 
 ## Feature-Specific TLS Runs
 
 Use `native-tls`:
 
 ```bash
-cargo run --example tls_backends --no-default-features -F tls-native
+cargo run --example tls_backends --no-default-features -F async-tls-native
 ```
 
 Use `rustls + aws-lc-rs`:
 
 ```bash
-cargo run --example tls_backends --no-default-features -F tls-rustls-aws-lc-rs
+cargo run --example tls_backends --no-default-features -F async-tls-rustls-aws-lc-rs
+```
+
+Use blocking sync client (`ureq + rustls`):
+
+```bash
+cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring
 ```

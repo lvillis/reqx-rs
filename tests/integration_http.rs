@@ -1,3 +1,5 @@
+#![cfg(feature = "_async")]
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

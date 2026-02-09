@@ -1,6 +1,8 @@
 use http::Method;
 use thiserror::Error;
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TransportErrorKind {
     Dns,
@@ -59,6 +61,7 @@ pub enum HttpClientErrorCode {
     ConcurrencyLimitClosed,
     TlsBackendUnavailable,
     TlsBackendInit,
+    TlsConfig,
 }
 
 impl HttpClientErrorCode {
@@ -82,6 +85,7 @@ impl HttpClientErrorCode {
             Self::ConcurrencyLimitClosed => "concurrency_limit_closed",
             Self::TlsBackendUnavailable => "tls_backend_unavailable",
             Self::TlsBackendInit => "tls_backend_init",
+            Self::TlsConfig => "tls_config",
         }
     }
 }
@@ -117,7 +121,7 @@ pub enum HttpClientError {
         method: Method,
         uri: String,
         #[source]
-        source: hyper_util::client::legacy::Error,
+        source: BoxError,
     },
     #[error("http request timed out in {phase} after {timeout_ms}ms for {method} {uri}")]
     Timeout {
@@ -135,7 +139,7 @@ pub enum HttpClientError {
     #[error("failed to read response body: {source}")]
     ReadBody {
         #[source]
-        source: hyper::Error,
+        source: BoxError,
     },
     #[error(
         "response body too large ({actual_bytes} bytes > {limit_bytes} bytes) for {method} {uri}"
@@ -180,10 +184,15 @@ pub enum HttpClientError {
     },
     #[error("request concurrency limiter is closed")]
     ConcurrencyLimitClosed,
-    #[error("requested tls backend is not enabled: {backend}; enable matching Cargo feature")]
+    #[error("requested tls backend is not enabled in this build: {backend}")]
     TlsBackendUnavailable { backend: &'static str },
     #[error("failed to initialize tls backend {backend}: {message}")]
     TlsBackendInit {
+        backend: &'static str,
+        message: String,
+    },
+    #[error("invalid tls configuration for backend {backend}: {message}")]
+    TlsConfig {
         backend: &'static str,
         message: String,
     },
@@ -210,6 +219,7 @@ impl HttpClientError {
             Self::ConcurrencyLimitClosed => HttpClientErrorCode::ConcurrencyLimitClosed,
             Self::TlsBackendUnavailable { .. } => HttpClientErrorCode::TlsBackendUnavailable,
             Self::TlsBackendInit { .. } => HttpClientErrorCode::TlsBackendInit,
+            Self::TlsConfig { .. } => HttpClientErrorCode::TlsConfig,
         }
     }
 }

@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 //! `reqx` is an internal HTTP transport crate for API SDKs with HTTP/1.1 + HTTP/2 support.
 //!
 //! # Quick Start
@@ -44,48 +46,91 @@
 //! - Set both request timeout and total timeout.
 //! - For `POST` retries, always set `idempotency_key(...)`.
 
+#[cfg(not(any(feature = "_async", feature = "_blocking")))]
+compile_error!(
+    "reqx requires at least one transport feature: enable an `async-tls-*` or `blocking-tls-*` feature"
+);
+
 #[cfg(all(
-    not(feature = "tls-rustls-ring"),
-    not(feature = "tls-rustls-aws-lc-rs"),
-    not(feature = "tls-native")
+    feature = "_async",
+    not(feature = "async-tls-rustls-ring"),
+    not(feature = "async-tls-rustls-aws-lc-rs"),
+    not(feature = "async-tls-native")
 ))]
 compile_error!(
-    "reqx requires one TLS backend feature: enable `tls-rustls-ring`, `tls-rustls-aws-lc-rs`, or `tls-native`"
+    "async transport requires one async TLS backend: enable `async-tls-rustls-ring`, `async-tls-rustls-aws-lc-rs`, or `async-tls-native`"
+);
+
+#[cfg(all(
+    feature = "_blocking",
+    not(feature = "blocking-tls-rustls-ring"),
+    not(feature = "blocking-tls-rustls-aws-lc-rs"),
+    not(feature = "blocking-tls-native")
+))]
+compile_error!(
+    "blocking transport requires one blocking TLS backend: enable `blocking-tls-rustls-ring`, `blocking-tls-rustls-aws-lc-rs`, or `blocking-tls-native`"
 );
 
 pub(crate) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
+#[cfg(feature = "_blocking")]
+mod blocking_client;
+#[cfg(feature = "_async")]
 mod body;
+#[cfg(feature = "_async")]
 mod client;
 mod error;
+#[cfg(feature = "_async")]
 mod limiters;
 mod metrics;
 mod proxy;
+#[cfg(feature = "_async")]
 mod request;
 mod response;
 mod retry;
+mod tls;
 mod util;
 
-pub use crate::client::{HttpClient, HttpClientBuilder, TlsBackend};
+#[cfg(feature = "_blocking")]
+pub use crate::blocking_client::{
+    HttpClient as BlockingHttpClient, HttpClientBuilder as BlockingHttpClientBuilder,
+    RequestBuilder as BlockingRequestBuilder,
+};
+#[cfg(feature = "_async")]
+pub use crate::client::{HttpClient, HttpClientBuilder};
 pub use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
+#[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
-pub use crate::response::{HttpResponse, HttpResponseStream};
+pub use crate::response::HttpResponse;
+#[cfg(feature = "_async")]
+pub use crate::response::HttpResponseStream;
 pub use crate::retry::{
     PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
 };
+pub use crate::tls::TlsBackend;
+
+#[cfg(feature = "_blocking")]
+pub mod blocking {
+    pub use crate::blocking_client::{HttpClient, HttpClientBuilder, RequestBuilder};
+}
 
 pub type ReqxResult<T> = std::result::Result<T, HttpClientError>;
 
 pub mod prelude {
+    #[cfg(feature = "_blocking")]
     pub use crate::{
-        HttpClient, HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot, HttpResponse,
-        HttpResponseStream, PermissiveRetryEligibility, ReqxResult, RetryClassifier, RetryDecision,
-        RetryEligibility, RetryPolicy, StrictRetryEligibility, TimeoutPhase, TlsBackend,
-        TransportErrorKind,
+        BlockingHttpClient, BlockingHttpClientBuilder, BlockingRequestBuilder, blocking,
+    };
+    #[cfg(feature = "_async")]
+    pub use crate::{HttpClient, HttpResponseStream};
+    pub use crate::{
+        HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot, HttpResponse,
+        PermissiveRetryEligibility, ReqxResult, RetryClassifier, RetryDecision, RetryEligibility,
+        RetryPolicy, StrictRetryEligibility, TimeoutPhase, TlsBackend, TransportErrorKind,
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_async"))]
 mod tests;

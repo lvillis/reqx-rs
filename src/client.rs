@@ -5,21 +5,24 @@ use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, Response, Uri};
 use hyper::body::Incoming;
 #[cfg(any(
-    feature = "tls-native",
-    feature = "tls-rustls-ring",
-    feature = "tls-rustls-aws-lc-rs"
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
 ))]
 use hyper_util::client::legacy::Client;
 #[cfg(any(
-    feature = "tls-native",
-    feature = "tls-rustls-ring",
-    feature = "tls-rustls-aws-lc-rs"
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
 ))]
 use hyper_util::rt::TokioExecutor;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info_span, warn};
 
-#[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc-rs"))]
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 use hyper_rustls::HttpsConnectorBuilder;
 
 use crate::ReqxResult;
@@ -31,9 +34,9 @@ use crate::error::{HttpClientError, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
 use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
 #[cfg(any(
-    feature = "tls-native",
-    feature = "tls-rustls-ring",
-    feature = "tls-rustls-aws-lc-rs"
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
 ))]
 use crate::proxy::ProxyConnector;
 use crate::proxy::{NoProxyRule, ProxyConfig};
@@ -43,6 +46,7 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
 };
+use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error, ensure_accept_encoding,
     merge_headers, parse_header_name, parse_header_value, parse_retry_after, phase_timeout,
@@ -55,36 +59,22 @@ const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const DEFAULT_CLIENT_NAME: &str = "reqx";
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TlsBackend {
-    RustlsRing,
-    RustlsAwsLcRs,
-    NativeTls,
-}
-
-impl TlsBackend {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RustlsRing => "tls-rustls-ring",
-            Self::RustlsAwsLcRs => "tls-rustls-aws-lc-rs",
-            Self::NativeTls => "tls-native",
-        }
-    }
-}
-
 const fn default_tls_backend() -> TlsBackend {
-    #[cfg(feature = "tls-rustls-ring")]
+    #[cfg(feature = "async-tls-rustls-ring")]
     {
         return TlsBackend::RustlsRing;
     }
-    #[cfg(all(not(feature = "tls-rustls-ring"), feature = "tls-rustls-aws-lc-rs"))]
+    #[cfg(all(
+        not(feature = "async-tls-rustls-ring"),
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
     {
         return TlsBackend::RustlsAwsLcRs;
     }
     #[cfg(all(
-        not(feature = "tls-rustls-ring"),
-        not(feature = "tls-rustls-aws-lc-rs"),
-        feature = "tls-native"
+        not(feature = "async-tls-rustls-ring"),
+        not(feature = "async-tls-rustls-aws-lc-rs"),
+        feature = "async-tls-native"
     ))]
     {
         return TlsBackend::NativeTls;
@@ -93,21 +83,180 @@ const fn default_tls_backend() -> TlsBackend {
     TlsBackend::RustlsRing
 }
 
-#[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc-rs"))]
+#[cfg(feature = "async-tls-native")]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(feature = "async-tls-native")]
+fn extract_pem_certificate_blocks(pem_bundle: &[u8]) -> Vec<Vec<u8>> {
+    const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
+
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(begin_offset) = find_subslice(&pem_bundle[cursor..], PEM_BEGIN) {
+        let begin = cursor + begin_offset;
+        let end_search_start = begin + PEM_BEGIN.len();
+        let Some(end_offset) = find_subslice(&pem_bundle[end_search_start..], PEM_END) else {
+            break;
+        };
+        let end = end_search_start + end_offset + PEM_END.len();
+        let mut block_end = end;
+        while block_end < pem_bundle.len()
+            && (pem_bundle[block_end] == b'\n' || pem_bundle[block_end] == b'\r')
+        {
+            block_end += 1;
+        }
+        blocks.push(pem_bundle[begin..block_end].to_vec());
+        cursor = block_end;
+    }
+
+    blocks
+}
+
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+fn build_rustls_tls_config(
+    tls_backend: TlsBackend,
+    provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
+    tls_options: &TlsOptions,
+) -> ReqxResult<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+
+    let mut root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for certificate in &tls_options.root_certificates {
+        match certificate {
+            TlsRootCertificate::Pem(pem) => {
+                let mut parsed = Vec::new();
+                for item in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
+                    let certificate = item.map_err(|source| {
+                        tls_config_error(
+                            tls_backend,
+                            format!("failed to parse PEM root certificate: {source}"),
+                        )
+                    })?;
+                    parsed.push(certificate);
+                }
+                if parsed.is_empty() {
+                    return Err(tls_config_error(
+                        tls_backend,
+                        "no certificate blocks found in PEM root certificate",
+                    ));
+                }
+                let (added, _ignored) = root_store.add_parsable_certificates(parsed);
+                if added == 0 {
+                    return Err(tls_config_error(
+                        tls_backend,
+                        "failed to parse PEM root certificate(s)",
+                    ));
+                }
+            }
+            TlsRootCertificate::Der(der) => {
+                root_store
+                    .add(rustls::pki_types::CertificateDer::from(der.clone()))
+                    .map_err(|source| {
+                        tls_config_error(
+                            tls_backend,
+                            format!("failed to add DER root certificate: {source}"),
+                        )
+                    })?;
+            }
+        }
+    }
+
+    let config_builder = rustls::ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .map_err(|source| HttpClientError::TlsBackendInit {
+            backend: tls_backend.as_str(),
+            message: source.to_string(),
+        })?
+        .with_root_certificates(root_store);
+
+    match &tls_options.client_identity {
+        None => Ok(config_builder.with_no_client_auth()),
+        Some(TlsClientIdentity::Pem {
+            cert_chain_pem,
+            private_key_pem,
+        }) => {
+            let mut cert_chain = Vec::new();
+            for item in rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem) {
+                let certificate = item.map_err(|source| {
+                    tls_config_error(
+                        tls_backend,
+                        format!("failed to parse mTLS certificate chain PEM: {source}"),
+                    )
+                })?;
+                cert_chain.push(certificate);
+            }
+            if cert_chain.is_empty() {
+                return Err(tls_config_error(
+                    tls_backend,
+                    "mTLS certificate chain PEM is empty or invalid",
+                ));
+            }
+            let private_key = rustls::pki_types::PrivateKeyDer::from_pem_slice(private_key_pem)
+                .map_err(|source| {
+                    tls_config_error(
+                        tls_backend,
+                        format!("failed to parse mTLS private key PEM: {source}"),
+                    )
+                })?;
+            config_builder
+                .with_client_auth_cert(cert_chain, private_key)
+                .map_err(|source| {
+                    tls_config_error(
+                        tls_backend,
+                        format!("failed to configure mTLS identity: {source}"),
+                    )
+                })
+        }
+        Some(TlsClientIdentity::Pkcs12 {
+            identity_der,
+            password,
+        }) => Err(tls_config_error(
+            tls_backend,
+            format!(
+                "PKCS#12 identity is unsupported for rustls backends; use PEM cert+key (pkcs12_bytes={}, password_len={})",
+                identity_der.len(),
+                password.len()
+            ),
+        )),
+    }
+}
+
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 type RustlsHttpsConnector = hyper_rustls::HttpsConnector<ProxyConnector>;
-#[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc-rs"))]
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 type RustlsHyperClient = Client<RustlsHttpsConnector, ReqBody>;
 
-#[cfg(feature = "tls-native")]
+#[cfg(feature = "async-tls-native")]
 type NativeHttpsConnector = hyper_tls::HttpsConnector<ProxyConnector>;
-#[cfg(feature = "tls-native")]
+#[cfg(feature = "async-tls-native")]
 type NativeHyperClient = Client<NativeHttpsConnector, ReqBody>;
 
 #[derive(Clone)]
 enum TransportClient {
-    #[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc-rs"))]
+    #[cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
     Rustls(RustlsHyperClient),
-    #[cfg(feature = "tls-native")]
+    #[cfg(feature = "async-tls-native")]
     Native(NativeHyperClient),
 }
 
@@ -117,21 +266,24 @@ impl TransportClient {
         request: Request<ReqBody>,
     ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
         #[cfg(not(any(
-            feature = "tls-native",
-            feature = "tls-rustls-ring",
-            feature = "tls-rustls-aws-lc-rs"
+            feature = "async-tls-native",
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs"
         )))]
         let _ = &request;
 
         match self {
-            #[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc-rs"))]
+            #[cfg(any(
+                feature = "async-tls-rustls-ring",
+                feature = "async-tls-rustls-aws-lc-rs"
+            ))]
             Self::Rustls(client) => client.request(request).await,
-            #[cfg(feature = "tls-native")]
+            #[cfg(feature = "async-tls-native")]
             Self::Native(client) => client.request(request).await,
             #[cfg(not(any(
-                feature = "tls-native",
-                feature = "tls-rustls-ring",
-                feature = "tls-rustls-aws-lc-rs"
+                feature = "async-tls-native",
+                feature = "async-tls-rustls-ring",
+                feature = "async-tls-rustls-aws-lc-rs"
             )))]
             _ => unreachable!("no TLS transport backend is compiled"),
         }
@@ -162,20 +314,22 @@ fn remove_content_encoding_headers(headers: &mut HeaderMap) {
     headers.remove(CONTENT_LENGTH);
 }
 
-#[cfg(feature = "tls-rustls-ring")]
+#[cfg(feature = "async-tls-rustls-ring")]
 fn build_rustls_ring_transport(
     proxy_config: Option<ProxyConfig>,
+    tls_options: &TlsOptions,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
 ) -> ReqxResult<TransportClient> {
     let connector = ProxyConnector::new(proxy_config);
+    let tls_config = build_rustls_tls_config(
+        TlsBackend::RustlsRing,
+        rustls::crypto::ring::default_provider(),
+        tls_options,
+    )?;
     let https = HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
-        .map_err(|source| HttpClientError::TlsBackendInit {
-            backend: TlsBackend::RustlsRing.as_str(),
-            message: source.to_string(),
-        })?
+        .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
@@ -188,9 +342,10 @@ fn build_rustls_ring_transport(
     Ok(TransportClient::Rustls(transport))
 }
 
-#[cfg(not(feature = "tls-rustls-ring"))]
+#[cfg(not(feature = "async-tls-rustls-ring"))]
 fn build_rustls_ring_transport(
     _proxy_config: Option<ProxyConfig>,
+    _tls_options: &TlsOptions,
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
@@ -200,20 +355,22 @@ fn build_rustls_ring_transport(
     })
 }
 
-#[cfg(feature = "tls-rustls-aws-lc-rs")]
+#[cfg(feature = "async-tls-rustls-aws-lc-rs")]
 fn build_rustls_aws_lc_rs_transport(
     proxy_config: Option<ProxyConfig>,
+    tls_options: &TlsOptions,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
 ) -> ReqxResult<TransportClient> {
     let connector = ProxyConnector::new(proxy_config);
+    let tls_config = build_rustls_tls_config(
+        TlsBackend::RustlsAwsLcRs,
+        rustls::crypto::aws_lc_rs::default_provider(),
+        tls_options,
+    )?;
     let https = HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|source| HttpClientError::TlsBackendInit {
-            backend: TlsBackend::RustlsAwsLcRs.as_str(),
-            message: source.to_string(),
-        })?
+        .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
@@ -226,9 +383,10 @@ fn build_rustls_aws_lc_rs_transport(
     Ok(TransportClient::Rustls(transport))
 }
 
-#[cfg(not(feature = "tls-rustls-aws-lc-rs"))]
+#[cfg(not(feature = "async-tls-rustls-aws-lc-rs"))]
 fn build_rustls_aws_lc_rs_transport(
     _proxy_config: Option<ProxyConfig>,
+    _tls_options: &TlsOptions,
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
@@ -238,15 +396,98 @@ fn build_rustls_aws_lc_rs_transport(
     })
 }
 
-#[cfg(feature = "tls-native")]
+#[cfg(feature = "async-tls-native")]
+fn build_native_tls_connector(
+    tls_options: &TlsOptions,
+) -> ReqxResult<hyper_tls::native_tls::TlsConnector> {
+    let mut connector_builder = hyper_tls::native_tls::TlsConnector::builder();
+
+    for certificate in &tls_options.root_certificates {
+        match certificate {
+            TlsRootCertificate::Pem(pem) => {
+                let certificate_blocks = extract_pem_certificate_blocks(pem);
+                if certificate_blocks.is_empty() {
+                    return Err(tls_config_error(
+                        TlsBackend::NativeTls,
+                        "no certificate blocks found in PEM root certificate",
+                    ));
+                }
+                for certificate_block in certificate_blocks {
+                    let certificate = hyper_tls::native_tls::Certificate::from_pem(
+                        &certificate_block,
+                    )
+                    .map_err(|source| {
+                        tls_config_error(
+                            TlsBackend::NativeTls,
+                            format!("failed to parse PEM root certificate: {source}"),
+                        )
+                    })?;
+                    connector_builder.add_root_certificate(certificate);
+                }
+            }
+            TlsRootCertificate::Der(der) => {
+                let certificate =
+                    hyper_tls::native_tls::Certificate::from_der(der).map_err(|source| {
+                        tls_config_error(
+                            TlsBackend::NativeTls,
+                            format!("failed to parse DER root certificate: {source}"),
+                        )
+                    })?;
+                connector_builder.add_root_certificate(certificate);
+            }
+        }
+    }
+
+    if let Some(identity) = &tls_options.client_identity {
+        let identity = match identity {
+            TlsClientIdentity::Pem {
+                cert_chain_pem,
+                private_key_pem,
+            } => hyper_tls::native_tls::Identity::from_pkcs8(cert_chain_pem, private_key_pem)
+                .map_err(|source| {
+                    tls_config_error(
+                        TlsBackend::NativeTls,
+                        format!("failed to parse PKCS#8 mTLS identity: {source}"),
+                    )
+                })?,
+            TlsClientIdentity::Pkcs12 {
+                identity_der,
+                password,
+            } => hyper_tls::native_tls::Identity::from_pkcs12(identity_der, password).map_err(
+                |source| {
+                    tls_config_error(
+                        TlsBackend::NativeTls,
+                        format!("failed to parse PKCS#12 mTLS identity: {source}"),
+                    )
+                },
+            )?,
+        };
+        connector_builder.identity(identity);
+    }
+
+    connector_builder
+        .build()
+        .map_err(|source| HttpClientError::TlsBackendInit {
+            backend: TlsBackend::NativeTls.as_str(),
+            message: source.to_string(),
+        })
+}
+
+#[cfg(feature = "async-tls-native")]
 fn build_native_tls_transport(
     proxy_config: Option<ProxyConfig>,
+    tls_options: &TlsOptions,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
 ) -> ReqxResult<TransportClient> {
     let connector = ProxyConnector::new(proxy_config);
-    let https = hyper_tls::HttpsConnector::new_with_connector(connector);
+    let https = if tls_options.has_customizations() {
+        let tls_connector = build_native_tls_connector(tls_options)?;
+        hyper_tls::HttpsConnector::from((connector, tls_connector.into()))
+    } else {
+        hyper_tls::HttpsConnector::new_with_connector(connector)
+    };
     let transport = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(pool_idle_timeout)
         .pool_max_idle_per_host(pool_max_idle_per_host)
@@ -255,9 +496,10 @@ fn build_native_tls_transport(
     Ok(TransportClient::Native(transport))
 }
 
-#[cfg(not(feature = "tls-native"))]
+#[cfg(not(feature = "async-tls-native"))]
 fn build_native_tls_transport(
     _proxy_config: Option<ProxyConfig>,
+    _tls_options: &TlsOptions,
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
@@ -270,6 +512,7 @@ fn build_native_tls_transport(
 fn build_transport_client(
     tls_backend: TlsBackend,
     proxy_config: Option<ProxyConfig>,
+    tls_options: &TlsOptions,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
@@ -277,18 +520,21 @@ fn build_transport_client(
     match tls_backend {
         TlsBackend::RustlsRing => build_rustls_ring_transport(
             proxy_config,
+            tls_options,
             pool_idle_timeout,
             pool_max_idle_per_host,
             http2_only,
         ),
         TlsBackend::RustlsAwsLcRs => build_rustls_aws_lc_rs_transport(
             proxy_config,
+            tls_options,
             pool_idle_timeout,
             pool_max_idle_per_host,
             http2_only,
         ),
         TlsBackend::NativeTls => build_native_tls_transport(
             proxy_config,
+            tls_options,
             pool_idle_timeout,
             pool_max_idle_per_host,
             http2_only,
@@ -318,6 +564,7 @@ pub struct HttpClientBuilder {
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
     tls_backend: TlsBackend,
+    tls_options: TlsOptions,
     client_name: String,
     max_in_flight: Option<usize>,
     max_in_flight_per_host: Option<usize>,
@@ -340,6 +587,7 @@ impl HttpClientBuilder {
             retry_policy: RetryPolicy::standard(),
             retry_eligibility: Arc::new(StrictRetryEligibility),
             tls_backend: default_tls_backend(),
+            tls_options: TlsOptions::default(),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             max_in_flight: None,
             max_in_flight_per_host: None,
@@ -437,6 +685,54 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
+        self.tls_options
+            .root_certificates
+            .push(TlsRootCertificate::Pem(certificate_pem.into()));
+        self
+    }
+
+    pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
+        self.tls_options
+            .root_certificates
+            .push(TlsRootCertificate::Der(certificate_der.into()));
+        self
+    }
+
+    pub fn clear_tls_root_cas(mut self) -> Self {
+        self.tls_options.root_certificates.clear();
+        self
+    }
+
+    pub fn tls_client_identity_pem(
+        mut self,
+        cert_chain_pem: impl Into<Vec<u8>>,
+        private_key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.tls_options.client_identity = Some(TlsClientIdentity::Pem {
+            cert_chain_pem: cert_chain_pem.into(),
+            private_key_pem: private_key_pem.into(),
+        });
+        self
+    }
+
+    pub fn tls_client_identity_pkcs12(
+        mut self,
+        identity_der: impl Into<Vec<u8>>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.tls_options.client_identity = Some(TlsClientIdentity::Pkcs12 {
+            identity_der: identity_der.into(),
+            password: password.into(),
+        });
+        self
+    }
+
+    pub fn clear_tls_client_identity(mut self) -> Self {
+        self.tls_options.client_identity = None;
+        self
+    }
+
     pub fn allow_non_idempotent_retries(mut self, allow: bool) -> Self {
         self.retry_eligibility = if allow {
             Arc::new(PermissiveRetryEligibility)
@@ -470,6 +766,7 @@ impl HttpClientBuilder {
         let transport = build_transport_client(
             self.tls_backend,
             proxy_config,
+            &self.tls_options,
             self.pool_idle_timeout,
             self.pool_max_idle_per_host,
             self.http2_only,
@@ -734,7 +1031,7 @@ impl HttpClient {
                         kind,
                         method: method.clone(),
                         uri: redacted_uri_text.clone(),
-                        source,
+                        source: Box::new(source),
                     };
                     let retry_decision = RetryDecision {
                         attempt,
@@ -826,7 +1123,9 @@ impl HttpClient {
                 {
                     Ok(Ok(body)) => body,
                     Ok(Err(ReadBodyError::Read(source))) => {
-                        return Err(HttpClientError::ReadBody { source });
+                        return Err(HttpClientError::ReadBody {
+                            source: Box::new(source),
+                        });
                     }
                     Ok(Err(ReadBodyError::TooLarge { actual_bytes })) => {
                         return Err(HttpClientError::ResponseBodyTooLarge {
@@ -978,7 +1277,7 @@ impl HttpClient {
                         kind,
                         method: method.clone(),
                         uri: redacted_uri_text.clone(),
-                        source,
+                        source: Box::new(source),
                     };
                     let retry_decision = RetryDecision {
                         attempt,
@@ -1078,7 +1377,9 @@ impl HttpClient {
             {
                 Ok(Ok(body)) => body,
                 Ok(Err(ReadBodyError::Read(source))) => {
-                    let error = HttpClientError::ReadBody { source };
+                    let error = HttpClientError::ReadBody {
+                        source: Box::new(source),
+                    };
                     let retry_decision = RetryDecision {
                         attempt,
                         max_attempts,

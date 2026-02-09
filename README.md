@@ -24,22 +24,43 @@ cargo add reqx
 Use `native-tls`:
 
 ```bash
-cargo add reqx --no-default-features -F tls-native
+cargo add reqx --no-default-features -F async-tls-native
 ```
 
 Use `rustls + aws-lc-rs`:
 
 ```bash
-cargo add reqx --no-default-features -F tls-rustls-aws-lc-rs
+cargo add reqx --no-default-features -F async-tls-rustls-aws-lc-rs
+```
+
+Use blocking client with `ureq + rustls(ring)`:
+
+```bash
+cargo add reqx --no-default-features -F blocking-tls-rustls-ring
+```
+
+Use blocking client with `ureq + native-tls`:
+
+```bash
+cargo add reqx --no-default-features -F blocking-tls-native
 ```
 
 ## TLS Backends
 
-- default: `rustls + ring` (`tls-rustls-ring`)
-- optional: `rustls + aws-lc-rs` (`tls-rustls-aws-lc-rs`)
-- optional: `native-tls` (`tls-native`)
+- async backends (default mode):
+  - `async-tls-rustls-ring` (default)
+  - `async-tls-rustls-aws-lc-rs`
+  - `async-tls-native`
+- blocking backends (`ureq`):
+  - `blocking-tls-rustls-ring`
+  - `blocking-tls-rustls-aws-lc-rs`
+  - `blocking-tls-native`
 - runtime selection via `tls_backend(TlsBackend::...)`
 - build-time mismatch returns structured error from `try_build()`
+- custom root CA: `tls_root_ca_pem(...)` / `tls_root_ca_der(...)`
+- mTLS identity:
+  - PEM chain + key: `tls_client_identity_pem(...)` (async + sync)
+  - PKCS#12: `tls_client_identity_pkcs12(...)` (async `async-tls-native`)
 
 ## Quick Start
 
@@ -80,6 +101,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Blocking Quick Start
+
+```rust
+use std::time::Duration;
+
+use reqx::blocking::HttpClient;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = HttpClient::builder("https://api.example.com")
+        .request_timeout(Duration::from_secs(3))
+        .total_timeout(Duration::from_secs(8))
+        .build();
+
+    let response = client.get("/v1/items").send()?;
+    println!("status={}", response.status());
+    Ok(())
+}
+```
+
 ## Core Capabilities
 
 - global defaults + per-request overrides
@@ -105,6 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `cargo run --example retry_classifier`
 - `cargo run --example proxy_and_no_proxy`
 - `cargo run --example tls_backends`
+- `cargo run --example custom_ca_mtls`
+- `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring`
 
 ## Error Model
 

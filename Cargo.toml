@@ -24,37 +24,72 @@ include = [
 ]
 
 [features]
-default = ["tls-rustls-ring"]
-tls-rustls-ring = ["dep:hyper-rustls", "dep:rustls", "hyper-rustls/ring", "rustls/ring"]
-tls-rustls-aws-lc-rs = [
+default = ["async-tls-rustls-ring"]
+_async = [
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower-service",
+]
+_blocking = ["dep:ureq"]
+async-tls-rustls-aws-lc-rs = [
+    "_async",
     "dep:hyper-rustls",
     "dep:rustls",
+    "dep:webpki-roots",
     "hyper-rustls/aws-lc-rs",
     "rustls/aws_lc_rs",
 ]
-tls-native = ["dep:hyper-tls", "hyper-tls/alpn"]
+async-tls-rustls-ring = [
+    "_async",
+    "dep:hyper-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "hyper-rustls/ring",
+    "rustls/ring",
+]
+async-tls-native = ["_async", "dep:hyper-tls", "hyper-tls/alpn"]
+blocking-tls-rustls-ring = ["_blocking", "ureq/rustls", "ureq/gzip", "ureq/brotli"]
+blocking-tls-rustls-aws-lc-rs = [
+    "_blocking",
+    "dep:rustls",
+    "ureq/rustls-no-provider",
+    "ureq/rustls-webpki-roots",
+    "ureq/gzip",
+    "ureq/brotli",
+    "rustls/aws_lc_rs",
+]
+blocking-tls-native = ["_blocking", "ureq/native-tls", "ureq/gzip", "ureq/brotli"]
 
 [dependencies]
 # Async runtime and stream primitives.
-tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.18", default-features = false, features = ["io"] }
-futures-core = { version = "0.3.31", default-features = false, features = ["alloc", "std"] }
-futures-util = { version = "0.3.31", default-features = false, features = ["alloc", "std"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+tokio-util = { version = "0.7.18", default-features = false, features = ["io"], optional = true }
+futures-core = { version = "0.3.31", default-features = false, features = ["alloc", "std"], optional = true }
+futures-util = { version = "0.3.31", default-features = false, features = ["alloc", "std"], optional = true }
 bytes = { version = "1.11.1", default-features = false, features = ["std"] }
 
 # HTTP stack.
 http = { version = "1.4.0", default-features = false, features = ["std"] }
-http-body-util = { version = "0.1.3", default-features = false }
+http-body-util = { version = "0.1.3", default-features = false, optional = true }
 httpdate = { version = "1.0.3", default-features = false }
-hyper = { version = "1.8.1", default-features = false, features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1.20", default-features = false, features = ["client", "client-legacy", "client-proxy", "http1", "http2", "tokio"] }
-tower-service = { version = "0.3.3", default-features = false }
+hyper = { version = "1.8.1", default-features = false, features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1.20", default-features = false, features = ["client", "client-legacy", "client-proxy", "http1", "http2", "tokio"], optional = true }
+tower-service = { version = "0.3.3", default-features = false, optional = true }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 # TLS backends (feature-gated).
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
 rustls = { version = "0.23.36", default-features = false, features = ["std"], optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
+
+# Blocking transport backend (feature-gated).
+ureq = { version = "3.2.0", default-features = false, optional = true }
 
 # Serialization helpers.
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
@@ -78,6 +113,11 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 [[bench]]
 name = "transport"
 harness = false
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["async-tls-rustls-ring", "blocking-tls-rustls-ring"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.release]
 push = true

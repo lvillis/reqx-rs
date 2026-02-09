@@ -17,8 +17,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: rust / ubuntu-latest / 1.93.0
+  quality:
+    name: quality / ubuntu-latest / 1.93.0
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -42,3 +42,41 @@ jobs:
 
       - name: Run CI checks
         run: just ci
+
+  feature-matrix:
+    name: feature-matrix / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: async-rustls-ring
+            command: cargo test --locked --tests --no-default-features --features async-tls-rustls-ring
+          - name: async-rustls-aws-lc-rs
+            command: cargo check --locked --lib --tests --no-default-features --features async-tls-rustls-aws-lc-rs
+          - name: async-native
+            command: cargo check --locked --lib --tests --no-default-features --features async-tls-native
+          - name: blocking-rustls-ring
+            command: cargo test --locked --tests --no-default-features --features blocking-tls-rustls-ring
+          - name: blocking-rustls-aws-lc-rs
+            command: cargo check --locked --lib --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
+          - name: blocking-native
+            command: cargo check --locked --lib --tests --no-default-features --features blocking-tls-native
+          - name: hybrid-async-and-blocking
+            command: cargo check --locked --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run feature profile
+        run: ${{ matrix.command }}

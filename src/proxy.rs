@@ -1,15 +1,23 @@
+#[cfg(feature = "_async")]
 use std::error::Error as StdError;
+#[cfg(feature = "_async")]
 use std::future::Future;
+#[cfg(feature = "_async")]
 use std::pin::Pin;
+#[cfg(feature = "_async")]
 use std::task::{Context, Poll};
 
 use http::Uri;
 use http::header::HeaderValue;
+#[cfg(feature = "_async")]
 use hyper_util::client::legacy::connect::HttpConnector;
+#[cfg(feature = "_async")]
 use hyper_util::client::legacy::connect::proxy::Tunnel;
+#[cfg(feature = "_async")]
 use tower_service::Service;
 use url::Url;
 
+#[cfg(feature = "_async")]
 pub(crate) type BoxConnectError = Box<dyn StdError + Send + Sync>;
 
 #[derive(Clone)]
@@ -65,11 +73,13 @@ impl NoProxyRule {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "_async")]
 struct ProxyRuntime {
     tunnel: Tunnel<HttpConnector>,
     no_proxy_rules: Vec<NoProxyRule>,
 }
 
+#[cfg(feature = "_async")]
 impl ProxyRuntime {
     fn should_bypass_proxy(&self, uri: &Uri) -> bool {
         let Some(host) = uri.host() else {
@@ -83,11 +93,13 @@ impl ProxyRuntime {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "_async")]
 pub(crate) struct ProxyConnector {
     direct: HttpConnector,
     proxy: Option<ProxyRuntime>,
 }
 
+#[cfg(feature = "_async")]
 impl ProxyConnector {
     pub(crate) fn new(proxy_config: Option<ProxyConfig>) -> Self {
         let mut direct = HttpConnector::new();
@@ -106,6 +118,7 @@ impl ProxyConnector {
     }
 }
 
+#[cfg(feature = "_async")]
 impl Service<Uri> for ProxyConnector {
     type Response = <HttpConnector as Service<Uri>>::Response;
     type Error = BoxConnectError;
@@ -155,6 +168,7 @@ impl Service<Uri> for ProxyConnector {
     }
 }
 
+#[cfg(feature = "_async")]
 pub(crate) fn normalize_tunnel_target_uri(dst: Uri) -> Uri {
     if dst.port().is_some() {
         return dst;

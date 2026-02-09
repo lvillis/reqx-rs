@@ -1,3 +1,5 @@
+#![cfg(feature = "_async")]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -660,7 +662,7 @@ async fn total_timeout_interrupts_retry_loop_with_retry_after() {
 
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
-        .total_timeout(Duration::from_millis(80))
+        .total_timeout(Duration::from_millis(300))
         .retry_policy(
             RetryPolicy::standard()
                 .max_attempts(3)

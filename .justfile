@@ -42,10 +42,12 @@ private-guard:
 ci: private-guard fmt-check check-all examples-all clippy test
 
 package:
-    cargo package
+    cargo package --locked
 
 publish-dry-run:
-    cargo publish --dry-run
+    cargo publish --dry-run --locked
+
+release-check: ci package publish-dry-run
 
 changelog:
     git cliff -o CHANGELOG.md

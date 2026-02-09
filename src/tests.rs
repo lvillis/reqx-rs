@@ -6,11 +6,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::body::decode_content_encoded_body;
-use crate::client::{HttpClient, TlsBackend};
+use crate::client::HttpClient;
 use crate::error::{HttpClientError, HttpClientErrorCode};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
 use crate::response::HttpResponse;
 use crate::retry::{RetryPolicy, request_supports_retry};
+use crate::tls::TlsBackend;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, ensure_accept_encoding, join_base_path,
     parse_retry_after, redact_uri_for_logs, resolve_uri,
@@ -217,6 +218,84 @@ fn error_code_maps_expected_variant() {
 }
 
 #[test]
+fn error_code_maps_tls_config_variant() {
+    let error = HttpClientError::TlsConfig {
+        backend: "native-tls",
+        message: "bad cert".to_owned(),
+    };
+    assert_eq!(error.code(), HttpClientErrorCode::TlsConfig);
+    assert_eq!(error.code().as_str(), "tls_config");
+}
+
+#[test]
+fn invalid_tls_root_ca_pem_returns_tls_config_error() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_ca_pem("not-a-pem-certificate")
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("invalid root ca pem should fail"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::TlsConfig { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn rustls_backend_rejects_pkcs12_identity_configuration() {
+    #[cfg(feature = "async-tls-rustls-ring")]
+    let backend = Some(TlsBackend::RustlsRing);
+    #[cfg(all(
+        not(feature = "async-tls-rustls-ring"),
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
+    let backend = Some(TlsBackend::RustlsAwsLcRs);
+    #[cfg(all(
+        not(feature = "async-tls-rustls-ring"),
+        not(feature = "async-tls-rustls-aws-lc-rs")
+    ))]
+    let backend: Option<TlsBackend> = None;
+
+    let Some(backend) = backend else {
+        return;
+    };
+
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_backend(backend)
+        .tls_client_identity_pkcs12(vec![0x30, 0x82], "secret")
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("rustls should reject pkcs12 identity"),
+        Err(error) => error,
+    };
+
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("PKCS#12 identity"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "async-tls-native")]
+#[test]
+fn native_tls_invalid_pkcs12_identity_returns_tls_config_error() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_backend(TlsBackend::NativeTls)
+        .tls_client_identity_pkcs12(vec![1, 2, 3, 4], "secret")
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("invalid native tls identity should fail"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::TlsConfig { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn no_proxy_rule_matches_domain_and_subdomain() {
     let rule = NoProxyRule::parse(".example.com").expect("valid rule");
     assert!(rule.matches("example.com"));
@@ -267,7 +346,7 @@ fn decode_content_encoded_body_rejects_unknown_encoding() {
     assert_eq!(error.0, "x-custom");
 }
 
-#[cfg(feature = "tls-rustls-ring")]
+#[cfg(feature = "async-tls-rustls-ring")]
 #[test]
 fn selecting_rustls_ring_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
@@ -277,13 +356,16 @@ fn selecting_rustls_ring_backend_builds_when_feature_enabled() {
     assert_eq!(client.tls_backend(), TlsBackend::RustlsRing);
 }
 
-#[cfg(not(feature = "tls-rustls-ring"))]
+#[cfg(not(feature = "async-tls-rustls-ring"))]
 #[test]
 fn selecting_rustls_ring_backend_returns_unavailable_when_feature_disabled() {
-    let error = HttpClient::builder("https://api.example.com")
+    let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsRing)
-        .try_build()
-        .expect_err("rustls ring backend should be unavailable when feature is disabled");
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("rustls ring backend should be unavailable when feature is disabled"),
+        Err(error) => error,
+    };
     match error {
         HttpClientError::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::RustlsRing.as_str());
@@ -292,7 +374,7 @@ fn selecting_rustls_ring_backend_returns_unavailable_when_feature_disabled() {
     }
 }
 
-#[cfg(feature = "tls-rustls-aws-lc-rs")]
+#[cfg(feature = "async-tls-rustls-aws-lc-rs")]
 #[test]
 fn selecting_rustls_aws_lc_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
@@ -302,13 +384,16 @@ fn selecting_rustls_aws_lc_backend_builds_when_feature_enabled() {
     assert_eq!(client.tls_backend(), TlsBackend::RustlsAwsLcRs);
 }
 
-#[cfg(not(feature = "tls-rustls-aws-lc-rs"))]
+#[cfg(not(feature = "async-tls-rustls-aws-lc-rs"))]
 #[test]
 fn selecting_rustls_aws_lc_backend_returns_unavailable_when_feature_disabled() {
-    let error = HttpClient::builder("https://api.example.com")
+    let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsAwsLcRs)
-        .try_build()
-        .expect_err("rustls aws-lc-rs backend should be unavailable when feature is disabled");
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("rustls aws-lc-rs backend should be unavailable when feature is disabled"),
+        Err(error) => error,
+    };
     match error {
         HttpClientError::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::RustlsAwsLcRs.as_str());
@@ -317,7 +402,7 @@ fn selecting_rustls_aws_lc_backend_returns_unavailable_when_feature_disabled() {
     }
 }
 
-#[cfg(feature = "tls-native")]
+#[cfg(feature = "async-tls-native")]
 #[test]
 fn selecting_native_tls_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
@@ -327,13 +412,16 @@ fn selecting_native_tls_backend_builds_when_feature_enabled() {
     assert_eq!(client.tls_backend(), TlsBackend::NativeTls);
 }
 
-#[cfg(not(feature = "tls-native"))]
+#[cfg(not(feature = "async-tls-native"))]
 #[test]
 fn selecting_native_tls_backend_returns_unavailable_when_feature_disabled() {
-    let error = HttpClient::builder("https://api.example.com")
+    let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::NativeTls)
-        .try_build()
-        .expect_err("native tls backend should be unavailable when feature is disabled");
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("native tls backend should be unavailable when feature is disabled"),
+        Err(error) => error,
+    };
     match error {
         HttpClientError::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::NativeTls.as_str());

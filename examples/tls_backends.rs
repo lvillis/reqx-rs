@@ -8,20 +8,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_name("reqx-example-tls")
         .request_timeout(Duration::from_secs(3));
 
-    #[cfg(feature = "tls-native")]
+    #[cfg(feature = "async-tls-native")]
     {
         builder = builder.tls_backend(TlsBackend::NativeTls);
     }
 
-    #[cfg(all(not(feature = "tls-native"), feature = "tls-rustls-aws-lc-rs"))]
+    #[cfg(all(
+        not(feature = "async-tls-native"),
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
     {
         builder = builder.tls_backend(TlsBackend::RustlsAwsLcRs);
     }
 
     #[cfg(all(
-        not(feature = "tls-native"),
-        not(feature = "tls-rustls-aws-lc-rs"),
-        feature = "tls-rustls-ring"
+        not(feature = "async-tls-native"),
+        not(feature = "async-tls-rustls-aws-lc-rs"),
+        feature = "async-tls-rustls-ring"
     ))]
     {
         builder = builder.tls_backend(TlsBackend::RustlsRing);

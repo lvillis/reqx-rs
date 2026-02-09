@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::error::{HttpClientError, TimeoutPhase};
-use crate::response::{HttpResponse, HttpResponseStream};
+use crate::response::HttpResponse;
+#[cfg(feature = "_async")]
+use crate::response::HttpResponseStream;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Debug)]
@@ -95,6 +97,7 @@ impl HttpClientMetrics {
         self.record_latency(latency);
     }
 
+    #[cfg(feature = "_async")]
     pub(crate) fn record_request_completed_stream(
         &self,
         result: &Result<HttpResponseStream, HttpClientError>,
@@ -196,6 +199,9 @@ impl HttpClientMetrics {
             }
             HttpClientError::TlsBackendInit { .. } => {
                 self.add_error_count("tls_backend_init".to_owned());
+            }
+            HttpClientError::TlsConfig { .. } => {
+                self.add_error_count("tls_config".to_owned());
             }
         }
     }
