@@ -62,6 +62,8 @@ pub enum HttpClientErrorCode {
     TlsBackendUnavailable,
     TlsBackendInit,
     TlsConfig,
+    RetryBudgetExhausted,
+    CircuitOpen,
     MissingRedirectLocation,
     InvalidRedirectLocation,
     RedirectLimitExceeded,
@@ -90,6 +92,8 @@ impl HttpClientErrorCode {
             Self::TlsBackendUnavailable => "tls_backend_unavailable",
             Self::TlsBackendInit => "tls_backend_init",
             Self::TlsConfig => "tls_config",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
+            Self::CircuitOpen => "circuit_open",
             Self::MissingRedirectLocation => "missing_redirect_location",
             Self::InvalidRedirectLocation => "invalid_redirect_location",
             Self::RedirectLimitExceeded => "redirect_limit_exceeded",
@@ -204,6 +208,14 @@ pub enum HttpClientError {
         backend: &'static str,
         message: String,
     },
+    #[error("retry budget exhausted for {method} {uri}")]
+    RetryBudgetExhausted { method: Method, uri: String },
+    #[error("circuit breaker is open for {method} {uri}; retry after {retry_after_ms}ms")]
+    CircuitOpen {
+        method: Method,
+        uri: String,
+        retry_after_ms: u128,
+    },
     #[error("redirect response {status} missing location header for {method} {uri}")]
     MissingRedirectLocation {
         status: u16,
@@ -248,6 +260,8 @@ impl HttpClientError {
             Self::TlsBackendUnavailable { .. } => HttpClientErrorCode::TlsBackendUnavailable,
             Self::TlsBackendInit { .. } => HttpClientErrorCode::TlsBackendInit,
             Self::TlsConfig { .. } => HttpClientErrorCode::TlsConfig,
+            Self::RetryBudgetExhausted { .. } => HttpClientErrorCode::RetryBudgetExhausted,
+            Self::CircuitOpen { .. } => HttpClientErrorCode::CircuitOpen,
             Self::MissingRedirectLocation { .. } => HttpClientErrorCode::MissingRedirectLocation,
             Self::InvalidRedirectLocation { .. } => HttpClientErrorCode::InvalidRedirectLocation,
             Self::RedirectLimitExceeded { .. } => HttpClientErrorCode::RedirectLimitExceeded,

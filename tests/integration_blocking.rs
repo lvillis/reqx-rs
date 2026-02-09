@@ -11,7 +11,8 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
 use reqx::prelude::{
-    HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
+    CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext,
+    RetryBudgetPolicy, RetryPolicy,
 };
 use serde_json::Value;
 
@@ -293,6 +294,91 @@ fn blocking_retries_idempotent_post_then_succeeds() {
 
     assert_eq!(response["id"], "item-1");
     assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            503,
+            vec![("Content-Type", "application/json")],
+            b"{}".to_vec(),
+        ),
+        MockResponse::new(
+            503,
+            vec![("Content-Type", "application/json")],
+            b"{}".to_vec(),
+        ),
+    ]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(5)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(2))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(1))
+                .retry_ratio(0.0)
+                .min_retries_per_window(1),
+        )
+        .request_timeout(Duration::from_secs(1))
+        .build();
+
+    let error = client
+        .get("/v1/budget")
+        .send()
+        .expect_err("retry budget should stop retries after one retry");
+
+    match error {
+        HttpClientError::RetryBudgetExhausted { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_circuit_breaker_short_circuits_after_opening() {
+    let server = MockServer::start(vec![MockResponse::new(
+        503,
+        vec![("Content-Type", "application/json")],
+        b"{}".to_vec(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_secs(1))
+        .build();
+
+    let first = client
+        .get("/v1/open")
+        .send()
+        .expect_err("first request should return 503");
+    match first {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let second = client
+        .get("/v1/open")
+        .send()
+        .expect_err("second request should be rejected by circuit");
+    match second {
+        HttpClientError::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error: {other}"),
+    }
+
+    assert_eq!(server.served_count(), 1);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue};
@@ -16,6 +16,7 @@ use hyper_util::client::legacy::Client;
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
 use hyper_util::rt::TokioExecutor;
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info_span, warn};
 
@@ -42,6 +43,9 @@ use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 use crate::proxy::ProxyConnector;
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::request::RequestBuilder;
+use crate::resilience::{
+    AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
+};
 use crate::response::{HttpResponse, HttpResponseStream};
 use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
@@ -50,9 +54,9 @@ use crate::retry::{
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error, ensure_accept_encoding,
-    is_redirect_status, merge_headers, parse_header_name, parse_header_value, parse_retry_after,
-    phase_timeout, redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri,
-    resolve_uri, same_origin, sanitize_headers_for_redirect, truncate_body,
+    is_redirect_status, lock_unpoisoned, merge_headers, parse_header_name, parse_header_value,
+    parse_retry_after, phase_timeout, redact_uri_for_logs, redirect_location, redirect_method,
+    resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect, truncate_body,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -555,6 +559,105 @@ fn build_transport_client(
     }
 }
 
+#[derive(Debug)]
+struct AdaptiveConcurrencyState {
+    in_flight: usize,
+    current_limit: usize,
+    ewma_latency_ms: f64,
+}
+
+#[derive(Debug)]
+struct AdaptiveConcurrencyController {
+    policy: AdaptiveConcurrencyPolicy,
+    state: Mutex<AdaptiveConcurrencyState>,
+    notify: Notify,
+}
+
+impl AdaptiveConcurrencyController {
+    fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+        let initial_limit = policy
+            .initial_limit_value()
+            .clamp(policy.min_limit_value(), policy.max_limit_value());
+        Self {
+            policy,
+            state: Mutex::new(AdaptiveConcurrencyState {
+                in_flight: 0,
+                current_limit: initial_limit,
+                ewma_latency_ms: 0.0,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
+        loop {
+            {
+                let mut state = lock_unpoisoned(&self.state);
+                if state.in_flight < state.current_limit {
+                    state.in_flight = state.in_flight.saturating_add(1);
+                    return AdaptiveConcurrencyPermit {
+                        controller: Arc::clone(self),
+                        started_at: Instant::now(),
+                        completed: false,
+                    };
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn release_and_record(&self, success: bool, latency: Duration) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.in_flight = state.in_flight.saturating_sub(1);
+
+        let latency_ms = latency.as_secs_f64() * 1000.0;
+        if state.ewma_latency_ms <= f64::EPSILON {
+            state.ewma_latency_ms = latency_ms;
+        } else {
+            state.ewma_latency_ms = state.ewma_latency_ms * 0.8 + latency_ms * 0.2;
+        }
+
+        let threshold_ms = self.policy.high_latency_threshold_value().as_secs_f64() * 1000.0;
+        let should_decrease = !success || state.ewma_latency_ms > threshold_ms;
+        if should_decrease {
+            let decreased =
+                (state.current_limit as f64 * self.policy.decrease_ratio_value()).floor() as usize;
+            state.current_limit = decreased.max(self.policy.min_limit_value());
+        } else {
+            state.current_limit = state
+                .current_limit
+                .saturating_add(self.policy.increase_step_value())
+                .min(self.policy.max_limit_value());
+        }
+
+        self.notify.notify_waiters();
+    }
+}
+
+struct AdaptiveConcurrencyPermit {
+    controller: Arc<AdaptiveConcurrencyController>,
+    started_at: Instant,
+    completed: bool,
+}
+
+impl AdaptiveConcurrencyPermit {
+    fn mark_success(mut self) {
+        self.controller
+            .release_and_record(true, self.started_at.elapsed());
+        self.completed = true;
+    }
+}
+
+impl Drop for AdaptiveConcurrencyPermit {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.controller
+                .release_and_record(false, self.started_at.elapsed());
+            self.completed = true;
+        }
+    }
+}
+
 pub(crate) struct RequestExecutionOptions {
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) total_timeout: Option<Duration>,
@@ -578,6 +681,9 @@ pub struct HttpClientBuilder {
     no_proxy_rules: Vec<NoProxyRule>,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
+    retry_budget_policy: Option<RetryBudgetPolicy>,
+    circuit_breaker_policy: Option<CircuitBreakerPolicy>,
+    adaptive_concurrency_policy: Option<AdaptiveConcurrencyPolicy>,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
@@ -604,6 +710,9 @@ impl HttpClientBuilder {
             no_proxy_rules: Vec::new(),
             retry_policy: RetryPolicy::standard(),
             retry_eligibility: Arc::new(StrictRetryEligibility),
+            retry_budget_policy: None,
+            circuit_breaker_policy: None,
+            adaptive_concurrency_policy: None,
             redirect_policy: RedirectPolicy::none(),
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
@@ -702,6 +811,24 @@ impl HttpClientBuilder {
 
     pub fn retry_eligibility(mut self, retry_eligibility: Arc<dyn RetryEligibility>) -> Self {
         self.retry_eligibility = retry_eligibility;
+        self
+    }
+
+    pub fn retry_budget_policy(mut self, retry_budget_policy: RetryBudgetPolicy) -> Self {
+        self.retry_budget_policy = Some(retry_budget_policy);
+        self
+    }
+
+    pub fn circuit_breaker_policy(mut self, circuit_breaker_policy: CircuitBreakerPolicy) -> Self {
+        self.circuit_breaker_policy = Some(circuit_breaker_policy);
+        self
+    }
+
+    pub fn adaptive_concurrency(
+        mut self,
+        adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
+    ) -> Self {
+        self.adaptive_concurrency_policy = Some(adaptive_concurrency_policy);
         self
     }
 
@@ -823,6 +950,15 @@ impl HttpClientBuilder {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             retry_eligibility: self.retry_eligibility,
+            retry_budget: self
+                .retry_budget_policy
+                .map(|policy| Arc::new(RetryBudget::new(policy))),
+            circuit_breaker: self
+                .circuit_breaker_policy
+                .map(|policy| Arc::new(CircuitBreaker::new(policy))),
+            adaptive_concurrency: self
+                .adaptive_concurrency_policy
+                .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),
             redirect_policy: self.redirect_policy,
             client_name: self.client_name,
             tls_backend: self.tls_backend,
@@ -848,6 +984,9 @@ pub struct HttpClient {
     max_response_body_bytes: usize,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
+    retry_budget: Option<Arc<RetryBudget>>,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
+    adaptive_concurrency: Option<Arc<AdaptiveConcurrencyController>>,
     redirect_policy: RedirectPolicy,
     client_name: String,
     tls_backend: TlsBackend,
@@ -915,6 +1054,50 @@ impl HttpClient {
         for interceptor in &self.interceptors {
             interceptor.on_error(context, error);
         }
+    }
+
+    fn record_successful_request_for_resilience(&self) {
+        if let Some(retry_budget) = &self.retry_budget {
+            retry_budget.record_success();
+        }
+    }
+
+    fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), HttpClientError> {
+        let Some(retry_budget) = &self.retry_budget else {
+            return Ok(());
+        };
+        if retry_budget.try_consume_retry() {
+            Ok(())
+        } else {
+            Err(HttpClientError::RetryBudgetExhausted {
+                method: method.clone(),
+                uri: uri.to_owned(),
+            })
+        }
+    }
+
+    fn begin_circuit_attempt(
+        &self,
+        method: &Method,
+        uri: &str,
+    ) -> Result<Option<crate::resilience::CircuitAttempt>, HttpClientError> {
+        let Some(circuit_breaker) = &self.circuit_breaker else {
+            return Ok(None);
+        };
+
+        match circuit_breaker.begin() {
+            Ok(attempt) => Ok(Some(attempt)),
+            Err(retry_after) => Err(HttpClientError::CircuitOpen {
+                method: method.clone(),
+                uri: uri.to_owned(),
+                retry_after_ms: retry_after.as_millis(),
+            }),
+        }
+    }
+
+    async fn begin_adaptive_attempt(&self) -> Option<AdaptiveConcurrencyPermit> {
+        let controller = self.adaptive_concurrency.as_ref()?;
+        Some(controller.acquire().await)
     }
 
     async fn acquire_request_permits(
@@ -1097,6 +1280,15 @@ impl HttpClient {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             };
+            let mut circuit_attempt =
+                match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    }
+                };
+            let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
 
@@ -1136,6 +1328,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1177,6 +1375,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1245,6 +1449,12 @@ impl HttpClient {
                     return Err(error);
                 };
                 self.run_response_interceptors(&context, status, &response_headers);
+                if let Some(attempt_guard) = circuit_attempt.take() {
+                    attempt_guard.mark_success();
+                }
+                if let Some(adaptive_guard) = adaptive_attempt.take() {
+                    adaptive_guard.mark_success();
+                }
                 let next_method = redirect_method(&current_method, status);
                 let method_changed_to_get =
                     next_method == Method::GET && current_method != Method::GET;
@@ -1347,6 +1557,12 @@ impl HttpClient {
                     response_body_read_error: false,
                 };
                 if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision) {
+                    if let Err(error) =
+                        self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                    {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    }
                     let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
                         .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
                     let Some(retry_delay) =
@@ -1371,6 +1587,13 @@ impl HttpClient {
                 return Err(error);
             }
             self.run_response_interceptors(&context, status, &response_headers);
+            if let Some(attempt_guard) = circuit_attempt.take() {
+                attempt_guard.mark_success();
+            }
+            if let Some(adaptive_guard) = adaptive_attempt.take() {
+                adaptive_guard.mark_success();
+            }
+            self.record_successful_request_for_resilience();
 
             return Ok(HttpResponseStream::new(
                 status,
@@ -1465,6 +1688,15 @@ impl HttpClient {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             };
+            let mut circuit_attempt =
+                match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    }
+                };
+            let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
             let request_body = if let Some(body) = &buffered_body {
@@ -1503,6 +1735,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1549,6 +1787,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1622,6 +1866,12 @@ impl HttpClient {
                     return Err(error);
                 };
                 self.run_response_interceptors(&context, status, &response_headers);
+                if let Some(attempt_guard) = circuit_attempt.take() {
+                    attempt_guard.mark_success();
+                }
+                if let Some(adaptive_guard) = adaptive_attempt.take() {
+                    adaptive_guard.mark_success();
+                }
                 let next_method = redirect_method(&current_method, status);
                 let method_changed_to_get =
                     next_method == Method::GET && current_method != Method::GET;
@@ -1679,6 +1929,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1735,6 +1991,12 @@ impl HttpClient {
                     };
                     if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
                     {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                        {
+                            self.run_error_interceptors(&context, &error);
+                            return Err(error);
+                        }
                         let retry_delay = retry_policy.backoff_for_retry(attempt);
                         let Some(retry_delay) =
                             bounded_retry_delay(retry_delay, total_timeout, request_started_at)
@@ -1801,6 +2063,12 @@ impl HttpClient {
                     response_body_read_error: false,
                 };
                 if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision) {
+                    if let Err(error) =
+                        self.try_consume_retry_budget(&current_method, &current_redacted_uri)
+                    {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    }
                     let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
                         .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
                     let Some(retry_delay) =
@@ -1831,6 +2099,13 @@ impl HttpClient {
                 return Err(error);
             }
 
+            if let Some(attempt_guard) = circuit_attempt.take() {
+                attempt_guard.mark_success();
+            }
+            if let Some(adaptive_guard) = adaptive_attempt.take() {
+                adaptive_guard.mark_success();
+            }
+            self.record_successful_request_for_resilience();
             return Ok(HttpResponse::new(status, response_headers, response_body));
         }
 

@@ -239,6 +239,27 @@ fn error_code_maps_redirect_limit_exceeded_variant() {
 }
 
 #[test]
+fn error_code_maps_retry_budget_exhausted_variant() {
+    let error = HttpClientError::RetryBudgetExhausted {
+        method: http::Method::GET,
+        uri: "https://example.com/retry-budget".to_owned(),
+    };
+    assert_eq!(error.code(), HttpClientErrorCode::RetryBudgetExhausted);
+    assert_eq!(error.code().as_str(), "retry_budget_exhausted");
+}
+
+#[test]
+fn error_code_maps_circuit_open_variant() {
+    let error = HttpClientError::CircuitOpen {
+        method: http::Method::GET,
+        uri: "https://example.com/circuit".to_owned(),
+        retry_after_ms: 1000,
+    };
+    assert_eq!(error.code(), HttpClientErrorCode::CircuitOpen);
+    assert_eq!(error.code().as_str(), "circuit_open");
+}
+
+#[test]
 fn invalid_tls_root_ca_pem_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_ca_pem("not-a-pem-certificate")

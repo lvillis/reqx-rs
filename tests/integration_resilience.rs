@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use http::Uri;
 use http_body_util::BodyExt;
-use reqx::prelude::{HttpClient, HttpClientError, RetryClassifier, RetryDecision, RetryPolicy};
+use reqx::prelude::{
+    CircuitBreakerPolicy, HttpClient, HttpClientError, RetryBudgetPolicy, RetryClassifier,
+    RetryDecision, RetryPolicy,
+};
 
 #[derive(Clone)]
 struct ResponseSpec {
@@ -787,6 +790,93 @@ async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
         other => panic!("unexpected error variant: {other}"),
     }
     assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_budget_exhausted_stops_retry_loop_early() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(5)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(2))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(1))
+                .retry_ratio(0.0)
+                .min_retries_per_window(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build();
+
+    let error = client
+        .get("/budget")
+        .send()
+        .await
+        .expect_err("retry budget should stop retries after one retry");
+
+    match error {
+        HttpClientError::RetryBudgetExhausted { .. } => {}
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_short_circuits_after_opening() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build();
+
+    let first = client
+        .get("/open")
+        .send()
+        .await
+        .expect_err("first request should return 503");
+    match first {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        other => panic!("unexpected first error variant: {other}"),
+    }
+
+    let second = client
+        .get("/open")
+        .send()
+        .await
+        .expect_err("second request should be rejected by circuit");
+    match second {
+        HttpClientError::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    assert_eq!(server.served_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -17,12 +17,13 @@ cargo run --example <name>
 5. `metrics_snapshot` - Read runtime metrics counters.
 6. `streaming` - Stream upload and stream response body.
 7. `concurrency_limits` - `max_in_flight` behavior under parallel load.
-8. `retry_classifier` - Custom `RetryClassifier`.
-9. `proxy_and_no_proxy` - Proxy routing and bypass rules.
-10. `tls_backends` - Runtime TLS backend selection.
-11. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
-12. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
-13. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
+8. `resilience_controls` - Retry budget, circuit breaker, and adaptive concurrency.
+9. `retry_classifier` - Custom `RetryClassifier`.
+10. `proxy_and_no_proxy` - Proxy routing and bypass rules.
+11. `tls_backends` - Runtime TLS backend selection.
+12. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
+13. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
+14. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
 
 ## Example Index
 
@@ -35,6 +36,7 @@ cargo run --example <name>
 | `metrics_snapshot.rs`   | Observe requests/retries/status/error counters      | `cargo run --example metrics_snapshot`   |
 | `streaming.rs`          | `body_stream()` upload and `send_stream()` download | `cargo run --example streaming`          |
 | `concurrency_limits.rs` | Demonstrate serialized execution with limiter       | `cargo run --example concurrency_limits` |
+| `resilience_controls.rs` | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls` |
 | `retry_classifier.rs`   | Plug in custom retry classifier logic               | `cargo run --example retry_classifier`   |
 | `proxy_and_no_proxy.rs` | Configure proxy auth and `no_proxy` rules           | `cargo run --example proxy_and_no_proxy` |
 | `tls_backends.rs`       | Choose TLS backend based on enabled features        | `cargo run --example tls_backends`       |

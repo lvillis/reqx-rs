@@ -87,6 +87,7 @@ mod policy;
 mod proxy;
 #[cfg(feature = "_async")]
 mod request;
+mod resilience;
 mod response;
 mod retry;
 mod tls;
@@ -104,6 +105,7 @@ pub use crate::metrics::HttpClientMetricsSnapshot;
 pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
+pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
 pub use crate::response::HttpResponse;
 #[cfg(feature = "_async")]
 pub use crate::response::HttpResponseStream;
@@ -121,18 +123,19 @@ pub mod blocking {
 pub type ReqxResult<T> = std::result::Result<T, HttpClientError>;
 
 pub mod prelude {
+    pub use crate::{
+        AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode,
+        HttpClientMetricsSnapshot, HttpInterceptor, HttpResponse, PermissiveRetryEligibility,
+        RedirectPolicy, RequestContext, ReqxResult, RetryBudgetPolicy, RetryClassifier,
+        RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility, TimeoutPhase,
+        TlsBackend, TransportErrorKind,
+    };
     #[cfg(feature = "_blocking")]
     pub use crate::{
         BlockingHttpClient, BlockingHttpClientBuilder, BlockingRequestBuilder, blocking,
     };
     #[cfg(feature = "_async")]
     pub use crate::{HttpClient, HttpResponseStream};
-    pub use crate::{
-        HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot, HttpInterceptor,
-        HttpResponse, PermissiveRetryEligibility, RedirectPolicy, RequestContext, ReqxResult,
-        RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility,
-        TimeoutPhase, TlsBackend, TransportErrorKind,
-    };
 }
 
 #[cfg(all(test, feature = "_async"))]

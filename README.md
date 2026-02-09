@@ -124,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - global defaults + per-request overrides
 - idempotency-aware retries
+- retry budget + circuit breaker + adaptive concurrency controls
 - bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
 - separate connect timeout (`connect_timeout(...)`)
@@ -145,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `cargo run --example metrics_snapshot`
 - `cargo run --example streaming`
 - `cargo run --example concurrency_limits`
+- `cargo run --example resilience_controls`
 - `cargo run --example retry_classifier`
 - `cargo run --example proxy_and_no_proxy`
 - `cargo run --example tls_backends`

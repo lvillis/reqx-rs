@@ -203,6 +203,12 @@ impl HttpClientMetrics {
             HttpClientError::TlsConfig { .. } => {
                 self.add_error_count("tls_config".to_owned());
             }
+            HttpClientError::RetryBudgetExhausted { .. } => {
+                self.add_error_count("retry_budget_exhausted".to_owned());
+            }
+            HttpClientError::CircuitOpen { .. } => {
+                self.add_error_count("circuit_open".to_owned());
+            }
             HttpClientError::MissingRedirectLocation { .. } => {
                 self.add_error_count("missing_redirect_location".to_owned());
             }
