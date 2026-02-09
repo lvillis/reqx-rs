@@ -85,6 +85,7 @@ mod limiters;
 mod metrics;
 mod policy;
 mod proxy;
+mod rate_limit;
 #[cfg(feature = "_async")]
 mod request;
 mod resilience;
@@ -103,6 +104,7 @@ pub use crate::client::{HttpClient, HttpClientBuilder};
 pub use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
 pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
+pub use crate::rate_limit::RateLimitPolicy;
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
@@ -126,9 +128,9 @@ pub mod prelude {
     pub use crate::{
         AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode,
         HttpClientMetricsSnapshot, HttpInterceptor, HttpResponse, PermissiveRetryEligibility,
-        RedirectPolicy, RequestContext, ReqxResult, RetryBudgetPolicy, RetryClassifier,
-        RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility, TimeoutPhase,
-        TlsBackend, TransportErrorKind,
+        RateLimitPolicy, RedirectPolicy, RequestContext, ReqxResult, RetryBudgetPolicy,
+        RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility,
+        TimeoutPhase, TlsBackend, TransportErrorKind,
     };
     #[cfg(feature = "_blocking")]
     pub use crate::{

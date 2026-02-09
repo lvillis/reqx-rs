@@ -6,13 +6,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
 use reqx::prelude::{
-    CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext,
-    RetryBudgetPolicy, RetryPolicy,
+    CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy,
+    RequestContext, RetryBudgetPolicy, RetryPolicy,
 };
 use serde_json::Value;
 
@@ -293,6 +293,80 @@ fn blocking_retries_idempotent_post_then_succeeds() {
         .expect("blocking request should succeed after retry");
 
     assert_eq!(response["id"], "item-1");
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_global_rate_limit_applies_between_requests() {
+    let server = MockServer::start(vec![
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-1".to_vec()),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-2".to_vec()),
+    ]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(20.0)
+                .burst(1),
+        )
+        .build();
+
+    let started = Instant::now();
+    let first = client
+        .get("/v1/rate-a")
+        .send()
+        .expect("first request succeeds");
+    let second = client
+        .get("/v1/rate-b")
+        .send()
+        .expect("second request succeeds");
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(second.status().as_u16(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(45),
+        "rate limiter should introduce spacing between requests"
+    );
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_retry_after_429_backpressures_following_request() {
+    let server = MockServer::start(vec![
+        MockResponse::new(429, vec![("Retry-After", "1")], b"busy".to_vec()),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+    ]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .build();
+
+    let first = client
+        .get("/v1/throttled")
+        .send()
+        .expect_err("first request should return 429");
+    match first {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let started = Instant::now();
+    let second = client
+        .get("/v1/recovered")
+        .send()
+        .expect("second request should succeed");
+    assert_eq!(second.status().as_u16(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "retry-after should backpressure the next request"
+    );
     assert_eq!(server.served_count(), 2);
 }
 

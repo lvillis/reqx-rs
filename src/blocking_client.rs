@@ -15,6 +15,7 @@ use crate::error::{HttpClientError, TimeoutPhase, TransportErrorKind};
 use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
 use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 use crate::proxy::{NoProxyRule, ProxyConfig};
+use crate::rate_limit::{RateLimitPolicy, RateLimiter};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
@@ -457,6 +458,8 @@ pub struct HttpClientBuilder {
     retry_budget_policy: Option<RetryBudgetPolicy>,
     circuit_breaker_policy: Option<CircuitBreakerPolicy>,
     adaptive_concurrency_policy: Option<AdaptiveConcurrencyPolicy>,
+    global_rate_limit_policy: Option<RateLimitPolicy>,
+    per_host_rate_limit_policy: Option<RateLimitPolicy>,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
@@ -484,6 +487,8 @@ impl HttpClientBuilder {
             retry_budget_policy: None,
             circuit_breaker_policy: None,
             adaptive_concurrency_policy: None,
+            global_rate_limit_policy: None,
+            per_host_rate_limit_policy: None,
             redirect_policy: RedirectPolicy::none(),
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
@@ -598,6 +603,19 @@ impl HttpClientBuilder {
         adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
     ) -> Self {
         self.adaptive_concurrency_policy = Some(adaptive_concurrency_policy);
+        self
+    }
+
+    pub fn global_rate_limit_policy(mut self, global_rate_limit_policy: RateLimitPolicy) -> Self {
+        self.global_rate_limit_policy = Some(global_rate_limit_policy);
+        self
+    }
+
+    pub fn per_host_rate_limit_policy(
+        mut self,
+        per_host_rate_limit_policy: RateLimitPolicy,
+    ) -> Self {
+        self.per_host_rate_limit_policy = Some(per_host_rate_limit_policy);
         self
     }
 
@@ -745,6 +763,11 @@ impl HttpClientBuilder {
             adaptive_concurrency: self
                 .adaptive_concurrency_policy
                 .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),
+            rate_limiter: RateLimiter::new(
+                self.global_rate_limit_policy,
+                self.per_host_rate_limit_policy,
+            )
+            .map(Arc::new),
             redirect_policy: self.redirect_policy,
             tls_backend: self.tls_backend,
             transport: TransportAgents {
@@ -775,6 +798,7 @@ pub struct HttpClient {
     retry_budget: Option<Arc<RetryBudget>>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
     adaptive_concurrency: Option<Arc<AdaptiveConcurrencyController>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     transport: TransportAgents,
@@ -886,6 +910,48 @@ impl HttpClient {
     fn begin_adaptive_attempt(&self) -> Option<AdaptiveConcurrencyPermit> {
         let controller = self.adaptive_concurrency.as_ref()?;
         Some(controller.acquire())
+    }
+
+    fn acquire_rate_limit_slot(
+        &self,
+        host: Option<&str>,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<(), HttpClientError> {
+        let Some(rate_limiter) = &self.rate_limiter else {
+            return Ok(());
+        };
+
+        loop {
+            let wait = rate_limiter.acquire_delay(host);
+            if wait.is_zero() {
+                return Ok(());
+            }
+            let Some(wait) = bounded_retry_delay(wait, total_timeout, request_started_at) else {
+                return Err(deadline_exceeded_error(total_timeout, method, uri));
+            };
+            sleep(wait);
+        }
+    }
+
+    fn observe_server_throttle(
+        &self,
+        status: http::StatusCode,
+        headers: &HeaderMap,
+        host: Option<&str>,
+        fallback_delay: Duration,
+    ) {
+        if status != http::StatusCode::TOO_MANY_REQUESTS {
+            return;
+        }
+        let Some(rate_limiter) = &self.rate_limiter else {
+            return;
+        };
+        let throttle_delay =
+            parse_retry_after(headers, SystemTime::now()).unwrap_or(fallback_delay);
+        rate_limiter.observe_server_throttle(host, throttle_delay);
     }
 
     fn select_agent(&self, uri: &Uri) -> (&ureq::Agent, bool) {
@@ -1078,21 +1144,6 @@ impl HttpClient {
         let mut current_headers = merged_headers;
 
         while attempt <= max_attempts {
-            let Some(transport_timeout) =
-                phase_timeout(timeout_value, total_timeout, request_started_at)
-            else {
-                let error =
-                    deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
-                let context = RequestContext::new(
-                    current_method.clone(),
-                    current_redacted_uri.clone(),
-                    attempt,
-                    max_attempts,
-                    redirect_count,
-                );
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            };
             let context = RequestContext::new(
                 current_method.clone(),
                 current_redacted_uri.clone(),
@@ -1100,6 +1151,24 @@ impl HttpClient {
                 max_attempts,
                 redirect_count,
             );
+            if let Err(error) = self.acquire_rate_limit_slot(
+                current_uri.host(),
+                total_timeout,
+                request_started_at,
+                &current_method,
+                &current_redacted_uri,
+            ) {
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
+            }
+            let Some(transport_timeout) =
+                phase_timeout(timeout_value, total_timeout, request_started_at)
+            else {
+                let error =
+                    deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
+            };
             let mut circuit_attempt =
                 match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
                     Ok(attempt) => attempt,
@@ -1410,6 +1479,12 @@ impl HttpClient {
                     uri: current_redacted_uri.clone(),
                     body: truncate_body(&response_body),
                 };
+                self.observe_server_throttle(
+                    status,
+                    &response_headers,
+                    current_uri.host(),
+                    retry_policy.backoff_for_retry(attempt),
+                );
                 let retry_decision = RetryDecision {
                     attempt,
                     max_attempts,

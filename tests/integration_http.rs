@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use flate2::Compression;
@@ -14,8 +14,8 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{
-    HttpClient, HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
-    TimeoutPhase,
+    HttpClient, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
+    RetryPolicy, TimeoutPhase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -613,6 +613,78 @@ async fn body_stream_uploads_chunked_data_with_declared_length() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, b"hello world".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_rate_limit_applies_between_parallel_requests() {
+    let server = MockServer::start(vec![
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok-1", Duration::ZERO),
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok-2", Duration::ZERO),
+    ]);
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(20.0)
+                .burst(1),
+        )
+        .build();
+
+    let started = Instant::now();
+    let client_a = client.clone();
+    let client_b = client.clone();
+    let (first, second) = tokio::join!(client_a.get("/a").send(), client_b.get("/b").send());
+
+    let first = first.expect("first request should succeed");
+    let second = second.expect("second request should succeed");
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(second.status().as_u16(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(45),
+        "rate limiter should introduce spacing between requests"
+    );
+    assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_after_429_backpressures_following_request() {
+    let server = MockServer::start(vec![
+        MockResponse::new(429, vec![("Retry-After", "1")], "busy", Duration::ZERO),
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok", Duration::ZERO),
+    ]);
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .build();
+
+    let first_error = client
+        .get("/throttled")
+        .send()
+        .await
+        .expect_err("first request should return 429");
+    match first_error {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let started = Instant::now();
+    let second = client
+        .get("/recovered")
+        .send()
+        .await
+        .expect("second request should succeed after retry-after delay");
+    assert_eq!(second.status().as_u16(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "retry-after should backpressure the next request"
+    );
+    assert_eq!(server.served_count(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

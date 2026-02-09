@@ -18,12 +18,13 @@ cargo run --example <name>
 6. `streaming` - Stream upload and stream response body.
 7. `concurrency_limits` - `max_in_flight` behavior under parallel load.
 8. `resilience_controls` - Retry budget, circuit breaker, and adaptive concurrency.
-9. `retry_classifier` - Custom `RetryClassifier`.
-10. `proxy_and_no_proxy` - Proxy routing and bypass rules.
-11. `tls_backends` - Runtime TLS backend selection.
-12. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
-13. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
-14. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
+9. `rate_limit_429` - Global/per-host rate limiting with `429 Retry-After` backpressure.
+10. `retry_classifier` - Custom `RetryClassifier`.
+11. `proxy_and_no_proxy` - Proxy routing and bypass rules.
+12. `tls_backends` - Runtime TLS backend selection.
+13. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
+14. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
+15. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
 
 ## Example Index
 
@@ -37,6 +38,7 @@ cargo run --example <name>
 | `streaming.rs`          | `body_stream()` upload and `send_stream()` download | `cargo run --example streaming`          |
 | `concurrency_limits.rs` | Demonstrate serialized execution with limiter       | `cargo run --example concurrency_limits` |
 | `resilience_controls.rs` | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls` |
+| `rate_limit_429.rs`    | Configure global/per-host rate limits and 429 backpressure | `cargo run --example rate_limit_429` |
 | `retry_classifier.rs`   | Plug in custom retry classifier logic               | `cargo run --example retry_classifier`   |
 | `proxy_and_no_proxy.rs` | Configure proxy auth and `no_proxy` rules           | `cargo run --example proxy_and_no_proxy` |
 | `tls_backends.rs`       | Choose TLS backend based on enabled features        | `cargo run --example tls_backends`       |
