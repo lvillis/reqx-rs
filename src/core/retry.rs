@@ -295,9 +295,7 @@ fn default_retryable_transport_error_kinds() -> BTreeSet<TransportErrorKind> {
     [
         TransportErrorKind::Dns,
         TransportErrorKind::Connect,
-        TransportErrorKind::Tls,
         TransportErrorKind::Read,
-        TransportErrorKind::Other,
     ]
     .into_iter()
     .collect()

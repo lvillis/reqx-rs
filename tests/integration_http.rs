@@ -484,6 +484,81 @@ async fn decodes_gzip_response_and_sets_accept_encoding() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decoded_gzip_response_still_respects_max_body_limit() {
+    let expanded = vec![b'a'; 16 * 1024];
+    let body = gzip_bytes(&expanded);
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "gzip")],
+        body,
+        Duration::ZERO,
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .max_response_body_bytes(512)
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let error = client
+        .get("/gzip-too-large")
+        .send()
+        .await
+        .expect_err("decoded payload should still honor response size limit");
+
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 512);
+            assert!(actual_bytes > limit_bytes);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_into_response_limited_respects_decode_limit() {
+    let expanded = vec![b'b'; 16 * 1024];
+    let body = gzip_bytes(&expanded);
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "gzip")],
+        body,
+        Duration::ZERO,
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/gzip-stream-too-large")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    let error = streamed
+        .into_response_limited(512)
+        .await
+        .expect_err("decoded stream payload should still honor response size limit");
+
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 512);
+            assert!(actual_bytes > limit_bytes);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
 #[derive(Serialize)]
 struct SearchParams<'a> {
     topic: &'a str,

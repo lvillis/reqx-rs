@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-use crate::body::decode_content_encoded_body;
+use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::client::HttpClient;
 use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
@@ -179,6 +179,28 @@ fn retry_policy_can_filter_transport_error_kinds() {
 
     assert!(retry_policy.should_retry_decision(&connect_decision));
     assert!(!retry_policy.should_retry_decision(&dns_decision));
+}
+
+#[test]
+fn retry_policy_standard_skips_tls_and_other_transport_errors() {
+    let retry_policy = RetryPolicy::standard();
+    let tls_decision = RetryDecision {
+        attempt: 1,
+        max_attempts: 3,
+        method: http::Method::GET,
+        uri: "https://example.com/tls".to_owned(),
+        status: None,
+        transport_error_kind: Some(TransportErrorKind::Tls),
+        timeout_phase: None,
+        response_body_read_error: false,
+    };
+    let other_decision = RetryDecision {
+        transport_error_kind: Some(TransportErrorKind::Other),
+        ..tls_decision.clone()
+    };
+
+    assert!(!retry_policy.should_retry_decision(&tls_decision));
+    assert!(!retry_policy.should_retry_decision(&other_decision));
 }
 
 #[test]
@@ -411,6 +433,36 @@ fn invalid_tls_root_ca_pem_returns_tls_config_error() {
 }
 
 #[test]
+fn try_build_rejects_invalid_base_url_early() {
+    let result = HttpClient::builder("not-a-valid-base-url").try_build();
+    let error = match result {
+        Ok(_) => panic!("invalid base url should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::InvalidUri { uri } => {
+            assert_eq!(uri, "not-a-valid-base-url");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn try_build_rejects_non_http_base_url_scheme() {
+    let result = HttpClient::builder("ftp://api.example.com").try_build();
+    let error = match result {
+        Ok(_) => panic!("non-http base url should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::InvalidUri { uri } => {
+            assert_eq!(uri, "ftp://api.example.com");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn tls_root_store_specific_without_roots_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)
@@ -550,8 +602,9 @@ fn decode_content_encoded_body_decodes_gzip_payload() {
         http::header::CONTENT_ENCODING,
         http::HeaderValue::from_static("gzip"),
     );
-    let decoded = decode_content_encoded_body(bytes::Bytes::from(compressed), &headers)
-        .expect("gzip payload should decode");
+    let decoded =
+        decode_content_encoded_body_limited(bytes::Bytes::from(compressed), &headers, 1024)
+            .expect("gzip payload should decode");
     assert_eq!(decoded.as_ref(), source);
 }
 
@@ -562,9 +615,37 @@ fn decode_content_encoded_body_rejects_unknown_encoding() {
         http::header::CONTENT_ENCODING,
         http::HeaderValue::from_static("x-custom"),
     );
-    let error = decode_content_encoded_body(bytes::Bytes::from_static(b"abc"), &headers)
-        .expect_err("unknown content-encoding should fail");
-    assert_eq!(error.0, "x-custom");
+    let error =
+        decode_content_encoded_body_limited(bytes::Bytes::from_static(b"abc"), &headers, 64)
+            .expect_err("unknown content-encoding should fail");
+    match error {
+        DecodeContentEncodingError::Decode { encoding, .. } => assert_eq!(encoding, "x-custom"),
+        other => panic!("unexpected decode error: {other:?}"),
+    }
+}
+
+#[test]
+fn decode_content_encoded_body_limited_rejects_expanded_payload() {
+    let source = vec![b'a'; 16 * 1024];
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&source)
+        .expect("write gzip source bytes should succeed");
+    let compressed = encoder.finish().expect("finish gzip stream should succeed");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("gzip"),
+    );
+    let error = decode_content_encoded_body_limited(bytes::Bytes::from(compressed), &headers, 512)
+        .expect_err("expanded payload should exceed decode limit");
+    match error {
+        DecodeContentEncodingError::TooLarge { actual_bytes } => {
+            assert!(actual_bytes > 512);
+        }
+        other => panic!("unexpected decode error: {other:?}"),
+    }
 }
 
 #[cfg(feature = "async-tls-rustls-ring")]

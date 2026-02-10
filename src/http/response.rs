@@ -60,7 +60,10 @@ mod stream {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     use crate::ReqxResult;
-    use crate::body::{ReadBodyError, decode_content_encoded_body, read_all_body_limited};
+    use crate::body::{
+        DecodeContentEncodingError, ReadBodyError, decode_content_encoded_body_limited,
+        read_all_body_limited,
+    };
     use crate::error::HttpClientError;
     use crate::response::HttpResponse;
 
@@ -80,6 +83,32 @@ mod stream {
                 method: method.clone(),
                 uri: uri.to_owned(),
             },
+        }
+    }
+
+    fn map_decode_body_error(
+        error: DecodeContentEncodingError,
+        method: &http::Method,
+        uri: &str,
+        max_bytes: usize,
+    ) -> HttpClientError {
+        match error {
+            DecodeContentEncodingError::Decode { encoding, message } => {
+                HttpClientError::DecodeContentEncoding {
+                    encoding,
+                    method: method.clone(),
+                    uri: uri.to_owned(),
+                    message,
+                }
+            }
+            DecodeContentEncodingError::TooLarge { actual_bytes } => {
+                HttpClientError::ResponseBodyTooLarge {
+                    limit_bytes: max_bytes,
+                    actual_bytes,
+                    method: method.clone(),
+                    uri: uri.to_owned(),
+                }
+            }
         }
     }
 
@@ -219,15 +248,8 @@ mod stream {
             let body = read_all_body_limited(body, max_bytes)
                 .await
                 .map_err(|error| map_read_body_error(error, &method, &uri, max_bytes))?;
-            let body =
-                decode_content_encoded_body(body, &headers).map_err(|(encoding, message)| {
-                    HttpClientError::DecodeContentEncoding {
-                        encoding,
-                        method: method.clone(),
-                        uri: uri.clone(),
-                        message,
-                    }
-                })?;
+            let body = decode_content_encoded_body_limited(body, &headers, max_bytes)
+                .map_err(|error| map_decode_body_error(error, &method, &uri, max_bytes))?;
             if headers.contains_key(super::CONTENT_ENCODING) {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);

@@ -18,7 +18,7 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
 };
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
-use crate::util::{parse_header_name, parse_header_value};
+use crate::util::{parse_header_name, parse_header_value, validate_base_url};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
 use super::{
@@ -287,6 +287,8 @@ impl HttpClientBuilder {
     }
 
     pub fn try_build(self) -> ReqxResult<HttpClient> {
+        validate_base_url(&self.base_url)?;
+
         if !backend_is_available(self.tls_backend) {
             return Err(HttpClientError::TlsBackendUnavailable {
                 backend: self.tls_backend.as_str(),
@@ -370,8 +372,12 @@ impl HttpClientBuilder {
         })
     }
 
+    #[track_caller]
     pub fn build(self) -> HttpClient {
-        self.try_build()
-            .unwrap_or_else(|error| panic!("failed to build reqx blocking http client: {error}"))
+        self.try_build().unwrap_or_else(|error| {
+            panic!(
+                "failed to build reqx blocking http client: {error}; use try_build() to handle configuration errors"
+            )
+        })
     }
 }

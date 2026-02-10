@@ -659,6 +659,22 @@ fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
 }
 
 #[test]
+fn blocking_try_build_rejects_invalid_base_url_early() {
+    let result = HttpClient::builder("ftp://api.example.com").try_build();
+    let error = match result {
+        Ok(_) => panic!("non-http base url should fail at build time"),
+        Err(error) => error,
+    };
+
+    match error {
+        HttpClientError::InvalidUri { uri } => {
+            assert_eq!(uri, "ftp://api.example.com");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_tls_root_store_system_rejects_custom_roots() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::System)

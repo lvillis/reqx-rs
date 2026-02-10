@@ -28,8 +28,8 @@ use hyper_rustls::HttpsConnectorBuilder;
 
 use crate::ReqxResult;
 use crate::body::{
-    ReadBodyError, ReqBody, RequestBody, buffered_req_body, build_http_request,
-    decode_content_encoded_body, empty_req_body, read_all_body_limited,
+    DecodeContentEncodingError, ReadBodyError, ReqBody, RequestBody, buffered_req_body,
+    build_http_request, decode_content_encoded_body_limited, empty_req_body, read_all_body_limited,
 };
 use crate::error::{HttpClientError, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
@@ -63,7 +63,7 @@ use crate::util::{
     is_redirect_status, lock_unpoisoned, merge_headers, parse_header_name, parse_header_value,
     parse_retry_after, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, resolve_uri, same_origin,
-    sanitize_headers_for_redirect, truncate_body,
+    sanitize_headers_for_redirect, truncate_body, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -398,6 +398,27 @@ fn decode_content_encoding_error(
         message,
         method: method.clone(),
         uri: uri.to_owned(),
+    }
+}
+
+fn decode_response_body_error(
+    error: DecodeContentEncodingError,
+    max_bytes: usize,
+    method: &Method,
+    uri: &str,
+) -> HttpClientError {
+    match error {
+        DecodeContentEncodingError::Decode { encoding, message } => {
+            decode_content_encoding_error(encoding, message, method, uri)
+        }
+        DecodeContentEncodingError::TooLarge { actual_bytes } => {
+            HttpClientError::ResponseBodyTooLarge {
+                limit_bytes: max_bytes,
+                actual_bytes,
+                method: method.clone(),
+                uri: uri.to_owned(),
+            }
+        }
     }
 }
 
@@ -1084,6 +1105,8 @@ impl HttpClientBuilder {
     }
 
     pub fn try_build(self) -> ReqxResult<HttpClient> {
+        validate_base_url(&self.base_url)?;
+
         let proxy_config = self.http_proxy.map(|uri| ProxyConfig {
             uri,
             authorization: self.proxy_authorization,
@@ -1137,9 +1160,11 @@ impl HttpClientBuilder {
         })
     }
 
+    #[track_caller]
     pub fn build(self) -> HttpClient {
-        self.try_build()
-            .unwrap_or_else(|error| panic!("failed to build reqx http client: {error}"))
+        self.try_build().unwrap_or_else(|error| {
+            panic!("failed to build reqx http client: {error}; use try_build() to handle configuration errors")
+        })
     }
 }
 
@@ -1786,11 +1811,15 @@ impl HttpClient {
                         return Err(error);
                     }
                 };
-                let response_body = decode_content_encoded_body(response_body, &response_headers)
-                    .map_err(|(encoding, message)| {
-                    decode_content_encoding_error(
-                        encoding,
-                        message,
+                let response_body = decode_content_encoded_body_limited(
+                    response_body,
+                    &response_headers,
+                    max_response_body_bytes,
+                )
+                .map_err(|error| {
+                    decode_response_body_error(
+                        error,
+                        max_response_body_bytes,
                         &current_method,
                         &current_redacted_uri,
                     )
@@ -2304,15 +2333,19 @@ impl HttpClient {
                     return Err(error);
                 }
             };
-            let response_body = decode_content_encoded_body(response_body, &response_headers)
-                .map_err(|(encoding, message)| {
-                    decode_content_encoding_error(
-                        encoding,
-                        message,
-                        &current_method,
-                        &current_redacted_uri,
-                    )
-                })?;
+            let response_body = decode_content_encoded_body_limited(
+                response_body,
+                &response_headers,
+                max_response_body_bytes,
+            )
+            .map_err(|error| {
+                decode_response_body_error(
+                    error,
+                    max_response_body_bytes,
+                    &current_method,
+                    &current_redacted_uri,
+                )
+            })?;
             if response_headers.contains_key(CONTENT_ENCODING) {
                 remove_content_encoding_headers(&mut response_headers);
             }

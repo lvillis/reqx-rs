@@ -88,6 +88,35 @@ pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), H
     Ok((uri_text, uri))
 }
 
+pub(crate) fn validate_base_url(base_url: &str) -> Result<(), HttpClientError> {
+    let normalized = base_url.trim();
+    if normalized.is_empty() {
+        return Err(HttpClientError::InvalidUri {
+            uri: base_url.to_owned(),
+        });
+    }
+
+    let uri = normalized
+        .parse::<Uri>()
+        .map_err(|_| HttpClientError::InvalidUri {
+            uri: base_url.to_owned(),
+        })?;
+    let Some(scheme) = uri.scheme_str() else {
+        return Err(HttpClientError::InvalidUri {
+            uri: base_url.to_owned(),
+        });
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || uri.host().is_none()
+    {
+        return Err(HttpClientError::InvalidUri {
+            uri: base_url.to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
 pub(crate) fn append_query_pairs(path: &str, query_pairs: &[(String, String)]) -> String {
     if query_pairs.is_empty() {
         return path.to_owned();

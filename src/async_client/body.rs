@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::io::Read;
+use std::io::{self, Read};
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -72,6 +72,42 @@ pub(crate) enum ReadBodyError {
     TooLarge { actual_bytes: usize },
 }
 
+#[derive(Debug)]
+pub(crate) enum DecodeContentEncodingError {
+    Decode { encoding: String, message: String },
+    TooLarge { actual_bytes: usize },
+}
+
+fn read_to_end_limited<R: Read>(
+    reader: &mut R,
+    encoding: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, DecodeContentEncodingError> {
+    let mut decoded = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+
+    loop {
+        let read = reader.read(&mut chunk).map_err(|error: io::Error| {
+            DecodeContentEncodingError::Decode {
+                encoding: encoding.to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        let next_size = decoded.len().saturating_add(read);
+        if next_size > max_bytes {
+            return Err(DecodeContentEncodingError::TooLarge {
+                actual_bytes: next_size,
+            });
+        }
+        decoded.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(decoded)
+}
+
 pub(crate) async fn read_all_body_limited(
     mut body: Incoming,
     max_bytes: usize,
@@ -95,16 +131,22 @@ pub(crate) async fn read_all_body_limited(
     Ok(Bytes::from(collected))
 }
 
-pub(crate) fn decode_content_encoded_body(
+pub(crate) fn decode_content_encoded_body_limited(
     mut body: Bytes,
     headers: &HeaderMap,
-) -> Result<Bytes, (String, String)> {
+    max_bytes: usize,
+) -> Result<Bytes, DecodeContentEncodingError> {
+    let max_bytes = max_bytes.max(1);
     let Some(content_encoding) = headers.get(CONTENT_ENCODING) else {
         return Ok(body);
     };
-    let content_encoding = content_encoding
-        .to_str()
-        .map_err(|error| ("content-encoding".to_owned(), error.to_string()))?;
+    let content_encoding =
+        content_encoding
+            .to_str()
+            .map_err(|error| DecodeContentEncodingError::Decode {
+                encoding: "content-encoding".to_owned(),
+                message: error.to_string(),
+            })?;
     let mut encodings = content_encoding
         .split(',')
         .map(str::trim)
@@ -113,35 +155,41 @@ pub(crate) fn decode_content_encoded_body(
 
     while let Some(encoding) = encodings.pop() {
         let decoded = match encoding.to_ascii_lowercase().as_str() {
-            "identity" => body.to_vec(),
+            "identity" => {
+                if body.len() > max_bytes {
+                    return Err(DecodeContentEncodingError::TooLarge {
+                        actual_bytes: body.len(),
+                    });
+                }
+                body.to_vec()
+            }
             "gzip" => {
                 let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
-                let mut decoded = Vec::new();
-                decoder
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| (encoding.to_owned(), error.to_string()))?;
-                decoded
+                read_to_end_limited(&mut decoder, encoding, max_bytes)?
             }
             "deflate" => {
                 let mut decoder = flate2::read::ZlibDecoder::new(body.as_ref());
-                let mut decoded = Vec::new();
-                decoder
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| (encoding.to_owned(), error.to_string()))?;
-                decoded
+                read_to_end_limited(&mut decoder, encoding, max_bytes)?
             }
             "br" => {
                 let mut decoder = brotli::Decompressor::new(body.as_ref(), 4096);
-                let mut decoded = Vec::new();
-                decoder
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| (encoding.to_owned(), error.to_string()))?;
-                decoded
+                read_to_end_limited(&mut decoder, encoding, max_bytes)?
             }
-            "zstd" => zstd::stream::decode_all(body.as_ref())
-                .map_err(|error| (encoding.to_owned(), error.to_string()))?,
+            "zstd" => {
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(body.as_ref()).map_err(|error| {
+                        DecodeContentEncodingError::Decode {
+                            encoding: encoding.to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                read_to_end_limited(&mut decoder, encoding, max_bytes)?
+            }
             other => {
-                return Err((other.to_owned(), "unsupported content-encoding".to_owned()));
+                return Err(DecodeContentEncodingError::Decode {
+                    encoding: other.to_owned(),
+                    message: "unsupported content-encoding".to_owned(),
+                });
             }
         };
         body = Bytes::from(decoded);

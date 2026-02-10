@@ -886,8 +886,10 @@ impl Default for AsyncResumableUploader {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(feature = "_async")]
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
 
     use super::*;
 
