@@ -226,6 +226,17 @@ impl CountingServer {
         self.served.load(Ordering::SeqCst)
     }
 
+    fn wait_for_served_count(&self, expected: usize, timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observed = self.served_count();
+            if observed >= expected || Instant::now() >= deadline {
+                return observed;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn max_active(&self) -> usize {
         self.max_active.load(Ordering::SeqCst)
     }
@@ -754,7 +765,10 @@ async fn retry_classifier_can_disable_retries() {
         HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected error variant: {other}"),
     }
-    assert_eq!(server.served_count(), 1);
+    assert_eq!(
+        server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -877,7 +891,10 @@ async fn circuit_breaker_short_circuits_after_opening() {
         other => panic!("unexpected second error variant: {other}"),
     }
 
-    assert_eq!(server.served_count(), 1);
+    assert_eq!(
+        server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
