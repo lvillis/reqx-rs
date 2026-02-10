@@ -7,10 +7,10 @@ use flate2::write::GzEncoder;
 
 use crate::body::decode_content_encoded_body;
 use crate::client::HttpClient;
-use crate::error::{HttpClientError, HttpClientErrorCode};
+use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
 use crate::response::HttpResponse;
-use crate::retry::{RetryPolicy, request_supports_retry};
+use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::TlsBackend;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, ensure_accept_encoding, join_base_path,
@@ -156,6 +156,101 @@ fn retry_policy_backoff_is_capped() {
         retry_policy.backoff_for_retry(3),
         Duration::from_millis(250)
     );
+}
+
+#[test]
+fn retry_policy_can_filter_transport_error_kinds() {
+    let retry_policy =
+        RetryPolicy::standard().retryable_transport_error_kinds([TransportErrorKind::Connect]);
+    let connect_decision = RetryDecision {
+        attempt: 1,
+        max_attempts: 3,
+        method: http::Method::GET,
+        uri: "https://example.com".to_owned(),
+        status: None,
+        transport_error_kind: Some(TransportErrorKind::Connect),
+        timeout_phase: None,
+        response_body_read_error: false,
+    };
+    let dns_decision = RetryDecision {
+        transport_error_kind: Some(TransportErrorKind::Dns),
+        ..connect_decision.clone()
+    };
+
+    assert!(retry_policy.should_retry_decision(&connect_decision));
+    assert!(!retry_policy.should_retry_decision(&dns_decision));
+}
+
+#[test]
+fn retry_policy_status_retry_window_caps_followup_attempts() {
+    let retry_policy = RetryPolicy::standard()
+        .retryable_status_codes([429_u16, 503_u16])
+        .status_retry_window(429, 2);
+    let first_429 = RetryDecision {
+        attempt: 1,
+        max_attempts: 5,
+        method: http::Method::GET,
+        uri: "https://example.com/rate".to_owned(),
+        status: Some(http::StatusCode::TOO_MANY_REQUESTS),
+        transport_error_kind: None,
+        timeout_phase: None,
+        response_body_read_error: false,
+    };
+    let second_429 = RetryDecision {
+        attempt: 2,
+        ..first_429.clone()
+    };
+    let third_503 = RetryDecision {
+        attempt: 3,
+        status: Some(http::StatusCode::SERVICE_UNAVAILABLE),
+        ..first_429.clone()
+    };
+
+    assert!(retry_policy.should_retry_decision(&first_429));
+    assert!(!retry_policy.should_retry_decision(&second_429));
+    assert!(retry_policy.should_retry_decision(&third_503));
+}
+
+#[test]
+fn retry_policy_timeout_and_read_body_windows_are_configurable() {
+    let retry_policy = RetryPolicy::standard()
+        .retryable_timeout_phases([TimeoutPhase::Transport])
+        .timeout_retry_window(TimeoutPhase::Transport, 2)
+        .response_body_read_retry_window(2);
+    let transport_timeout_first = RetryDecision {
+        attempt: 1,
+        max_attempts: 5,
+        method: http::Method::GET,
+        uri: "https://example.com/timeout".to_owned(),
+        status: None,
+        transport_error_kind: None,
+        timeout_phase: Some(TimeoutPhase::Transport),
+        response_body_read_error: false,
+    };
+    let transport_timeout_second = RetryDecision {
+        attempt: 2,
+        ..transport_timeout_first.clone()
+    };
+    let response_timeout = RetryDecision {
+        timeout_phase: Some(TimeoutPhase::ResponseBody),
+        ..transport_timeout_first.clone()
+    };
+    let read_body_first = RetryDecision {
+        attempt: 1,
+        timeout_phase: None,
+        response_body_read_error: true,
+        ..transport_timeout_first.clone()
+    };
+    let read_body_second = RetryDecision {
+        attempt: 2,
+        ..read_body_first.clone()
+    };
+
+    assert!(retry_policy.should_retry_decision(&transport_timeout_first));
+    assert!(!retry_policy.should_retry_decision(&transport_timeout_second));
+    assert!(!retry_policy.should_retry_decision(&response_timeout));
+    assert!(retry_policy.should_retry_decision(&read_body_first));
+    assert!(!retry_policy.should_retry_decision(&read_body_second));
 }
 
 #[test]

@@ -54,8 +54,10 @@ impl HttpResponse {
 mod stream {
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
+    use http_body_util::BodyExt;
     use hyper::body::Incoming;
     use serde::de::DeserializeOwned;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     use crate::ReqxResult;
     use crate::body::{ReadBodyError, decode_content_encoded_body, read_all_body_limited};
@@ -134,6 +136,77 @@ mod stream {
                 .map_err(|error| map_read_body_error(error, &self.method, &self.uri, max_bytes))
         }
 
+        pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> ReqxResult<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            let mut copied = 0_u64;
+
+            while let Some(frame) = self.body.frame().await {
+                let frame = frame.map_err(|source| HttpClientError::ReadBody {
+                    source: Box::new(source),
+                })?;
+                if let Some(data) = frame.data_ref() {
+                    writer
+                        .write_all(data)
+                        .await
+                        .map_err(|source| HttpClientError::ReadBody {
+                            source: Box::new(source),
+                        })?;
+                    copied = copied.saturating_add(data.len() as u64);
+                }
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|source| HttpClientError::ReadBody {
+                    source: Box::new(source),
+                })?;
+            Ok(copied)
+        }
+
+        pub async fn copy_to_writer_limited<W>(
+            mut self,
+            writer: &mut W,
+            max_bytes: usize,
+        ) -> ReqxResult<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            let max_bytes = max_bytes.max(1);
+            let mut copied = 0_u64;
+
+            while let Some(frame) = self.body.frame().await {
+                let frame = frame.map_err(|source| HttpClientError::ReadBody {
+                    source: Box::new(source),
+                })?;
+                if let Some(data) = frame.data_ref() {
+                    copied = copied.saturating_add(data.len() as u64);
+                    if copied > max_bytes as u64 {
+                        return Err(HttpClientError::ResponseBodyTooLarge {
+                            limit_bytes: max_bytes,
+                            actual_bytes: copied as usize,
+                            method: self.method.clone(),
+                            uri: self.uri.clone(),
+                        });
+                    }
+                    writer
+                        .write_all(data)
+                        .await
+                        .map_err(|source| HttpClientError::ReadBody {
+                            source: Box::new(source),
+                        })?;
+                }
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|source| HttpClientError::ReadBody {
+                    source: Box::new(source),
+                })?;
+            Ok(copied)
+        }
+
         pub async fn into_response_limited(self, max_bytes: usize) -> ReqxResult<HttpResponse> {
             let HttpResponseStream {
                 status,
@@ -179,7 +252,7 @@ mod stream {
 
 #[cfg(feature = "_blocking")]
 mod blocking_stream {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
@@ -283,6 +356,67 @@ mod blocking_stream {
                 .as_reader()
                 .read(buffer)
                 .map_err(|source| map_read_error(source, &self.method, &self.uri, self.timeout_ms))
+        }
+
+        pub fn copy_to_writer<W>(mut self, writer: &mut W) -> ReqxResult<u64>
+        where
+            W: Write + ?Sized,
+        {
+            let mut chunk = [0_u8; 8192];
+            let mut copied = 0_u64;
+            loop {
+                let read = self.read_chunk(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                writer
+                    .write_all(&chunk[..read])
+                    .map_err(|source| HttpClientError::ReadBody {
+                        source: Box::new(source),
+                    })?;
+                copied = copied.saturating_add(read as u64);
+            }
+            writer.flush().map_err(|source| HttpClientError::ReadBody {
+                source: Box::new(source),
+            })?;
+            Ok(copied)
+        }
+
+        pub fn copy_to_writer_limited<W>(
+            mut self,
+            writer: &mut W,
+            max_bytes: usize,
+        ) -> ReqxResult<u64>
+        where
+            W: Write + ?Sized,
+        {
+            let max_bytes = max_bytes.max(1);
+            let mut chunk = [0_u8; 8192];
+            let mut copied = 0_u64;
+            loop {
+                let read = self.read_chunk(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                copied = copied.saturating_add(read as u64);
+                if copied > max_bytes as u64 {
+                    return Err(HttpClientError::ResponseBodyTooLarge {
+                        limit_bytes: max_bytes,
+                        actual_bytes: copied as usize,
+                        method: self.method.clone(),
+                        uri: self.uri.clone(),
+                    });
+                }
+                writer
+                    .write_all(&chunk[..read])
+                    .map_err(|source| HttpClientError::ReadBody {
+                        source: Box::new(source),
+                    })?;
+            }
+            writer.flush().map_err(|source| HttpClientError::ReadBody {
+                source: Box::new(source),
+            })?;
+            Ok(copied)
         }
 
         pub fn into_bytes_limited(mut self, max_bytes: usize) -> ReqxResult<Bytes> {

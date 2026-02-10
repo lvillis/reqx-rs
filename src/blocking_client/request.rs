@@ -2,7 +2,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use http::{HeaderMap, Method};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -108,6 +108,30 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    pub fn upload_from_reader<R>(self, reader: R) -> Self
+    where
+        R: Read + Send + Sync + 'static,
+    {
+        self.body_reader(reader)
+    }
+
+    pub fn upload_from_reader_with_length<R>(
+        self,
+        reader: R,
+        content_length: u64,
+    ) -> ReqxResult<Self>
+    where
+        R: Read + Send + Sync + 'static,
+    {
+        let value = HeaderValue::from_str(&content_length.to_string()).map_err(|source| {
+            crate::error::HttpClientError::InvalidHeaderValue {
+                name: CONTENT_LENGTH.as_str().to_owned(),
+                source,
+            }
+        })?;
+        Ok(self.body_reader(reader).header(CONTENT_LENGTH, value))
+    }
+
     pub fn body_bytes(mut self, body: Bytes) -> Self {
         self.body = Some(RequestBody::Buffered(body));
         self
@@ -195,6 +219,21 @@ impl<'a> RequestBuilder<'a> {
             self.body,
             execution_options,
         )
+    }
+
+    pub fn download_to_writer<W>(self, writer: &mut W) -> ReqxResult<u64>
+    where
+        W: std::io::Write + ?Sized,
+    {
+        self.send_stream()?.copy_to_writer(writer)
+    }
+
+    pub fn download_to_writer_limited<W>(self, writer: &mut W, max_bytes: usize) -> ReqxResult<u64>
+    where
+        W: std::io::Write + ?Sized,
+    {
+        self.send_stream()?
+            .copy_to_writer_limited(writer, max_bytes)
     }
 
     pub fn send_json<T>(self) -> ReqxResult<T>

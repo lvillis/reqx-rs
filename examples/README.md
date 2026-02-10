@@ -17,7 +17,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 3. `request_overrides` - Per-request timeout and retry overrides.
 4. `error_handling` - Pattern match `HttpClientError` + stable `error.code()`.
 5. `metrics_snapshot` - Read runtime metrics counters.
-6. `streaming` - Stream upload and stream response body.
+6. `streaming` - `upload_from_reader()` and `download_to_writer_limited()`.
 7. `concurrency_limits` - `max_in_flight` behavior under parallel load.
 8. `resilience_controls` - Retry budget, circuit breaker, and adaptive concurrency.
 9. `rate_limit_429` - Global/per-host rate limiting with `429 Retry-After` backpressure.
@@ -27,7 +27,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 13. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
 14. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
 15. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
-16. `blocking_streaming` - Blocking stream download with limited read helpers.
+16. `blocking_streaming` - Blocking `upload_from_reader_with_length()` + `download_to_writer_limited()`.
 
 ## Example Index
 
@@ -38,7 +38,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 | `request_overrides.rs`    | Override timeout/retry at request level                           | `cargo run --example request_overrides`                                                |
 | `error_handling.rs`       | Match error variants and print error codes                        | `cargo run --example error_handling`                                                   |
 | `metrics_snapshot.rs`     | Observe requests/retries/status/error counters                    | `cargo run --example metrics_snapshot`                                                 |
-| `streaming.rs`            | `body_stream()` upload and `send_stream()` download               | `cargo run --example streaming`                                                        |
+| `streaming.rs`            | Async reader upload and writer download helpers                   | `cargo run --example streaming`                                                        |
 | `concurrency_limits.rs`   | Demonstrate serialized execution with limiter                     | `cargo run --example concurrency_limits`                                               |
 | `resilience_controls.rs`  | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls`                                              |
 | `rate_limit_429.rs`       | Configure global/per-host rate limits and 429 backpressure        | `cargo run --example rate_limit_429`                                                   |
@@ -48,7 +48,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 | `custom_ca_mtls.rs`       | Configure custom CA trust and mTLS client identity                | `cargo run --example custom_ca_mtls`                                                   |
 | `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy                     | `cargo run --example interceptor_redirect`                                             |
 | `blocking_basic.rs`       | Blocking request flow with sync transport                         | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
-| `blocking_streaming.rs`   | Blocking `send_stream()` + consistent stream read errors          | `cargo run --example blocking_streaming --no-default-features -F blocking-tls-rustls-ring` |
+| `blocking_streaming.rs`   | Blocking reader upload + writer download helpers                  | `cargo run --example blocking_streaming --no-default-features -F blocking-tls-rustls-ring` |
 
 ## Feature-Specific TLS Runs
 

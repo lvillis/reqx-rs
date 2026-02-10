@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use reqx::prelude::{
     AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, HttpClient, RetryBudgetPolicy, RetryPolicy,
+    TimeoutPhase, TransportErrorKind,
 };
 
 #[tokio::main]
@@ -15,7 +16,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_attempts(5)
                 .base_backoff(Duration::from_millis(100))
                 .max_backoff(Duration::from_millis(800))
-                .jitter_ratio(0.1),
+                .jitter_ratio(0.1)
+                .retryable_transport_error_kinds([
+                    TransportErrorKind::Connect,
+                    TransportErrorKind::Read,
+                    TransportErrorKind::Dns,
+                ])
+                .retryable_timeout_phases([TimeoutPhase::Transport, TimeoutPhase::ResponseBody])
+                .status_retry_window(429, 5)
+                .status_retry_window(503, 4)
+                .timeout_retry_window(TimeoutPhase::ResponseBody, 2)
+                .transport_retry_window(TransportErrorKind::Dns, 2)
+                .response_body_read_retry_window(2),
         )
         .retry_budget_policy(
             RetryBudgetPolicy::standard()

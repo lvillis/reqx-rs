@@ -13,6 +13,7 @@ use reqx::prelude::{
     CircuitBreakerPolicy, HttpClient, HttpClientError, RetryBudgetPolicy, RetryClassifier,
     RetryDecision, RetryPolicy,
 };
+use tokio::io::sink;
 
 #[derive(Clone)]
 struct ResponseSpec {
@@ -1006,6 +1007,69 @@ async fn send_stream_into_response_limited_enforces_limit_with_consistent_error(
             assert!(actual_bytes > limit_bytes);
             assert_eq!(method, http::Method::GET);
             assert!(uri.contains("/stream-over-limit"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_to_writer_transfers_stream_bytes() {
+    let payload = b"writer-stream-async".to_vec();
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "application/octet-stream")],
+            payload.clone(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let mut output = sink();
+    let written = client
+        .get("/stream-to-writer")
+        .download_to_writer(&mut output)
+        .await
+        .expect("download_to_writer should succeed");
+    assert_eq!(written as usize, payload.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_to_writer_limited_enforces_limit_with_consistent_error() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "application/octet-stream")],
+            b"0123456789".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let mut output = sink();
+    let error = client
+        .get("/stream-to-writer-limit")
+        .download_to_writer_limited(&mut output, 4)
+        .await
+        .expect_err("download_to_writer_limited should enforce max bytes");
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            method,
+            uri,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 4);
+            assert_eq!(method, http::Method::GET);
+            assert!(uri.contains("/stream-to-writer-limit"));
         }
         other => panic!("unexpected error variant: {other}"),
     }

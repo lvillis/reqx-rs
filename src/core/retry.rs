@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +53,13 @@ pub struct RetryPolicy {
     max_backoff: Duration,
     jitter_ratio: f64,
     retryable_status_codes: BTreeSet<u16>,
+    retryable_transport_error_kinds: BTreeSet<TransportErrorKind>,
+    retryable_timeout_phases: BTreeSet<TimeoutPhase>,
+    retry_on_response_body_read_error: bool,
+    status_retry_windows: BTreeMap<u16, usize>,
+    transport_retry_windows: BTreeMap<TransportErrorKind, usize>,
+    timeout_retry_windows: BTreeMap<TimeoutPhase, usize>,
+    response_body_read_retry_window: Option<usize>,
     retry_classifier: Option<Arc<dyn RetryClassifier>>,
 }
 
@@ -65,6 +72,22 @@ impl std::fmt::Debug for RetryPolicy {
             .field("max_backoff", &self.max_backoff)
             .field("jitter_ratio", &self.jitter_ratio)
             .field("retryable_status_codes", &self.retryable_status_codes)
+            .field(
+                "retryable_transport_error_kinds",
+                &self.retryable_transport_error_kinds,
+            )
+            .field("retryable_timeout_phases", &self.retryable_timeout_phases)
+            .field(
+                "retry_on_response_body_read_error",
+                &self.retry_on_response_body_read_error,
+            )
+            .field("status_retry_windows", &self.status_retry_windows)
+            .field("transport_retry_windows", &self.transport_retry_windows)
+            .field("timeout_retry_windows", &self.timeout_retry_windows)
+            .field(
+                "response_body_read_retry_window",
+                &self.response_body_read_retry_window,
+            )
             .finish()
     }
 }
@@ -77,6 +100,13 @@ impl RetryPolicy {
             max_backoff: Duration::from_secs(2),
             jitter_ratio: 0.0,
             retryable_status_codes: default_retryable_status_codes(),
+            retryable_transport_error_kinds: default_retryable_transport_error_kinds(),
+            retryable_timeout_phases: default_retryable_timeout_phases(),
+            retry_on_response_body_read_error: true,
+            status_retry_windows: BTreeMap::new(),
+            transport_retry_windows: BTreeMap::new(),
+            timeout_retry_windows: BTreeMap::new(),
+            response_body_read_retry_window: None,
             retry_classifier: None,
         }
     }
@@ -88,6 +118,13 @@ impl RetryPolicy {
             max_backoff: Duration::from_secs(2),
             jitter_ratio: 0.2,
             retryable_status_codes: default_retryable_status_codes(),
+            retryable_transport_error_kinds: default_retryable_transport_error_kinds(),
+            retryable_timeout_phases: default_retryable_timeout_phases(),
+            retry_on_response_body_read_error: true,
+            status_retry_windows: BTreeMap::new(),
+            transport_retry_windows: BTreeMap::new(),
+            timeout_retry_windows: BTreeMap::new(),
+            response_body_read_retry_window: None,
             retry_classifier: None,
         }
     }
@@ -120,6 +157,50 @@ impl RetryPolicy {
         self
     }
 
+    pub fn retryable_transport_error_kinds(
+        mut self,
+        kinds: impl IntoIterator<Item = TransportErrorKind>,
+    ) -> Self {
+        self.retryable_transport_error_kinds = kinds.into_iter().collect();
+        self
+    }
+
+    pub fn retryable_timeout_phases(
+        mut self,
+        phases: impl IntoIterator<Item = TimeoutPhase>,
+    ) -> Self {
+        self.retryable_timeout_phases = phases.into_iter().collect();
+        self
+    }
+
+    pub fn retry_on_response_body_read_error(mut self, retry: bool) -> Self {
+        self.retry_on_response_body_read_error = retry;
+        self
+    }
+
+    pub fn status_retry_window(mut self, status: u16, max_attempts: usize) -> Self {
+        self.status_retry_windows
+            .insert(status, max_attempts.max(1));
+        self
+    }
+
+    pub fn transport_retry_window(mut self, kind: TransportErrorKind, max_attempts: usize) -> Self {
+        self.transport_retry_windows
+            .insert(kind, max_attempts.max(1));
+        self
+    }
+
+    pub fn timeout_retry_window(mut self, phase: TimeoutPhase, max_attempts: usize) -> Self {
+        self.timeout_retry_windows
+            .insert(phase, max_attempts.max(1));
+        self
+    }
+
+    pub fn response_body_read_retry_window(mut self, max_attempts: usize) -> Self {
+        self.response_body_read_retry_window = Some(max_attempts.max(1));
+        self
+    }
+
     pub fn retry_classifier(mut self, retry_classifier: Arc<dyn RetryClassifier>) -> Self {
         self.retry_classifier = Some(retry_classifier);
         self
@@ -133,14 +214,40 @@ impl RetryPolicy {
         self.retryable_status_codes.contains(&status.as_u16())
     }
 
+    fn is_within_retry_window(limit: Option<usize>, attempt: usize) -> bool {
+        match limit {
+            Some(limit) => attempt < limit.max(1),
+            None => true,
+        }
+    }
+
     pub(crate) fn should_retry_decision(&self, decision: &RetryDecision) -> bool {
         if let Some(retry_classifier) = &self.retry_classifier {
             return retry_classifier.should_retry(decision);
         }
-        match decision.status {
-            Some(status) => self.should_retry_status(status),
-            None => true,
+        if let Some(status) = decision.status {
+            let window = self.status_retry_windows.get(&status.as_u16()).copied();
+            return self.should_retry_status(status)
+                && Self::is_within_retry_window(window, decision.attempt);
         }
+        if let Some(kind) = decision.transport_error_kind {
+            let window = self.transport_retry_windows.get(&kind).copied();
+            return self.retryable_transport_error_kinds.contains(&kind)
+                && Self::is_within_retry_window(window, decision.attempt);
+        }
+        if let Some(phase) = decision.timeout_phase {
+            let window = self.timeout_retry_windows.get(&phase).copied();
+            return self.retryable_timeout_phases.contains(&phase)
+                && Self::is_within_retry_window(window, decision.attempt);
+        }
+        if decision.response_body_read_error {
+            return self.retry_on_response_body_read_error
+                && Self::is_within_retry_window(
+                    self.response_body_read_retry_window,
+                    decision.attempt,
+                );
+        }
+        true
     }
 
     pub(crate) fn backoff_for_retry(&self, retry_index: usize) -> Duration {
@@ -182,6 +289,24 @@ impl Default for RetryPolicy {
 
 fn default_retryable_status_codes() -> BTreeSet<u16> {
     [429_u16, 500, 502, 503, 504].into_iter().collect()
+}
+
+fn default_retryable_transport_error_kinds() -> BTreeSet<TransportErrorKind> {
+    [
+        TransportErrorKind::Dns,
+        TransportErrorKind::Connect,
+        TransportErrorKind::Tls,
+        TransportErrorKind::Read,
+        TransportErrorKind::Other,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn default_retryable_timeout_phases() -> BTreeSet<TimeoutPhase> {
+    [TimeoutPhase::Transport, TimeoutPhase::ResponseBody]
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn request_supports_retry(method: &Method, headers: &HeaderMap) -> bool {

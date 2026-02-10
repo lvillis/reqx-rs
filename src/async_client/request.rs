@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use http::{HeaderMap, Method};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::ReaderStream;
 
 use crate::body::{RequestBody, stream_req_body};
@@ -117,6 +117,30 @@ impl<'a> RequestBuilder<'a> {
         self.body_stream(ReaderStream::new(reader))
     }
 
+    pub fn upload_from_reader<R>(self, reader: R) -> Self
+    where
+        R: AsyncRead + Send + Sync + 'static,
+    {
+        self.body_reader(reader)
+    }
+
+    pub fn upload_from_reader_with_length<R>(
+        self,
+        reader: R,
+        content_length: u64,
+    ) -> ReqxResult<Self>
+    where
+        R: AsyncRead + Send + Sync + 'static,
+    {
+        let value = HeaderValue::from_str(&content_length.to_string()).map_err(|source| {
+            crate::error::HttpClientError::InvalidHeaderValue {
+                name: CONTENT_LENGTH.as_str().to_owned(),
+                source,
+            }
+        })?;
+        Ok(self.body_reader(reader).header(CONTENT_LENGTH, value))
+    }
+
     pub fn body_bytes(mut self, body: Bytes) -> Self {
         self.body = Some(RequestBody::Buffered(body));
         self
@@ -207,6 +231,27 @@ impl<'a> RequestBuilder<'a> {
                 self.body,
                 execution_options,
             )
+            .await
+    }
+
+    pub async fn download_to_writer<W>(self, writer: &mut W) -> ReqxResult<u64>
+    where
+        W: AsyncWrite + Unpin + Send + ?Sized,
+    {
+        self.send_stream().await?.copy_to_writer(writer).await
+    }
+
+    pub async fn download_to_writer_limited<W>(
+        self,
+        writer: &mut W,
+        max_bytes: usize,
+    ) -> ReqxResult<u64>
+    where
+        W: AsyncWrite + Unpin + Send + ?Sized,
+    {
+        self.send_stream()
+            .await?
+            .copy_to_writer_limited(writer, max_bytes)
             .await
     }
 

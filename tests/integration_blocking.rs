@@ -698,6 +698,63 @@ fn blocking_send_stream_maps_decode_error_consistently() {
 }
 
 #[test]
+fn blocking_download_to_writer_writes_stream_without_buffering() {
+    let payload = b"writer-stream-ok".to_vec();
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        payload.clone(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let mut output = Vec::new();
+    let written = client
+        .get("/v1/download-writer")
+        .download_to_writer(&mut output)
+        .expect("download_to_writer should succeed");
+    assert_eq!(written as usize, payload.len());
+    assert_eq!(output, payload);
+}
+
+#[test]
+fn blocking_download_to_writer_limited_maps_limit_error() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"0123456789".to_vec(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let mut output = Vec::new();
+    let error = client
+        .get("/v1/download-limit")
+        .download_to_writer_limited(&mut output, 4)
+        .expect_err("download_to_writer_limited should enforce max bytes");
+
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            method,
+            uri,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 4);
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/download-limit"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_redirect_policy_follows_relative_location() {
     let server = MockServer::start(vec![
         MockResponse::new(302, vec![("Location", "/v1/new")], b"redirect".to_vec()),
