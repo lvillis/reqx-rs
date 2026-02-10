@@ -5,6 +5,8 @@
 //! # Quick Start
 //!
 //! ```no_run
+//! # #[cfg(feature = "_async")]
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::time::Duration;
 //! use reqx::prelude::{HttpClient, RetryPolicy};
 //! use serde::Deserialize;
@@ -14,8 +16,6 @@
 //!     id: String,
 //! }
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = HttpClient::builder("https://api.example.com")
 //!         .client_name("my-sdk")
 //!         .request_timeout(Duration::from_secs(3))
@@ -37,7 +37,7 @@
 //!
 //!     println!("created id={}", created.id);
 //!     Ok(())
-//! }
+//! # }
 //! ```
 //!
 //! # Recommended Defaults

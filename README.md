@@ -58,6 +58,7 @@ cargo add reqx --no-default-features -F blocking-tls-native
 - runtime selection via `tls_backend(TlsBackend::...)`
 - build-time mismatch returns structured error from `try_build()`
 - trust store selection via `tls_root_store(TlsRootStore::BackendDefault | WebPki | System | Specific)`
+- `BackendDefault` follows each backend's default trust roots; set `System` explicitly for enterprise/private PKI environments
 - custom root CA: `tls_root_store(TlsRootStore::Specific)` + `tls_root_ca_pem(...)` / `tls_root_ca_der(...)`
 - mTLS identity:
   - PEM chain + key: `tls_client_identity_pem(...)` (async + sync)

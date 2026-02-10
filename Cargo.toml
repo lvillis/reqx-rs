@@ -127,6 +127,75 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 [[bench]]
 name = "transport"
 harness = false
+required-features = ["_async"]
+
+[[example]]
+name = "basic_json"
+required-features = ["_async"]
+
+[[example]]
+name = "concurrency_limits"
+required-features = ["_async"]
+
+[[example]]
+name = "custom_ca_mtls"
+required-features = ["_async"]
+
+[[example]]
+name = "error_handling"
+required-features = ["_async"]
+
+[[example]]
+name = "interceptor_redirect"
+required-features = ["_async"]
+
+[[example]]
+name = "metrics_snapshot"
+required-features = ["_async"]
+
+[[example]]
+name = "proxy_and_no_proxy"
+required-features = ["_async"]
+
+[[example]]
+name = "rate_limit_429"
+required-features = ["_async"]
+
+[[example]]
+name = "request_helpers"
+required-features = ["_async"]
+
+[[example]]
+name = "request_overrides"
+required-features = ["_async"]
+
+[[example]]
+name = "resilience_controls"
+required-features = ["_async"]
+
+[[example]]
+name = "resumable_upload"
+required-features = ["_async"]
+
+[[example]]
+name = "retry_classifier"
+required-features = ["_async"]
+
+[[example]]
+name = "streaming"
+required-features = ["_async"]
+
+[[example]]
+name = "tls_backends"
+required-features = ["_async"]
+
+[[example]]
+name = "blocking_basic"
+required-features = ["_blocking"]
+
+[[example]]
+name = "blocking_streaming"
+required-features = ["_blocking"]
 
 [package.metadata.docs.rs]
 no-default-features = true
