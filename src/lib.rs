@@ -82,6 +82,7 @@ mod http;
 mod rate_limit;
 mod resilience;
 mod tls;
+mod upload;
 
 #[cfg(feature = "_async")]
 pub(crate) use crate::async_client::body;
@@ -123,6 +124,12 @@ pub use crate::retry::{
     StrictRetryEligibility,
 };
 pub use crate::tls::TlsBackend;
+#[cfg(feature = "_async")]
+pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
+pub use crate::upload::{
+    BlockingResumableUploadBackend, BlockingResumableUploader, ResumableUploadCheckpoint,
+    ResumableUploadError, ResumableUploadOptions, ResumableUploadResult, UploadedPart,
+};
 
 #[cfg(feature = "_blocking")]
 pub mod blocking {
@@ -133,19 +140,23 @@ pub type ReqxResult<T> = std::result::Result<T, HttpClientError>;
 
 pub mod prelude {
     pub use crate::{
-        AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode,
-        HttpClientMetricsSnapshot, HttpInterceptor, HttpResponse, PermissiveRetryEligibility,
-        RateLimitPolicy, RedirectPolicy, RequestContext, ReqxResult, RetryBudgetPolicy,
-        RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility,
-        TimeoutPhase, TlsBackend, TransportErrorKind,
+        AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
+        CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot,
+        HttpInterceptor, HttpResponse, PermissiveRetryEligibility, RateLimitPolicy, RedirectPolicy,
+        RequestContext, ReqxResult, ResumableUploadCheckpoint, ResumableUploadError,
+        ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
+        RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility, TimeoutPhase,
+        TlsBackend, TransportErrorKind, UploadedPart,
+    };
+    #[cfg(feature = "_async")]
+    pub use crate::{
+        AsyncResumableUploadBackend, AsyncResumableUploader, HttpClient, HttpResponseStream,
     };
     #[cfg(feature = "_blocking")]
     pub use crate::{
         BlockingHttpClient, BlockingHttpClientBuilder, BlockingHttpResponseStream,
         BlockingRequestBuilder, blocking,
     };
-    #[cfg(feature = "_async")]
-    pub use crate::{HttpClient, HttpResponseStream};
 }
 
 #[cfg(all(test, feature = "_async"))]

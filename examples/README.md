@@ -28,6 +28,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 14. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
 15. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
 16. `blocking_streaming` - Blocking `upload_from_reader_with_length()` + `download_to_writer_limited()`.
+17. `resumable_upload` - Protocol-agnostic resumable multipart upload with checkpoint resume.
 
 ## Example Index
 
@@ -49,6 +50,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 | `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy                     | `cargo run --example interceptor_redirect`                                             |
 | `blocking_basic.rs`       | Blocking request flow with sync transport                         | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
 | `blocking_streaming.rs`   | Blocking reader upload + writer download helpers                  | `cargo run --example blocking_streaming --no-default-features -F blocking-tls-rustls-ring` |
+| `resumable_upload.rs`     | Async resumable multipart upload with persisted checkpoint         | `cargo run --example resumable_upload`                                                   |
 
 ## Feature-Specific TLS Runs
 
