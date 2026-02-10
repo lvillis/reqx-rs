@@ -1,3 +1,8 @@
+## [0.1.4] - 2026-02-10
+
+### 🧪 Testing
+
+- Stabilize async resilience served-count assertions
 ## [0.1.3] - 2026-02-10
 
 ### 🚀 Features
@@ -23,6 +28,7 @@
 
 - *(examples)* Switch to a more reliable public echo service
 - *(examples)* Switch to a more reliable public echo service
+- Release reqx version 0.1.3
 ## [0.1.2] - 2026-02-09
 
 ### 🚀 Features
