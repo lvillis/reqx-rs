@@ -1,8 +1,17 @@
+## [0.1.7] - 2026-02-10
+
+### 🐛 Bug Fixes
+
+- Harden decoding limits and validate base URLs early
 ## [0.1.6] - 2026-02-10
 
 ### 🐛 Bug Fixes
 
 - Gate examples and docs by feature set for blocking-only builds
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.6
 ## [0.1.5] - 2026-02-10
 
 ### 🚀 Features
