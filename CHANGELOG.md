@@ -1,8 +1,17 @@
+## [0.1.5] - 2026-02-10
+
+### 🚀 Features
+
+- Unify TLS trust-store semantics for custom CAs
 ## [0.1.4] - 2026-02-10
 
 ### 🧪 Testing
 
 - Stabilize async resilience served-count assertions
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.4
 ## [0.1.3] - 2026-02-10
 
 ### 🚀 Features
