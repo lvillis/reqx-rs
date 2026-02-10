@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_backend(TlsBackend::RustlsRing);
     }
 
-    let client = builder.try_build()?;
+    let client = builder.build()?;
     println!("selected tls backend = {:?}", client.tls_backend());
 
     let response = client.get("/status/200").send().await?;

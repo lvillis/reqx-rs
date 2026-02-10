@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http_proxy(proxy_uri)
         .try_proxy_authorization("Basic ZGVtbzpkZW1v")?
         .no_proxy(["localhost", "127.0.0.1", ".internal.example.com"])
-        .try_build()?;
+        .build()?;
 
     // This example focuses on proxy configuration. Update the proxy URI above and
     // issue a real request in your environment if needed.

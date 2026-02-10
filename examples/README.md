@@ -15,7 +15,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 1. `basic_json` - Base client, retries, JSON send/receive.
 2. `request_helpers` - Query, form, and header helpers.
 3. `request_overrides` - Per-request timeout and retry overrides.
-4. `error_handling` - Pattern match `HttpClientError` + stable `error.code()`.
+4. `error_handling` - Pattern match `Error` + stable `error.code()`.
 5. `metrics_snapshot` - Read runtime metrics counters.
 6. `streaming` - `upload_from_reader()` and `download_to_writer_limited()`.
 7. `concurrency_limits` - `max_in_flight` behavior under parallel load.

@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tls_root_store(TlsRootStore::Specific)
         .tls_root_ca_pem(ca_pem)
         .tls_client_identity_pem(client_cert_chain_pem, client_key_pem)
-        .try_build()?;
+        .build()?;
 
     println!("selected tls backend = {:?}", client.tls_backend());
 
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     .tls_backend(TlsBackend::NativeTls)
     //     .tls_root_ca_pem(std::fs::read("certs/ca.pem")?)
     //     .tls_client_identity_pkcs12(identity_p12, "changeit")
-    //     .try_build()?;
+    //     .build()?;
 
     Ok(())
 }

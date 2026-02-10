@@ -235,6 +235,7 @@ fn benchmark_client(base_url: &str) -> HttpClient {
         .retry_policy(RetryPolicy::disabled())
         .pool_max_idle_per_host(64)
         .build()
+        .expect("benchmark client should build")
 }
 
 fn bench_small_get_latency(c: &mut Criterion) {

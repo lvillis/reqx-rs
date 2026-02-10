@@ -9,7 +9,7 @@ mod enabled {
     use opentelemetry::metrics::{Counter, Histogram};
     use opentelemetry::trace::{Span, SpanKind, Tracer};
 
-    use crate::error::HttpClientError;
+    use crate::error::Error;
 
     #[derive(Clone, Debug, Default)]
     pub(crate) struct OtelTelemetry {
@@ -88,7 +88,7 @@ mod enabled {
             inner.requests_succeeded.add(1, &attributes);
         }
 
-        pub(crate) fn record_request_failed(&self, error: &HttpClientError) {
+        pub(crate) fn record_request_failed(&self, error: &Error) {
             let Some(inner) = &self.inner else {
                 return;
             };
@@ -165,7 +165,7 @@ mod enabled {
         pub(crate) fn finish_request_span_error(
             &self,
             mut request_span: OtelRequestSpan,
-            error: &HttpClientError,
+            error: &Error,
         ) {
             let Some(span) = request_span.span.as_mut() else {
                 return;
@@ -192,7 +192,7 @@ mod enabled {
 
     use http::Method;
 
-    use crate::error::HttpClientError;
+    use crate::error::Error;
 
     #[derive(Clone, Debug, Default)]
     pub(crate) struct OtelTelemetry;
@@ -213,7 +213,7 @@ mod enabled {
 
         pub(crate) fn record_request_succeeded(&self, _status: u16) {}
 
-        pub(crate) fn record_request_failed(&self, _error: &HttpClientError) {}
+        pub(crate) fn record_request_failed(&self, _error: &Error) {}
 
         pub(crate) fn record_retry(&self) {}
 
@@ -238,7 +238,7 @@ mod enabled {
         pub(crate) fn finish_request_span_error(
             &self,
             _request_span: OtelRequestSpan,
-            _error: &HttpClientError,
+            _error: &Error,
         ) {
         }
     }

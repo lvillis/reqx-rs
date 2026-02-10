@@ -5,8 +5,7 @@ use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 use http::{HeaderMap, Method, Uri};
 
-use crate::ReqxResult;
-use crate::error::{HttpClientError, TransportErrorKind};
+use crate::error::{Error, TransportErrorKind};
 use crate::proxy::ProxyConfig;
 use crate::tls::{
     TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
@@ -69,7 +68,7 @@ fn parse_pem_certificates(
     backend: TlsBackend,
     pem_bundle: &[u8],
     context: &str,
-) -> ReqxResult<Vec<ureq::tls::Certificate<'static>>> {
+) -> crate::Result<Vec<ureq::tls::Certificate<'static>>> {
     let mut certificates = Vec::new();
     for item in ureq::tls::parse_pem(pem_bundle) {
         match item.map_err(|source| {
@@ -97,7 +96,7 @@ fn parse_pem_certificates(
 fn build_sync_tls_config(
     backend: TlsBackend,
     tls_options: &TlsOptions,
-) -> ReqxResult<ureq::tls::TlsConfig> {
+) -> crate::Result<ureq::tls::TlsConfig> {
     let provider = match backend {
         TlsBackend::RustlsRing | TlsBackend::RustlsAwsLcRs => ureq::tls::TlsProvider::Rustls,
         TlsBackend::NativeTls => ureq::tls::TlsProvider::NativeTls,
@@ -197,7 +196,7 @@ fn build_sync_tls_config(
 fn build_sync_tls_config(
     _backend: TlsBackend,
     _tls_options: &TlsOptions,
-) -> ReqxResult<ureq::tls::TlsConfig> {
+) -> crate::Result<ureq::tls::TlsConfig> {
     unreachable!("sync client is not compiled without sync TLS features")
 }
 
@@ -209,7 +208,7 @@ pub(super) fn make_agent(
     pool_max_idle_per_host: usize,
     pool_max_idle_connections: usize,
     proxy: Option<ureq::Proxy>,
-) -> ReqxResult<ureq::Agent> {
+) -> crate::Result<ureq::Agent> {
     let tls_config = build_sync_tls_config(tls_backend, tls_options)?;
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -274,8 +273,8 @@ pub(super) fn decode_content_encoding_error(
     message: String,
     method: &Method,
     uri: &str,
-) -> HttpClientError {
-    HttpClientError::DecodeContentEncoding {
+) -> Error {
+    Error::DecodeContentEncoding {
         encoding,
         message,
         method: method.clone(),

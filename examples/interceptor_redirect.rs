@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
 use reqx::prelude::{
-    HttpClient, HttpClientError, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
+    Error, HttpClient, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
 };
 
 struct TraceInterceptor;
@@ -31,7 +31,7 @@ impl HttpInterceptor for TraceInterceptor {
         );
     }
 
-    fn on_error(&self, context: &RequestContext, error: &HttpClientError) {
+    fn on_error(&self, context: &RequestContext, error: &Error) {
         eprintln!(
             "error: method={} uri={} code={} err={error}",
             context.method(),
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .redirect_policy(RedirectPolicy::limited(5))
         .retry_policy(RetryPolicy::standard())
         .interceptor(TraceInterceptor)
-        .build();
+        .build()?;
 
     let response = client.get("/redirect-to?url=%2Fget").send().await?;
     println!("final status={}", response.status());

@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .half_open_max_requests(2)
                 .half_open_success_threshold(2),
         )
-        .adaptive_concurrency(
+        .adaptive_concurrency_policy(
             AdaptiveConcurrencyPolicy::standard()
                 .min_limit(2)
                 .initial_limit(8)
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .decrease_ratio(0.8)
                 .high_latency_threshold(Duration::from_millis(250)),
         )
-        .build();
+        .build()?;
 
     let response = client.get("/v1/health").send().await?;
     println!("status={}", response.status());

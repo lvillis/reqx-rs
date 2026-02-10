@@ -48,8 +48,8 @@ struct AdaptiveConcurrencyController {
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
         let initial_limit = policy
-            .initial_limit_value()
-            .clamp(policy.min_limit_value(), policy.max_limit_value());
+            .configured_initial_limit()
+            .clamp(policy.configured_min_limit(), policy.configured_max_limit());
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState {
@@ -89,17 +89,21 @@ impl AdaptiveConcurrencyController {
             state.ewma_latency_ms = state.ewma_latency_ms * 0.8 + latency_ms * 0.2;
         }
 
-        let threshold_ms = self.policy.high_latency_threshold_value().as_secs_f64() * 1000.0;
+        let threshold_ms = self
+            .policy
+            .configured_high_latency_threshold()
+            .as_secs_f64()
+            * 1000.0;
         let should_decrease = !success || state.ewma_latency_ms > threshold_ms;
         if should_decrease {
-            let decreased =
-                (state.current_limit as f64 * self.policy.decrease_ratio_value()).floor() as usize;
-            state.current_limit = decreased.max(self.policy.min_limit_value());
+            let decreased = (state.current_limit as f64 * self.policy.configured_decrease_ratio())
+                .floor() as usize;
+            state.current_limit = decreased.max(self.policy.configured_min_limit());
         } else {
             state.current_limit = state
                 .current_limit
-                .saturating_add(self.policy.increase_step_value())
-                .min(self.policy.max_limit_value());
+                .saturating_add(self.policy.configured_increase_step())
+                .min(self.policy.configured_max_limit());
         }
 
         self.condvar.notify_all();

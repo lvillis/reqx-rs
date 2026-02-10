@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_name("example-sdk")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(8))
-        .build();
+        .build()?;
 
     let response = client.get("/v1/items").send()?;
     println!("status={}", response.status());

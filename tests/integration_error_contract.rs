@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use reqx::prelude::{HttpClientError, HttpClientErrorCode};
+use reqx::prelude::{Error, ErrorCode};
 
 struct OneShotServer {
     base_url: String,
@@ -103,21 +103,13 @@ fn read_request_headers(stream: &mut std::net::TcpStream) -> std::io::Result<()>
     Ok(())
 }
 
-fn assert_error_contract(
-    error: &HttpClientError,
-    expected: HttpClientErrorCode,
-    expected_code: &str,
-) {
+fn assert_error_contract(error: &Error, expected: ErrorCode, expected_code: &str) {
     assert_eq!(error.code(), expected);
     assert_eq!(error.code().as_str(), expected_code);
 }
 
 #[cfg(feature = "_async")]
-async fn async_get_error(
-    status: u16,
-    body: Vec<u8>,
-    max_response_body_bytes: usize,
-) -> HttpClientError {
+async fn async_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize) -> Error {
     use reqx::prelude::{HttpClient, RetryPolicy};
 
     let server = OneShotServer::start(
@@ -132,7 +124,8 @@ async fn async_get_error(
         .request_timeout(Duration::from_secs(1))
         .max_response_body_bytes(max_response_body_bytes)
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
     let error = client
         .get("/case")
         .send()
@@ -143,11 +136,7 @@ async fn async_get_error(
 }
 
 #[cfg(feature = "_blocking")]
-fn blocking_get_error(
-    status: u16,
-    body: Vec<u8>,
-    max_response_body_bytes: usize,
-) -> HttpClientError {
+fn blocking_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize) -> Error {
     use reqx::blocking::HttpClient;
     use reqx::prelude::RetryPolicy;
 
@@ -163,7 +152,8 @@ fn blocking_get_error(
         .request_timeout(Duration::from_secs(1))
         .max_response_body_bytes(max_response_body_bytes)
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
     let error = client
         .get("/case")
         .send()
@@ -176,16 +166,12 @@ fn blocking_get_error(
 #[tokio::test(flavor = "current_thread")]
 async fn async_error_code_contract_status_and_body_limit() {
     let status_error = async_get_error(503, b"unavailable".to_vec(), 1024).await;
-    assert_error_contract(
-        &status_error,
-        HttpClientErrorCode::HttpStatus,
-        "http_status",
-    );
+    assert_error_contract(&status_error, ErrorCode::HttpStatus, "http_status");
 
     let too_large_error = async_get_error(200, vec![b'x'; 32], 4).await;
     assert_error_contract(
         &too_large_error,
-        HttpClientErrorCode::ResponseBodyTooLarge,
+        ErrorCode::ResponseBodyTooLarge,
         "response_body_too_large",
     );
 }
@@ -194,16 +180,12 @@ async fn async_error_code_contract_status_and_body_limit() {
 #[test]
 fn blocking_error_code_contract_status_and_body_limit() {
     let status_error = blocking_get_error(503, b"unavailable".to_vec(), 1024);
-    assert_error_contract(
-        &status_error,
-        HttpClientErrorCode::HttpStatus,
-        "http_status",
-    );
+    assert_error_contract(&status_error, ErrorCode::HttpStatus, "http_status");
 
     let too_large_error = blocking_get_error(200, vec![b'x'; 32], 4);
     assert_error_contract(
         &too_large_error,
-        HttpClientErrorCode::ResponseBodyTooLarge,
+        ErrorCode::ResponseBodyTooLarge,
         "response_body_too_large",
     );
 }
@@ -215,14 +197,11 @@ async fn async_and_blocking_error_codes_are_consistent() {
     let blocking_status_error = blocking_get_error(503, b"unavailable".to_vec(), 1024);
 
     assert_eq!(async_status_error.code(), blocking_status_error.code());
-    assert_eq!(async_status_error.code(), HttpClientErrorCode::HttpStatus);
+    assert_eq!(async_status_error.code(), ErrorCode::HttpStatus);
 
     let async_large_error = async_get_error(200, vec![b'x'; 32], 4).await;
     let blocking_large_error = blocking_get_error(200, vec![b'x'; 32], 4);
 
     assert_eq!(async_large_error.code(), blocking_large_error.code());
-    assert_eq!(
-        async_large_error.code(),
-        HttpClientErrorCode::ResponseBodyTooLarge
-    );
+    assert_eq!(async_large_error.code(), ErrorCode::ResponseBodyTooLarge);
 }

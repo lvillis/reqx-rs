@@ -81,9 +81,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let first_attempt = AsyncResumableUploader::new(
         ResumableUploadOptions::new()
-            .part_size(4)
-            .max_attempts(1)
-            .jitter_ratio(0.0),
+            .with_part_size(4)
+            .with_max_attempts(1)
+            .with_jitter_ratio(0.0),
     );
     let mut reader = Cursor::new(b"abcdefgh".to_vec());
     let failure = first_attempt
@@ -101,9 +101,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let resumed = AsyncResumableUploader::new(
         ResumableUploadOptions::new()
-            .part_size(4)
-            .max_attempts(2)
-            .jitter_ratio(0.0),
+            .with_part_size(4)
+            .with_max_attempts(2)
+            .with_jitter_ratio(0.0),
     );
     let mut replay_reader = Cursor::new(b"abcdefgh".to_vec());
     let result = resumed

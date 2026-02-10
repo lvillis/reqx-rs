@@ -42,15 +42,15 @@ impl RetryBudgetPolicy {
         self
     }
 
-    pub(crate) const fn window_value(self) -> Duration {
+    pub(crate) const fn configured_window(self) -> Duration {
         self.window
     }
 
-    pub(crate) fn retry_ratio_value(self) -> f64 {
+    pub(crate) fn configured_retry_ratio(self) -> f64 {
         self.retry_ratio
     }
 
-    pub(crate) const fn min_retries_per_window_value(self) -> usize {
+    pub(crate) const fn configured_min_retries_per_window(self) -> usize {
         self.min_retries_per_window
     }
 }
@@ -95,10 +95,11 @@ impl RetryBudget {
     pub(crate) fn try_consume_retry(&self) -> bool {
         let mut state = lock_unpoisoned(&self.state);
         refresh_retry_budget_window(&self.policy, &mut state);
-        let dynamic_allowance =
-            (state.requests_succeeded as f64 * self.policy.retry_ratio_value()).floor() as usize;
+        let dynamic_allowance = (state.requests_succeeded as f64
+            * self.policy.configured_retry_ratio())
+        .floor() as usize;
         let total_allowance =
-            dynamic_allowance.saturating_add(self.policy.min_retries_per_window_value());
+            dynamic_allowance.saturating_add(self.policy.configured_min_retries_per_window());
         if state.retries_consumed >= total_allowance {
             return false;
         }
@@ -108,7 +109,7 @@ impl RetryBudget {
 }
 
 fn refresh_retry_budget_window(policy: &RetryBudgetPolicy, state: &mut RetryBudgetState) {
-    if state.window_started_at.elapsed() >= policy.window_value() {
+    if state.window_started_at.elapsed() >= policy.configured_window() {
         state.window_started_at = Instant::now();
         state.requests_succeeded = 0;
         state.retries_consumed = 0;
@@ -372,27 +373,27 @@ impl AdaptiveConcurrencyPolicy {
         self
     }
 
-    pub(crate) const fn min_limit_value(self) -> usize {
+    pub(crate) const fn configured_min_limit(self) -> usize {
         self.min_limit
     }
 
-    pub(crate) const fn initial_limit_value(self) -> usize {
+    pub(crate) const fn configured_initial_limit(self) -> usize {
         self.initial_limit
     }
 
-    pub(crate) const fn max_limit_value(self) -> usize {
+    pub(crate) const fn configured_max_limit(self) -> usize {
         self.max_limit
     }
 
-    pub(crate) const fn increase_step_value(self) -> usize {
+    pub(crate) const fn configured_increase_step(self) -> usize {
         self.increase_step
     }
 
-    pub(crate) fn decrease_ratio_value(self) -> f64 {
+    pub(crate) fn configured_decrease_ratio(self) -> f64 {
         self.decrease_ratio
     }
 
-    pub(crate) const fn high_latency_threshold_value(self) -> Duration {
+    pub(crate) const fn configured_high_latency_threshold(self) -> Duration {
         self.high_latency_threshold
     }
 }

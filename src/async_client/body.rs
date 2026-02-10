@@ -11,7 +11,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 
-use crate::error::HttpClientError;
+use crate::error::Error;
 
 type BoxBodyError = Box<dyn StdError + Send + Sync>;
 pub(crate) type ReqBody = BoxBody<Bytes, BoxBodyError>;
@@ -57,14 +57,14 @@ pub(crate) fn build_http_request(
     uri: Uri,
     headers: &HeaderMap,
     body: ReqBody,
-) -> Result<Request<ReqBody>, HttpClientError> {
+) -> Result<Request<ReqBody>, Error> {
     let mut request_builder = Request::builder().method(method).uri(uri);
     for (name, value) in headers {
         request_builder = request_builder.header(name, value);
     }
     request_builder
         .body(body)
-        .map_err(|source| HttpClientError::RequestBuild { source })
+        .map_err(|source| Error::RequestBuild { source })
 }
 
 pub(crate) enum ReadBodyError {

@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_name("reqx-example-blocking-stream")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::standard().max_attempts(2))
-        .build();
+        .build()?;
 
     let mut writer = Vec::new();
     let copied = client

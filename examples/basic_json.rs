@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .base_backoff(Duration::from_millis(100))
                 .max_backoff(Duration::from_millis(800)),
         )
-        .try_build()?;
+        .build()?;
 
     let ping = client
         .get("/get")

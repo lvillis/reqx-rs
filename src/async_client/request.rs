@@ -10,12 +10,12 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::ReaderStream;
 
+use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::body::{RequestBody, stream_req_body};
 use crate::client::{HttpClient, RequestExecutionOptions};
 use crate::policy::RedirectPolicy;
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
-use crate::{IDEMPOTENCY_KEY_HEADER, ReqxResult};
 
 #[doc(hidden)]
 pub struct RequestBuilder<'a> {
@@ -54,13 +54,13 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn try_header(self, name: &str, value: &str) -> ReqxResult<Self> {
+    pub fn try_header(self, name: &str, value: &str) -> crate::Result<Self> {
         let name = parse_header_name(name)?;
         let value = parse_header_value(name.as_str(), value)?;
         Ok(self.header(name, value))
     }
 
-    pub fn idempotency_key(self, key: &str) -> ReqxResult<Self> {
+    pub fn idempotency_key(self, key: &str) -> crate::Result<Self> {
         self.try_header(IDEMPOTENCY_KEY_HEADER, key)
     }
 
@@ -83,12 +83,12 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn query<T>(mut self, params: &T) -> ReqxResult<Self>
+    pub fn query<T>(mut self, params: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
     {
         let encoded = serde_urlencoded::to_string(params)
-            .map_err(|source| crate::error::HttpClientError::SerializeQuery { source })?;
+            .map_err(|source| crate::error::Error::SerializeQuery { source })?;
         self.query_pairs.extend(
             url::form_urlencoded::parse(encoded.as_bytes())
                 .map(|(name, value)| (name.into_owned(), value.into_owned())),
@@ -128,12 +128,12 @@ impl<'a> RequestBuilder<'a> {
         self,
         reader: R,
         content_length: u64,
-    ) -> ReqxResult<Self>
+    ) -> crate::Result<Self>
     where
         R: AsyncRead + Send + Sync + 'static,
     {
         let value = HeaderValue::from_str(&content_length.to_string()).map_err(|source| {
-            crate::error::HttpClientError::InvalidHeaderValue {
+            crate::error::Error::InvalidHeaderValue {
                 name: CONTENT_LENGTH.as_str().to_owned(),
                 source,
             }
@@ -146,22 +146,22 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn json<T>(self, payload: &T) -> ReqxResult<Self>
+    pub fn json<T>(self, payload: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
     {
         let body = serde_json::to_vec(payload)
-            .map_err(|source| crate::error::HttpClientError::Serialize { source })?;
+            .map_err(|source| crate::error::Error::SerializeJson { source })?;
         let with_body = self.body_bytes(Bytes::from(body));
         Ok(with_body.header(CONTENT_TYPE, HeaderValue::from_static("application/json")))
     }
 
-    pub fn form<T>(self, payload: &T) -> ReqxResult<Self>
+    pub fn form<T>(self, payload: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
     {
         let encoded = serde_urlencoded::to_string(payload)
-            .map_err(|source| crate::error::HttpClientError::SerializeForm { source })?;
+            .map_err(|source| crate::error::Error::SerializeForm { source })?;
         let with_body = self.body_bytes(Bytes::from(encoded));
         Ok(with_body.header(
             CONTENT_TYPE,
@@ -194,7 +194,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub async fn send(self) -> ReqxResult<crate::response::HttpResponse> {
+    pub async fn send(self) -> crate::Result<crate::response::HttpResponse> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,
@@ -214,7 +214,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
-    pub async fn send_stream(self) -> ReqxResult<crate::response::HttpResponseStream> {
+    pub async fn send_stream(self) -> crate::Result<crate::response::HttpResponseStream> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,
@@ -234,7 +234,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
-    pub async fn download_to_writer<W>(self, writer: &mut W) -> ReqxResult<u64>
+    pub async fn download_to_writer<W>(self, writer: &mut W) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
     {
@@ -245,7 +245,7 @@ impl<'a> RequestBuilder<'a> {
         self,
         writer: &mut W,
         max_bytes: usize,
-    ) -> ReqxResult<u64>
+    ) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
     {
@@ -255,7 +255,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
-    pub async fn send_json<T>(self) -> ReqxResult<T>
+    pub async fn send_json<T>(self) -> crate::Result<T>
     where
         T: DeserializeOwned,
     {

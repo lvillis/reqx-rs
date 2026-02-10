@@ -99,15 +99,15 @@ impl RateLimitPolicy {
         }
     }
 
-    fn requests_per_second_value(self) -> f64 {
+    fn configured_requests_per_second(self) -> f64 {
         self.requests_per_second
     }
 
-    fn burst_value(self) -> usize {
+    fn configured_burst(self) -> usize {
         self.burst
     }
 
-    fn max_throttle_delay_value(self) -> Duration {
+    fn configured_max_throttle_delay(self) -> Duration {
         self.max_throttle_delay
     }
 }
@@ -131,7 +131,7 @@ impl TokenBucket {
         let policy = policy.normalize();
         Self {
             policy,
-            tokens: policy.burst_value() as f64,
+            tokens: policy.configured_burst() as f64,
             last_refill_at: now,
             throttle_until: None,
         }
@@ -143,8 +143,8 @@ impl TokenBucket {
         }
         let elapsed_secs = now.duration_since(self.last_refill_at).as_secs_f64();
         self.last_refill_at = now;
-        let replenished = elapsed_secs * self.policy.requests_per_second_value();
-        self.tokens = (self.tokens + replenished).min(self.policy.burst_value() as f64);
+        let replenished = elapsed_secs * self.policy.configured_requests_per_second();
+        self.tokens = (self.tokens + replenished).min(self.policy.configured_burst() as f64);
         if let Some(throttle_until) = self.throttle_until
             && now >= throttle_until
         {
@@ -163,7 +163,7 @@ impl TokenBucket {
             return Duration::ZERO;
         }
 
-        let rate = self.policy.requests_per_second_value();
+        let rate = self.policy.configured_requests_per_second();
         if rate <= f64::EPSILON {
             return Duration::from_secs(60);
         }
@@ -191,7 +191,7 @@ impl TokenBucket {
     }
 
     fn apply_throttle(&mut self, now: Instant, delay: Duration) {
-        let capped_delay = delay.min(self.policy.max_throttle_delay_value());
+        let capped_delay = delay.min(self.policy.configured_max_throttle_delay());
         if capped_delay.is_zero() {
             return;
         }

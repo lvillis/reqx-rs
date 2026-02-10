@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use http::Uri;
 use http_body_util::BodyExt;
 use reqx::prelude::{
-    CircuitBreakerPolicy, HttpClient, HttpClientError, RetryBudgetPolicy, RetryClassifier,
-    RetryDecision, RetryPolicy,
+    CircuitBreakerPolicy, Error, HttpClient, RetryBudgetPolicy, RetryClassifier, RetryDecision,
+    RetryPolicy,
 };
 use tokio::io::sink;
 
@@ -466,7 +466,8 @@ async fn proxy_connect_tunnels_http_request() {
         .http_proxy(proxy_uri)
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response = client
         .get("/through-proxy")
@@ -503,7 +504,8 @@ async fn proxy_authorization_header_is_forwarded() {
         .expect("valid proxy authorization header")
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response = client
         .get("/proxy-auth")
@@ -536,7 +538,8 @@ async fn no_proxy_bypasses_proxy_for_matching_host() {
         .no_proxy(["127.0.0.1"])
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response = client
         .get("/no-proxy")
@@ -564,7 +567,8 @@ async fn max_in_flight_enforces_single_active_request() {
         .max_in_flight(1)
         .request_timeout(Duration::from_millis(800))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let started = Instant::now();
     let mut tasks = Vec::new();
@@ -617,7 +621,8 @@ async fn max_in_flight_per_host_limits_each_host_independently() {
         .max_in_flight_per_host(1)
         .request_timeout(Duration::from_millis(800))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
     let server_b_port = server_b
         .authority()
         .rsplit(':')
@@ -685,7 +690,8 @@ async fn total_timeout_interrupts_retry_loop_with_retry_after() {
                 .max_backoff(Duration::from_millis(3))
                 .jitter_ratio(0.0),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/busy")
@@ -694,7 +700,7 @@ async fn total_timeout_interrupts_retry_loop_with_retry_after() {
         .expect_err("total timeout should stop retry loop");
 
     match error {
-        HttpClientError::DeadlineExceeded { .. } => {}
+        Error::DeadlineExceeded { .. } => {}
         other => panic!("unexpected error variant: {other}"),
     }
 
@@ -716,7 +722,8 @@ async fn max_response_body_limit_returns_specific_error() {
         .max_response_body_bytes(8)
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/large")
@@ -724,7 +731,7 @@ async fn max_response_body_limit_returns_specific_error() {
         .await
         .expect_err("response body should exceed max bytes");
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             ..
@@ -754,7 +761,8 @@ async fn retry_classifier_can_disable_retries() {
                 .retry_classifier(Arc::new(NeverRetryClassifier)),
         )
         .request_timeout(Duration::from_millis(400))
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/disabled-retry")
@@ -762,7 +770,7 @@ async fn retry_classifier_can_disable_retries() {
         .await
         .expect_err("custom classifier should disable retries");
     match error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected error variant: {other}"),
     }
     assert_eq!(
@@ -792,7 +800,8 @@ async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
                 .jitter_ratio(0.0),
         )
         .request_timeout(Duration::from_millis(400))
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .post("/post-no-key")
@@ -801,7 +810,7 @@ async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
         .await
         .expect_err("server always returns 503");
     match error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected error variant: {other}"),
     }
     assert_eq!(server.served_count(), 2);
@@ -833,7 +842,8 @@ async fn retry_budget_exhausted_stops_retry_loop_early() {
                 .min_retries_per_window(1),
         )
         .request_timeout(Duration::from_millis(400))
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/budget")
@@ -842,7 +852,7 @@ async fn retry_budget_exhausted_stops_retry_loop_early() {
         .expect_err("retry budget should stop retries after one retry");
 
     match error {
-        HttpClientError::RetryBudgetExhausted { .. } => {}
+        Error::RetryBudgetExhausted { .. } => {}
         other => panic!("unexpected error variant: {other}"),
     }
     assert_eq!(server.served_count(), 2);
@@ -869,7 +879,8 @@ async fn circuit_breaker_short_circuits_after_opening() {
                 .half_open_success_threshold(1),
         )
         .request_timeout(Duration::from_millis(400))
-        .build();
+        .build()
+        .expect("client should build");
 
     let first = client
         .get("/open")
@@ -877,7 +888,7 @@ async fn circuit_breaker_short_circuits_after_opening() {
         .await
         .expect_err("first request should return 503");
     match first {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected first error variant: {other}"),
     }
 
@@ -887,7 +898,7 @@ async fn circuit_breaker_short_circuits_after_opening() {
         .await
         .expect_err("second request should be rejected by circuit");
     match second {
-        HttpClientError::CircuitOpen { .. } => {}
+        Error::CircuitOpen { .. } => {}
         other => panic!("unexpected second error variant: {other}"),
     }
 
@@ -906,7 +917,8 @@ async fn https_path_returns_transport_error_on_non_tls_server() {
     let client = HttpClient::builder(format!("https://{}", raw_server.authority()))
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/tls-required")
@@ -915,7 +927,7 @@ async fn https_path_returns_transport_error_on_non_tls_server() {
         .expect_err("non-tls server should fail https transport");
 
     match error {
-        HttpClientError::Transport { uri, .. } => {
+        Error::Transport { uri, .. } => {
             assert!(uri.starts_with("https://"));
         }
         other => panic!("unexpected error variant: {other}"),
@@ -939,7 +951,8 @@ async fn send_stream_downloads_body_without_buffered_send_path() {
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/stream-body")
@@ -971,7 +984,8 @@ async fn send_stream_into_response_limited_returns_buffered_response() {
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/stream-buffer")
@@ -1001,7 +1015,8 @@ async fn send_stream_into_response_limited_enforces_limit_with_consistent_error(
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/stream-over-limit")
@@ -1014,7 +1029,7 @@ async fn send_stream_into_response_limited_enforces_limit_with_consistent_error(
         .expect_err("stream body should exceed max size");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             method,
@@ -1044,7 +1059,8 @@ async fn download_to_writer_transfers_stream_bytes() {
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let mut output = sink();
     let written = client
@@ -1069,7 +1085,8 @@ async fn download_to_writer_limited_enforces_limit_with_consistent_error() {
     let client = HttpClient::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let mut output = sink();
     let error = client
@@ -1078,7 +1095,7 @@ async fn download_to_writer_limited_enforces_limit_with_consistent_error() {
         .await
         .expect_err("download_to_writer_limited should enforce max bytes");
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             method,
             uri,

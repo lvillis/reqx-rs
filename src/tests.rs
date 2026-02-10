@@ -7,13 +7,13 @@ use flate2::write::GzEncoder;
 
 use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::client::HttpClient;
-use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
+use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
 use crate::response::HttpResponse;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
 use crate::util::{
-    append_query_pairs, bounded_retry_delay, ensure_accept_encoding, join_base_path,
+    append_query_pairs, bounded_retry_delay, ensure_accept_encoding_async, join_base_path,
     parse_retry_after, redact_uri_for_logs, resolve_uri,
 };
 
@@ -31,6 +31,26 @@ fn resolve_uri_keeps_absolute_uri() {
         .expect("absolute uri should parse");
     assert_eq!(uri_text, "https://x.test/a");
     assert_eq!(uri.to_string(), "https://x.test/a");
+}
+
+#[test]
+fn resolve_uri_keeps_absolute_uri_with_uppercase_scheme() {
+    let (uri_text, uri) = resolve_uri("https://api.example.com/v1", "HTTPS://x.test/a")
+        .expect("absolute uri with uppercase scheme should parse");
+    assert_eq!(uri_text, "HTTPS://x.test/a");
+    assert_eq!(uri.host().expect("host should be present"), "x.test",);
+}
+
+#[test]
+fn resolve_uri_rejects_non_http_absolute_uri() {
+    let error = resolve_uri("https://api.example.com/v1", "ftp://x.test/a")
+        .expect_err("non-http absolute uri should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "ftp://x.test/a");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
 }
 
 #[test]
@@ -133,7 +153,7 @@ fn response_json_decode_error_contains_body() {
         .json::<serde_json::Value>()
         .expect_err("invalid json should return error");
     match error {
-        HttpClientError::Deserialize { body, .. } => assert_eq!(body, "not-json"),
+        Error::DeserializeJson { body, .. } => assert_eq!(body, "not-json"),
         other => panic!("unexpected error variant: {other}"),
     }
 }
@@ -327,16 +347,16 @@ fn bounded_retry_delay_respects_total_timeout() {
 
 #[test]
 fn error_code_maps_expected_variant() {
-    let error = HttpClientError::InvalidUri {
+    let error = Error::InvalidUri {
         uri: "bad://uri".to_owned(),
     };
-    assert_eq!(error.code(), HttpClientErrorCode::InvalidUri);
+    assert_eq!(error.code(), ErrorCode::InvalidUri);
     assert_eq!(error.code().as_str(), "invalid_uri");
 }
 
 #[test]
 fn error_code_contract_table_is_stable() {
-    let codes = HttpClientErrorCode::all();
+    let codes = ErrorCode::all();
     assert_eq!(codes.len(), 25);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
@@ -354,7 +374,7 @@ fn error_code_contract_table_is_stable() {
             "read_body",
             "response_body_too_large",
             "http_status",
-            "deserialize",
+            "deserialize_json",
             "invalid_header_name",
             "invalid_header_value",
             "decode_content_encoding",
@@ -377,43 +397,43 @@ fn error_code_contract_table_is_stable() {
 
 #[test]
 fn error_code_maps_tls_config_variant() {
-    let error = HttpClientError::TlsConfig {
+    let error = Error::TlsConfig {
         backend: "native-tls",
         message: "bad cert".to_owned(),
     };
-    assert_eq!(error.code(), HttpClientErrorCode::TlsConfig);
+    assert_eq!(error.code(), ErrorCode::TlsConfig);
     assert_eq!(error.code().as_str(), "tls_config");
 }
 
 #[test]
 fn error_code_maps_redirect_limit_exceeded_variant() {
-    let error = HttpClientError::RedirectLimitExceeded {
+    let error = Error::RedirectLimitExceeded {
         max_redirects: 3,
         method: http::Method::GET,
         uri: "https://example.com/a".to_owned(),
     };
-    assert_eq!(error.code(), HttpClientErrorCode::RedirectLimitExceeded);
+    assert_eq!(error.code(), ErrorCode::RedirectLimitExceeded);
     assert_eq!(error.code().as_str(), "redirect_limit_exceeded");
 }
 
 #[test]
 fn error_code_maps_retry_budget_exhausted_variant() {
-    let error = HttpClientError::RetryBudgetExhausted {
+    let error = Error::RetryBudgetExhausted {
         method: http::Method::GET,
         uri: "https://example.com/retry-budget".to_owned(),
     };
-    assert_eq!(error.code(), HttpClientErrorCode::RetryBudgetExhausted);
+    assert_eq!(error.code(), ErrorCode::RetryBudgetExhausted);
     assert_eq!(error.code().as_str(), "retry_budget_exhausted");
 }
 
 #[test]
 fn error_code_maps_circuit_open_variant() {
-    let error = HttpClientError::CircuitOpen {
+    let error = Error::CircuitOpen {
         method: http::Method::GET,
         uri: "https://example.com/circuit".to_owned(),
         retry_after_ms: 1000,
     };
-    assert_eq!(error.code(), HttpClientErrorCode::CircuitOpen);
+    assert_eq!(error.code(), ErrorCode::CircuitOpen);
     assert_eq!(error.code().as_str(), "circuit_open");
 }
 
@@ -421,26 +441,26 @@ fn error_code_maps_circuit_open_variant() {
 fn invalid_tls_root_ca_pem_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_ca_pem("not-a-pem-certificate")
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("invalid root ca pem should fail"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsConfig { .. } => {}
+        Error::TlsConfig { .. } => {}
         other => panic!("unexpected error: {other}"),
     }
 }
 
 #[test]
-fn try_build_rejects_invalid_base_url_early() {
-    let result = HttpClient::builder("not-a-valid-base-url").try_build();
+fn build_rejects_invalid_base_url_early() {
+    let result = HttpClient::builder("not-a-valid-base-url").build();
     let error = match result {
         Ok(_) => panic!("invalid base url should fail at build time"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::InvalidUri { uri } => {
+        Error::InvalidUri { uri } => {
             assert_eq!(uri, "not-a-valid-base-url");
         }
         other => panic!("unexpected error: {other}"),
@@ -448,15 +468,75 @@ fn try_build_rejects_invalid_base_url_early() {
 }
 
 #[test]
-fn try_build_rejects_non_http_base_url_scheme() {
-    let result = HttpClient::builder("ftp://api.example.com").try_build();
+fn build_rejects_non_http_base_url_scheme() {
+    let result = HttpClient::builder("ftp://api.example.com").build();
     let error = match result {
         Ok(_) => panic!("non-http base url should fail at build time"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::InvalidUri { uri } => {
+        Error::InvalidUri { uri } => {
             assert_eq!(uri, "ftp://api.example.com");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_base_url_with_query() {
+    let result = HttpClient::builder("https://api.example.com/v1?token=abc").build();
+    let error = match result {
+        Ok(_) => panic!("base url with query should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://api.example.com/v1?token=abc");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_base_url_with_fragment() {
+    let result = HttpClient::builder("https://api.example.com/v1#anchor").build();
+    let error = match result {
+        Ok(_) => panic!("base url with fragment should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://api.example.com/v1#anchor");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_base_url_with_userinfo() {
+    let result = HttpClient::builder("https://user:pass@api.example.com/v1").build();
+    let error = match result {
+        Ok(_) => panic!("base url with userinfo should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://user:pass@api.example.com/v1");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_base_url_with_surrounding_whitespace() {
+    let result = HttpClient::builder(" https://api.example.com/v1 ").build();
+    let error = match result {
+        Ok(_) => panic!("base url with surrounding whitespace should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, " https://api.example.com/v1 ");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -466,13 +546,13 @@ fn try_build_rejects_non_http_base_url_scheme() {
 fn tls_root_store_specific_without_roots_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("specific root store without roots should fail"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -483,13 +563,13 @@ fn tls_root_store_specific_without_roots_returns_tls_config_error() {
 fn custom_root_ca_requires_specific_root_store() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_ca_der([1_u8, 2, 3, 4])
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("custom root ca should require specific root store"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -518,14 +598,14 @@ fn rustls_backend_rejects_pkcs12_identity_configuration() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(backend)
         .tls_client_identity_pkcs12(vec![0x30, 0x82], "secret")
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("rustls should reject pkcs12 identity"),
         Err(error) => error,
     };
 
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("PKCS#12 identity"));
         }
         other => panic!("unexpected error: {other}"),
@@ -538,13 +618,13 @@ fn native_tls_invalid_pkcs12_identity_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::NativeTls)
         .tls_client_identity_pkcs12(vec![1, 2, 3, 4], "secret")
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("invalid native tls identity should fail"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsConfig { .. } => {}
+        Error::TlsConfig { .. } => {}
         other => panic!("unexpected error: {other}"),
     }
 }
@@ -555,13 +635,13 @@ fn native_tls_webpki_root_store_is_rejected() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::NativeTls)
         .tls_root_store(TlsRootStore::WebPki)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("native tls should reject webpki root store"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::WebPki"));
         }
         other => panic!("unexpected error: {other}"),
@@ -579,7 +659,7 @@ fn no_proxy_rule_matches_domain_and_subdomain() {
 #[test]
 fn ensure_accept_encoding_sets_default_when_absent() {
     let mut headers = http::HeaderMap::new();
-    ensure_accept_encoding(&mut headers);
+    ensure_accept_encoding_async(&mut headers);
     assert_eq!(
         headers
             .get(http::header::ACCEPT_ENCODING)
@@ -653,7 +733,7 @@ fn decode_content_encoded_body_limited_rejects_expanded_payload() {
 fn selecting_rustls_ring_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsRing)
-        .try_build()
+        .build()
         .expect("rustls ring backend should build when feature is enabled");
     assert_eq!(client.tls_backend(), TlsBackend::RustlsRing);
 }
@@ -663,13 +743,13 @@ fn selecting_rustls_ring_backend_builds_when_feature_enabled() {
 fn selecting_rustls_ring_backend_returns_unavailable_when_feature_disabled() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsRing)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("rustls ring backend should be unavailable when feature is disabled"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsBackendUnavailable { backend } => {
+        Error::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::RustlsRing.as_str());
         }
         other => panic!("unexpected error: {other}"),
@@ -681,7 +761,7 @@ fn selecting_rustls_ring_backend_returns_unavailable_when_feature_disabled() {
 fn selecting_rustls_aws_lc_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsAwsLcRs)
-        .try_build()
+        .build()
         .expect("rustls aws-lc-rs backend should build when feature is enabled");
     assert_eq!(client.tls_backend(), TlsBackend::RustlsAwsLcRs);
 }
@@ -691,13 +771,13 @@ fn selecting_rustls_aws_lc_backend_builds_when_feature_enabled() {
 fn selecting_rustls_aws_lc_backend_returns_unavailable_when_feature_disabled() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::RustlsAwsLcRs)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("rustls aws-lc-rs backend should be unavailable when feature is disabled"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsBackendUnavailable { backend } => {
+        Error::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::RustlsAwsLcRs.as_str());
         }
         other => panic!("unexpected error: {other}"),
@@ -709,7 +789,7 @@ fn selecting_rustls_aws_lc_backend_returns_unavailable_when_feature_disabled() {
 fn selecting_native_tls_backend_builds_when_feature_enabled() {
     let client = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::NativeTls)
-        .try_build()
+        .build()
         .expect("native tls backend should build when feature is enabled");
     assert_eq!(client.tls_backend(), TlsBackend::NativeTls);
 }
@@ -719,13 +799,13 @@ fn selecting_native_tls_backend_builds_when_feature_enabled() {
 fn selecting_native_tls_backend_returns_unavailable_when_feature_disabled() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_backend(TlsBackend::NativeTls)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("native tls backend should be unavailable when feature is disabled"),
         Err(error) => error,
     };
     match error {
-        HttpClientError::TlsBackendUnavailable { backend } => {
+        Error::TlsBackendUnavailable { backend } => {
             assert_eq!(backend, TlsBackend::NativeTls.as_str());
         }
         other => panic!("unexpected error: {other}"),

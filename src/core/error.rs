@@ -1,6 +1,4 @@
 use http::Method;
-use thiserror::Error;
-
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,7 +40,7 @@ impl std::fmt::Display for TimeoutPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum HttpClientErrorCode {
+pub enum ErrorCode {
     InvalidUri,
     SerializeJson,
     SerializeQuery,
@@ -54,7 +52,7 @@ pub enum HttpClientErrorCode {
     ReadBody,
     ResponseBodyTooLarge,
     HttpStatus,
-    Deserialize,
+    DeserializeJson,
     InvalidHeaderName,
     InvalidHeaderValue,
     DecodeContentEncoding,
@@ -70,7 +68,7 @@ pub enum HttpClientErrorCode {
     RedirectBodyNotReplayable,
 }
 
-impl HttpClientErrorCode {
+impl ErrorCode {
     pub const ALL: [Self; 25] = [
         Self::InvalidUri,
         Self::SerializeJson,
@@ -83,7 +81,7 @@ impl HttpClientErrorCode {
         Self::ReadBody,
         Self::ResponseBodyTooLarge,
         Self::HttpStatus,
-        Self::Deserialize,
+        Self::DeserializeJson,
         Self::InvalidHeaderName,
         Self::InvalidHeaderValue,
         Self::DecodeContentEncoding,
@@ -116,7 +114,7 @@ impl HttpClientErrorCode {
             Self::ReadBody => "read_body",
             Self::ResponseBodyTooLarge => "response_body_too_large",
             Self::HttpStatus => "http_status",
-            Self::Deserialize => "deserialize",
+            Self::DeserializeJson => "deserialize_json",
             Self::InvalidHeaderName => "invalid_header_name",
             Self::InvalidHeaderValue => "invalid_header_value",
             Self::DecodeContentEncoding => "decode_content_encoding",
@@ -134,13 +132,13 @@ impl HttpClientErrorCode {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum HttpClientError {
+pub enum Error {
     #[error("invalid request uri: {uri}")]
     InvalidUri { uri: String },
     #[error("failed to serialize request json: {source}")]
-    Serialize {
+    SerializeJson {
         #[source]
         source: serde_json::Error,
     },
@@ -202,7 +200,7 @@ pub enum HttpClientError {
         body: String,
     },
     #[error("failed to decode response json: {source}; body={body}")]
-    Deserialize {
+    DeserializeJson {
         #[source]
         source: serde_json::Error,
         body: String,
@@ -270,36 +268,34 @@ pub enum HttpClientError {
     RedirectBodyNotReplayable { method: Method, uri: String },
 }
 
-impl HttpClientError {
-    pub const fn code(&self) -> HttpClientErrorCode {
+impl Error {
+    pub const fn code(&self) -> ErrorCode {
         match self {
-            Self::InvalidUri { .. } => HttpClientErrorCode::InvalidUri,
-            Self::Serialize { .. } => HttpClientErrorCode::SerializeJson,
-            Self::SerializeQuery { .. } => HttpClientErrorCode::SerializeQuery,
-            Self::SerializeForm { .. } => HttpClientErrorCode::SerializeForm,
-            Self::RequestBuild { .. } => HttpClientErrorCode::RequestBuild,
-            Self::Transport { .. } => HttpClientErrorCode::Transport,
-            Self::Timeout { .. } => HttpClientErrorCode::Timeout,
-            Self::DeadlineExceeded { .. } => HttpClientErrorCode::DeadlineExceeded,
-            Self::ReadBody { .. } => HttpClientErrorCode::ReadBody,
-            Self::ResponseBodyTooLarge { .. } => HttpClientErrorCode::ResponseBodyTooLarge,
-            Self::HttpStatus { .. } => HttpClientErrorCode::HttpStatus,
-            Self::Deserialize { .. } => HttpClientErrorCode::Deserialize,
-            Self::InvalidHeaderName { .. } => HttpClientErrorCode::InvalidHeaderName,
-            Self::InvalidHeaderValue { .. } => HttpClientErrorCode::InvalidHeaderValue,
-            Self::DecodeContentEncoding { .. } => HttpClientErrorCode::DecodeContentEncoding,
-            Self::ConcurrencyLimitClosed => HttpClientErrorCode::ConcurrencyLimitClosed,
-            Self::TlsBackendUnavailable { .. } => HttpClientErrorCode::TlsBackendUnavailable,
-            Self::TlsBackendInit { .. } => HttpClientErrorCode::TlsBackendInit,
-            Self::TlsConfig { .. } => HttpClientErrorCode::TlsConfig,
-            Self::RetryBudgetExhausted { .. } => HttpClientErrorCode::RetryBudgetExhausted,
-            Self::CircuitOpen { .. } => HttpClientErrorCode::CircuitOpen,
-            Self::MissingRedirectLocation { .. } => HttpClientErrorCode::MissingRedirectLocation,
-            Self::InvalidRedirectLocation { .. } => HttpClientErrorCode::InvalidRedirectLocation,
-            Self::RedirectLimitExceeded { .. } => HttpClientErrorCode::RedirectLimitExceeded,
-            Self::RedirectBodyNotReplayable { .. } => {
-                HttpClientErrorCode::RedirectBodyNotReplayable
-            }
+            Self::InvalidUri { .. } => ErrorCode::InvalidUri,
+            Self::SerializeJson { .. } => ErrorCode::SerializeJson,
+            Self::SerializeQuery { .. } => ErrorCode::SerializeQuery,
+            Self::SerializeForm { .. } => ErrorCode::SerializeForm,
+            Self::RequestBuild { .. } => ErrorCode::RequestBuild,
+            Self::Transport { .. } => ErrorCode::Transport,
+            Self::Timeout { .. } => ErrorCode::Timeout,
+            Self::DeadlineExceeded { .. } => ErrorCode::DeadlineExceeded,
+            Self::ReadBody { .. } => ErrorCode::ReadBody,
+            Self::ResponseBodyTooLarge { .. } => ErrorCode::ResponseBodyTooLarge,
+            Self::HttpStatus { .. } => ErrorCode::HttpStatus,
+            Self::DeserializeJson { .. } => ErrorCode::DeserializeJson,
+            Self::InvalidHeaderName { .. } => ErrorCode::InvalidHeaderName,
+            Self::InvalidHeaderValue { .. } => ErrorCode::InvalidHeaderValue,
+            Self::DecodeContentEncoding { .. } => ErrorCode::DecodeContentEncoding,
+            Self::ConcurrencyLimitClosed => ErrorCode::ConcurrencyLimitClosed,
+            Self::TlsBackendUnavailable { .. } => ErrorCode::TlsBackendUnavailable,
+            Self::TlsBackendInit { .. } => ErrorCode::TlsBackendInit,
+            Self::TlsConfig { .. } => ErrorCode::TlsConfig,
+            Self::RetryBudgetExhausted { .. } => ErrorCode::RetryBudgetExhausted,
+            Self::CircuitOpen { .. } => ErrorCode::CircuitOpen,
+            Self::MissingRedirectLocation { .. } => ErrorCode::MissingRedirectLocation,
+            Self::InvalidRedirectLocation { .. } => ErrorCode::InvalidRedirectLocation,
+            Self::RedirectLimitExceeded { .. } => ErrorCode::RedirectLimitExceeded,
+            Self::RedirectBodyNotReplayable { .. } => ErrorCode::RedirectBodyNotReplayable,
         }
     }
 }

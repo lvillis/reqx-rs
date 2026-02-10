@@ -206,7 +206,7 @@ impl RetryPolicy {
         self
     }
 
-    pub(crate) fn max_attempts_value(&self) -> usize {
+    pub(crate) fn configured_max_attempts(&self) -> usize {
         self.max_attempts
     }
 

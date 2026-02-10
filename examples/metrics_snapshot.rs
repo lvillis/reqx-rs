@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::standard().max_attempts(2))
         .metrics_enabled(true)
-        .try_build()?;
+        .build()?;
 
     let _ = client.get("/status/200").send().await;
     let _ = client.get("/status/503").send().await;

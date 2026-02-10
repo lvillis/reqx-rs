@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .requests_per_second(10.0)
                 .burst(20),
         )
-        .build();
+        .build()?;
 
     let response = client.get("/v1/resources").send().await?;
     println!("status={}", response.status());

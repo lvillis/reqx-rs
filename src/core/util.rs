@@ -7,7 +7,7 @@ use http::header::{
 };
 use http::{HeaderMap, Method, StatusCode, Uri};
 
-use crate::error::HttpClientError;
+use crate::error::Error;
 #[cfg(feature = "_async")]
 use crate::error::TransportErrorKind;
 
@@ -28,12 +28,25 @@ pub(crate) fn merge_headers(default_headers: &HeaderMap, request_headers: &Heade
     merged
 }
 
-pub(crate) fn ensure_accept_encoding(headers: &mut HeaderMap) {
+fn ensure_accept_encoding(headers: &mut HeaderMap, value: &'static str) {
     if !headers.contains_key(ACCEPT_ENCODING) {
-        headers.insert(
-            ACCEPT_ENCODING,
-            HeaderValue::from_static("gzip, br, deflate, zstd"),
-        );
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(value));
+    }
+}
+
+#[cfg(feature = "_async")]
+pub(crate) fn ensure_accept_encoding_async(headers: &mut HeaderMap) {
+    ensure_accept_encoding(headers, "gzip, br, deflate, zstd");
+}
+
+#[cfg(feature = "_blocking")]
+pub(crate) fn ensure_accept_encoding_blocking(headers: &mut HeaderMap) {
+    ensure_accept_encoding(headers, "gzip, br");
+}
+
+fn invalid_base_url_error(base_url: &str) -> Error {
+    Error::InvalidUri {
+        uri: base_url.to_owned(),
     }
 }
 
@@ -76,43 +89,60 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     parsed.to_string()
 }
 
-pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), HttpClientError> {
-    let uri_text = if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_owned()
-    } else {
-        join_base_path(base_url, path)
+pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), Error> {
+    let uri_text = match path.parse::<Uri>() {
+        Ok(uri) if uri.host().is_some() => {
+            let Some(scheme) = uri.scheme_str() else {
+                return Err(Error::InvalidUri {
+                    uri: path.to_owned(),
+                });
+            };
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+                path.to_owned()
+            } else {
+                return Err(Error::InvalidUri {
+                    uri: path.to_owned(),
+                });
+            }
+        }
+        _ => join_base_path(base_url, path),
     };
-    let uri = uri_text.parse().map_err(|_| HttpClientError::InvalidUri {
+    let uri = uri_text.parse().map_err(|_| Error::InvalidUri {
         uri: uri_text.clone(),
     })?;
     Ok((uri_text, uri))
 }
 
-pub(crate) fn validate_base_url(base_url: &str) -> Result<(), HttpClientError> {
+pub(crate) fn validate_base_url(base_url: &str) -> Result<(), Error> {
     let normalized = base_url.trim();
+    if normalized.len() != base_url.len() {
+        return Err(invalid_base_url_error(base_url));
+    }
     if normalized.is_empty() {
-        return Err(HttpClientError::InvalidUri {
-            uri: base_url.to_owned(),
-        });
+        return Err(invalid_base_url_error(base_url));
+    }
+
+    let parsed = url::Url::parse(normalized).map_err(|_| invalid_base_url_error(base_url))?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") {
+        return Err(invalid_base_url_error(base_url));
+    }
+    if parsed.host_str().is_none() {
+        return Err(invalid_base_url_error(base_url));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid_base_url_error(base_url));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid_base_url_error(base_url));
     }
 
     let uri = normalized
         .parse::<Uri>()
-        .map_err(|_| HttpClientError::InvalidUri {
-            uri: base_url.to_owned(),
-        })?;
-    let Some(scheme) = uri.scheme_str() else {
-        return Err(HttpClientError::InvalidUri {
-            uri: base_url.to_owned(),
-        });
+        .map_err(|_| invalid_base_url_error(base_url))?;
+    if uri.scheme_str().is_none() || uri.host().is_none() {
+        return Err(invalid_base_url_error(base_url));
     };
-    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || uri.host().is_none()
-    {
-        return Err(HttpClientError::InvalidUri {
-            uri: base_url.to_owned(),
-        });
-    }
 
     Ok(())
 }
@@ -213,21 +243,18 @@ pub(crate) fn join_base_path(base_url: &str, path: &str) -> String {
     }
 }
 
-pub(crate) fn parse_header_name(name: &str) -> Result<HeaderName, HttpClientError> {
-    name.parse()
-        .map_err(|source| HttpClientError::InvalidHeaderName {
-            name: name.to_owned(),
-            source,
-        })
+pub(crate) fn parse_header_name(name: &str) -> Result<HeaderName, Error> {
+    name.parse().map_err(|source| Error::InvalidHeaderName {
+        name: name.to_owned(),
+        source,
+    })
 }
 
-pub(crate) fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue, HttpClientError> {
-    value
-        .parse()
-        .map_err(|source| HttpClientError::InvalidHeaderValue {
-            name: name.to_owned(),
-            source,
-        })
+pub(crate) fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue, Error> {
+    value.parse().map_err(|source| Error::InvalidHeaderValue {
+        name: name.to_owned(),
+        source,
+    })
 }
 
 pub(crate) fn phase_timeout(
@@ -273,9 +300,9 @@ pub(crate) fn deadline_exceeded_error(
     total_timeout: Option<Duration>,
     method: &Method,
     uri: &str,
-) -> HttpClientError {
+) -> Error {
     let timeout_ms = total_timeout.map(|item| item.as_millis()).unwrap_or(0);
-    HttpClientError::DeadlineExceeded {
+    Error::DeadlineExceeded {
         timeout_ms,
         method: method.clone(),
         uri: uri.to_owned(),

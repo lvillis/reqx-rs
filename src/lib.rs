@@ -26,7 +26,7 @@
 //!                 .base_backoff(Duration::from_millis(100))
 //!                 .max_backoff(Duration::from_millis(800)),
 //!         )
-//!         .try_build()?;
+//!         .build()?;
 //!
 //!     let created: CreateItemResponse = client
 //!         .post("/v1/items")
@@ -101,22 +101,15 @@ pub(crate) use crate::core::retry;
 pub(crate) use crate::core::util;
 pub(crate) use crate::http::response;
 
-#[cfg(feature = "_blocking")]
-pub use crate::blocking_client::{
-    HttpClient as BlockingHttpClient, HttpClientBuilder as BlockingHttpClientBuilder,
-    RequestBuilder as BlockingRequestBuilder,
-};
 #[cfg(feature = "_async")]
 pub use crate::client::{HttpClient, HttpClientBuilder};
-pub use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
+pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
 pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
-#[cfg(feature = "_blocking")]
-pub use crate::response::BlockingHttpResponseStream;
 pub use crate::response::HttpResponse;
 #[cfg(feature = "_async")]
 pub use crate::response::HttpResponseStream;
@@ -136,17 +129,20 @@ pub use crate::upload::{
 #[cfg(feature = "_blocking")]
 pub mod blocking {
     pub use crate::blocking_client::{HttpClient, HttpClientBuilder, RequestBuilder};
+    pub use crate::response::BlockingHttpResponseStream as HttpResponseStream;
 }
 
-pub type ReqxResult<T> = std::result::Result<T, HttpClientError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub mod prelude {
+    #[cfg(feature = "_blocking")]
+    pub use crate::blocking;
     pub use crate::{
         AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
-        CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot,
-        HttpInterceptor, HttpResponse, PartChecksumAlgorithm, PermissiveRetryEligibility,
+        CircuitBreakerPolicy, Error, ErrorCode, HttpClientMetricsSnapshot, HttpInterceptor,
+        HttpResponse, PartChecksumAlgorithm, PermissiveRetryEligibility,
         RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RedirectPolicy, RequestContext,
-        ReqxResult, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
+        Result, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
         RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
         TlsRootStore, TransportErrorKind, UploadedPart,
@@ -154,11 +150,6 @@ pub mod prelude {
     #[cfg(feature = "_async")]
     pub use crate::{
         AsyncResumableUploadBackend, AsyncResumableUploader, HttpClient, HttpResponseStream,
-    };
-    #[cfg(feature = "_blocking")]
-    pub use crate::{
-        BlockingHttpClient, BlockingHttpClientBuilder, BlockingHttpResponseStream,
-        BlockingRequestBuilder, blocking,
     };
 }
 

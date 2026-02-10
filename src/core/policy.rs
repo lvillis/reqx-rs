@@ -1,6 +1,6 @@
 use http::{HeaderMap, Method, StatusCode};
 
-use crate::error::HttpClientError;
+use crate::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedirectPolicy {
@@ -94,5 +94,5 @@ pub trait HttpInterceptor: Send + Sync {
 
     fn on_response(&self, _context: &RequestContext, _status: StatusCode, _headers: &HeaderMap) {}
 
-    fn on_error(&self, _context: &RequestContext, _error: &HttpClientError) {}
+    fn on_error(&self, _context: &RequestContext, _error: &Error) {}
 }

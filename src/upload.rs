@@ -118,17 +118,17 @@ impl ResumableUploadOptions {
         Self::default()
     }
 
-    pub fn part_size(mut self, part_size: usize) -> Self {
+    pub fn with_part_size(mut self, part_size: usize) -> Self {
         self.part_size = part_size.max(1);
         self
     }
 
-    pub fn max_attempts(mut self, max_attempts: usize) -> Self {
+    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
         self.max_attempts = max_attempts.max(1);
         self
     }
 
-    pub fn base_backoff(mut self, base_backoff: Duration) -> Self {
+    pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
         self.base_backoff = base_backoff.max(Duration::from_millis(1));
         if self.max_backoff < self.base_backoff {
             self.max_backoff = self.base_backoff;
@@ -136,22 +136,22 @@ impl ResumableUploadOptions {
         self
     }
 
-    pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
         self.max_backoff = max_backoff.max(self.base_backoff);
         self
     }
 
-    pub fn jitter_ratio(mut self, jitter_ratio: f64) -> Self {
+    pub fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
         self.jitter_ratio = jitter_ratio.clamp(0.0, 1.0);
         self
     }
 
-    pub fn abort_on_error(mut self, abort_on_error: bool) -> Self {
+    pub fn with_abort_on_error(mut self, abort_on_error: bool) -> Self {
         self.abort_on_error = abort_on_error;
         self
     }
 
-    pub fn part_checksum_algorithm(
+    pub fn with_part_checksum_algorithm(
         mut self,
         part_checksum_algorithm: PartChecksumAlgorithm,
     ) -> Self {
@@ -159,29 +159,29 @@ impl ResumableUploadOptions {
         self
     }
 
-    pub fn clear_part_checksum_algorithm(mut self) -> Self {
+    pub fn without_part_checksum_algorithm(mut self) -> Self {
         self.part_checksum_algorithm = None;
         self
     }
 
-    pub fn verify_remote_etag(mut self, verify_remote_etag: bool) -> Self {
+    pub fn with_verify_remote_etag(mut self, verify_remote_etag: bool) -> Self {
         self.verify_remote_etag = verify_remote_etag;
         self
     }
 
-    pub fn part_size_value(&self) -> usize {
+    pub fn part_size(&self) -> usize {
         self.part_size
     }
 
-    pub fn max_attempts_value(&self) -> usize {
+    pub fn max_attempts(&self) -> usize {
         self.max_attempts
     }
 
-    pub fn part_checksum_algorithm_value(&self) -> Option<PartChecksumAlgorithm> {
+    pub fn part_checksum_algorithm(&self) -> Option<PartChecksumAlgorithm> {
         self.part_checksum_algorithm
     }
 
-    pub fn verify_remote_etag_value(&self) -> bool {
+    pub fn verify_remote_etag(&self) -> bool {
         self.verify_remote_etag
     }
 
@@ -470,7 +470,7 @@ where
 
     match (
         checkpoint.checksum_algorithm,
-        options.part_checksum_algorithm_value(),
+        options.part_checksum_algorithm(),
     ) {
         (Some(checkpoint_algorithm), Some(options_algorithm))
             if checkpoint_algorithm != options_algorithm =>
@@ -558,7 +558,7 @@ impl BlockingResumableUploader {
             .create_upload()
             .map_err(|source| ResumableUploadError::CreateFailed { source })?;
         let mut checkpoint = ResumableUploadCheckpoint::new(upload_id, self.options.part_size);
-        checkpoint.checksum_algorithm = self.options.part_checksum_algorithm_value();
+        checkpoint.checksum_algorithm = self.options.part_checksum_algorithm();
         self.upload_with_checkpoint(backend, reader, checkpoint, false)
     }
 
@@ -724,7 +724,7 @@ impl AsyncResumableUploader {
             .await
             .map_err(|source| ResumableUploadError::CreateFailed { source })?;
         let mut checkpoint = ResumableUploadCheckpoint::new(upload_id, self.options.part_size);
-        checkpoint.checksum_algorithm = self.options.part_checksum_algorithm_value();
+        checkpoint.checksum_algorithm = self.options.part_checksum_algorithm();
         self.upload_with_checkpoint(backend, reader, checkpoint, false)
             .await
     }
@@ -1032,10 +1032,10 @@ mod tests {
         let backend = BlockingMockBackend::default();
         let uploader = BlockingResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .max_attempts(1)
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
         );
 
         let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
@@ -1084,12 +1084,12 @@ mod tests {
         backend.fail_once_for_part(2);
         let uploader = BlockingResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .max_attempts(1)
-                .base_backoff(Duration::from_millis(1))
-                .max_backoff(Duration::from_millis(1))
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_base_backoff(Duration::from_millis(1))
+                .with_max_backoff(Duration::from_millis(1))
+                .with_jitter_ratio(0.0),
         );
 
         let mut reader = std::io::Cursor::new(b"abcdefgh".to_vec());
@@ -1126,11 +1126,11 @@ mod tests {
         backend.set_etag_for_part(1, "not-md5");
         let uploader = BlockingResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .verify_remote_etag(true)
-                .max_attempts(1)
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_verify_remote_etag(true)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
         );
 
         let mut reader = std::io::Cursor::new(b"abcd".to_vec());
@@ -1156,10 +1156,10 @@ mod tests {
         let backend = BlockingMockBackend::default();
         let uploader = BlockingResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Sha256)
-                .max_attempts(1)
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Sha256)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
         );
 
         let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
@@ -1182,10 +1182,10 @@ mod tests {
         backend.set_checksum_for_part(1, Some("bad-checksum".to_owned()));
         let uploader = BlockingResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .max_attempts(1)
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
         );
 
         let mut reader = std::io::Cursor::new(b"abcd".to_vec());
@@ -1278,12 +1278,12 @@ mod tests {
         backend.fail_once_for_part(2);
         let uploader = AsyncResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .max_attempts(1)
-                .base_backoff(Duration::from_millis(1))
-                .max_backoff(Duration::from_millis(1))
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_base_backoff(Duration::from_millis(1))
+                .with_max_backoff(Duration::from_millis(1))
+                .with_jitter_ratio(0.0),
         );
 
         let mut first_reader = std::io::Cursor::new(b"abcdefgh".to_vec());
@@ -1303,12 +1303,12 @@ mod tests {
         let mut second_reader = std::io::Cursor::new(b"abcdefgh".to_vec());
         let resumed = AsyncResumableUploader::new(
             ResumableUploadOptions::new()
-                .part_size(4)
-                .part_checksum_algorithm(PartChecksumAlgorithm::Md5)
-                .max_attempts(2)
-                .base_backoff(Duration::from_millis(1))
-                .max_backoff(Duration::from_millis(1))
-                .jitter_ratio(0.0),
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(2)
+                .with_base_backoff(Duration::from_millis(1))
+                .with_max_backoff(Duration::from_millis(1))
+                .with_jitter_ratio(0.0),
         )
         .resume(&backend, &mut second_reader, checkpoint)
         .await

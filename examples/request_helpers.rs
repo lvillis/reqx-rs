@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())
         .try_default_header("x-sdk-version", "1.0.0")?
-        .try_build()?;
+        .build()?;
 
     let get_response: Value = client
         .get("/get")

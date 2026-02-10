@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_name("reqx-example-retry-classifier")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(retry_policy)
-        .try_build()?;
+        .build()?;
 
     let result = client
         .get("/status/429")

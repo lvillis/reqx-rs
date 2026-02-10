@@ -56,7 +56,7 @@ cargo add reqx --no-default-features -F blocking-tls-native
   - `blocking-tls-rustls-aws-lc-rs`
   - `blocking-tls-native`
 - runtime selection via `tls_backend(TlsBackend::...)`
-- build-time mismatch returns structured error from `try_build()`
+- build-time mismatch returns structured error from `build()`
 - trust store selection via `tls_root_store(TlsRootStore::BackendDefault | WebPki | System | Specific)`
 - `BackendDefault` follows each backend's default trust roots; set `System` explicitly for enterprise/private PKI environments
 - custom root CA: `tls_root_store(TlsRootStore::Specific)` + `tls_root_ca_pem(...)` / `tls_root_ca_der(...)`
@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .base_backoff(Duration::from_millis(100))
                 .max_backoff(Duration::from_millis(800)),
         )
-        .try_build()?;
+        .build()?;
 
     let created: CreateItemResponse = client
         .post("/v1/items")
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = HttpClient::builder("https://api.example.com")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(8))
-        .build();
+        .build()?;
 
     let response = client.get("/v1/items").send()?;
     println!("status={}", response.status());
@@ -132,7 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - transport timeout + response-body timeout + total deadline
 - separate connect timeout (`connect_timeout(...)`)
 - streaming upload and streaming response path
-- buffered-path automatic decoding: `gzip`, `br`, `deflate`, `zstd`
+- buffered-path automatic decoding:
+  async: `gzip`, `br`, `deflate`, `zstd`; blocking: `gzip`, `br`
 - proxy support with auth and `no_proxy`
 - interceptor hooks for SDK concerns (`HttpInterceptor`)
 - response body size limit
@@ -160,13 +161,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Error Model
 
-Common `HttpClientError` variants:
+Common `Error` variants:
 
 - `Transport { kind, .. }`
 - `Timeout { phase, .. }`
 - `DeadlineExceeded { .. }`
 - `HttpStatus { status, body, .. }`
 - `DecodeContentEncoding { .. }`
-- `Deserialize { .. }`
+- `DeserializeJson { .. }`
 
 Use `error.code()` for stable machine-readable classification.

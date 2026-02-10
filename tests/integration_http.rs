@@ -14,7 +14,7 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{
-    HttpClient, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
+    Error, HttpClient, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
     RetryPolicy, ServerThrottleScope, TimeoutPhase,
 };
 use serde::Serialize;
@@ -348,7 +348,8 @@ async fn retries_post_with_idempotency_key_then_succeeds() {
                 .max_backoff(Duration::from_millis(5))
                 .jitter_ratio(0.0),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let response_json: Value = client
         .post("/v1/items")
@@ -397,7 +398,8 @@ async fn post_without_idempotency_key_does_not_retry() {
                 .max_backoff(Duration::from_millis(5))
                 .jitter_ratio(0.0),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .post("/v1/items")
@@ -408,7 +410,7 @@ async fn post_without_idempotency_key_does_not_retry() {
         .expect_err("500 should be returned as HttpStatus error without retry");
 
     match error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 500),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 500),
         other => panic!("unexpected error: {other}"),
     }
 
@@ -429,7 +431,8 @@ async fn request_timeout_reports_transport_phase() {
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/slow")
@@ -438,7 +441,7 @@ async fn request_timeout_reports_transport_phase() {
         .expect_err("slow response should timeout in transport phase");
 
     match error {
-        HttpClientError::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::Transport),
+        Error::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::Transport),
         other => panic!("unexpected error: {other}"),
     }
 
@@ -464,7 +467,8 @@ async fn decodes_gzip_response_and_sets_accept_encoding() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response: Value = client
         .get("/gzip")
@@ -499,7 +503,8 @@ async fn decoded_gzip_response_still_respects_max_body_limit() {
         .max_response_body_bytes(512)
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/gzip-too-large")
@@ -508,7 +513,7 @@ async fn decoded_gzip_response_still_respects_max_body_limit() {
         .expect_err("decoded payload should still honor response size limit");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             ..
@@ -534,7 +539,8 @@ async fn stream_into_response_limited_respects_decode_limit() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/gzip-stream-too-large")
@@ -547,7 +553,7 @@ async fn stream_into_response_limited_respects_decode_limit() {
         .expect_err("decoded stream payload should still honor response size limit");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             ..
@@ -577,7 +583,8 @@ async fn query_helpers_append_encoded_query_pairs() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response: Value = client
         .get("/v1/search?existing=true")
@@ -628,7 +635,8 @@ async fn form_helper_sets_content_type_and_encoded_body() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let response = client
         .post("/v1/login")
@@ -670,7 +678,8 @@ async fn body_stream_uploads_chunked_data_with_declared_length() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let body_stream = stream::iter(vec![
         Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello ")),
@@ -705,7 +714,8 @@ async fn global_rate_limit_applies_between_parallel_requests() {
                 .requests_per_second(20.0)
                 .burst(1),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let started = Instant::now();
     let client_a = client.clone();
@@ -737,7 +747,8 @@ async fn retry_after_429_backpressures_following_request() {
                 .requests_per_second(500.0)
                 .burst(50),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let first_error = client
         .get("/throttled")
@@ -745,7 +756,7 @@ async fn retry_after_429_backpressures_following_request() {
         .await
         .expect_err("first request should return 429");
     match first_error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -791,7 +802,8 @@ async fn retry_after_429_auto_scope_throttles_same_host_only() {
                 .requests_per_second(500.0)
                 .burst(50),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let first_error = client
         .get("/throttled")
@@ -799,7 +811,7 @@ async fn retry_after_429_auto_scope_throttles_same_host_only() {
         .await
         .expect_err("first request should return 429");
     match first_error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -858,7 +870,8 @@ async fn retry_after_429_global_scope_backpressures_other_hosts() {
                 .burst(50),
         )
         .server_throttle_scope(ServerThrottleScope::Global)
-        .build();
+        .build()
+        .expect("client should build");
 
     let first_error = client
         .get("/throttled")
@@ -866,7 +879,7 @@ async fn retry_after_429_global_scope_backpressures_other_hosts() {
         .await
         .expect_err("first request should return 429");
     match first_error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -895,7 +908,8 @@ async fn response_body_timeout_reports_phase_and_metrics() {
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/slow-body")
@@ -903,7 +917,7 @@ async fn response_body_timeout_reports_phase_and_metrics() {
         .await
         .expect_err("slow body read should timeout in response body phase");
     match error {
-        HttpClientError::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::ResponseBody),
+        Error::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::ResponseBody),
         other => panic!("unexpected error variant: {other}"),
     }
 
@@ -932,7 +946,8 @@ async fn decode_content_encoding_error_is_classified() {
         .request_timeout(Duration::from_millis(200))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/bad-encoding")
@@ -940,7 +955,7 @@ async fn decode_content_encoding_error_is_classified() {
         .await
         .expect_err("unknown content-encoding should fail");
     match error {
-        HttpClientError::DecodeContentEncoding { encoding, .. } => {
+        Error::DecodeContentEncoding { encoding, .. } => {
             assert_eq!(encoding, "x-custom");
         }
         other => panic!("unexpected error variant: {other}"),
@@ -976,7 +991,8 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
-        .build();
+        .build()
+        .expect("client should build");
 
     let first: Value = client
         .get("/ok")
@@ -991,7 +1007,7 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
         .await
         .expect_err("second request should return http status error");
     match second_error {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected error: {other}"),
     }
 
@@ -1002,7 +1018,7 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
         .await
         .expect_err("third request should exceed body limit");
     match third_error {
-        HttpClientError::ResponseBodyTooLarge { limit_bytes, .. } => assert_eq!(limit_bytes, 4),
+        Error::ResponseBodyTooLarge { limit_bytes, .. } => assert_eq!(limit_bytes, 4),
         other => panic!("unexpected error: {other}"),
     }
 
@@ -1035,7 +1051,8 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let _response = client
         .get("/metrics-disabled")
@@ -1073,7 +1090,8 @@ async fn redirect_policy_follows_relative_location() {
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .redirect_policy(RedirectPolicy::limited(3))
-        .build();
+        .build()
+        .expect("client should build");
 
     let body: Value = client
         .get("/v1/old")
@@ -1112,7 +1130,7 @@ impl HttpInterceptor for HeaderInjectingInterceptor {
         self.response_hits.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn on_error(&self, _context: &RequestContext, _error: &HttpClientError) {
+    fn on_error(&self, _context: &RequestContext, _error: &Error) {
         self.error_hits.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -1139,7 +1157,8 @@ async fn interceptor_can_mutate_headers_and_observe_lifecycle() {
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .interceptor_arc(interceptor)
-        .build();
+        .build()
+        .expect("client should build");
 
     let body: Value = client
         .get("/v1/interceptor")

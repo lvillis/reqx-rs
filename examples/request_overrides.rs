@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, HttpClientError, RetryPolicy, TimeoutPhase};
+use reqx::prelude::{Error, HttpClient, RetryPolicy, TimeoutPhase};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_timeout(Duration::from_secs(2))
         .total_timeout(Duration::from_secs(8))
         .retry_policy(RetryPolicy::standard().max_attempts(3))
-        .try_build()?;
+        .build()?;
 
     let fast = client
         .get("/delay/1")
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(response) => {
             println!("unexpected success: status={}", response.status());
         }
-        Err(HttpClientError::Timeout { phase, .. }) if phase == TimeoutPhase::Transport => {
+        Err(Error::Timeout { phase, .. }) if phase == TimeoutPhase::Transport => {
             println!("request-level timeout works: phase={phase}");
         }
         Err(other) => {

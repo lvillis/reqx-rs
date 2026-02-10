@@ -4,8 +4,7 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
-use crate::ReqxResult;
-use crate::error::HttpClientError;
+use crate::error::Error;
 use crate::metrics::HttpClientMetrics;
 use crate::otel::OtelTelemetry;
 use crate::policy::{HttpInterceptor, RedirectPolicy};
@@ -106,7 +105,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn try_proxy_authorization(self, proxy_authorization: &str) -> ReqxResult<Self> {
+    pub fn try_proxy_authorization(self, proxy_authorization: &str) -> crate::Result<Self> {
         let proxy_authorization = parse_header_value("proxy-authorization", proxy_authorization)?;
         Ok(self.proxy_authorization(proxy_authorization))
     }
@@ -135,7 +134,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn try_default_header(self, name: &str, value: &str) -> ReqxResult<Self> {
+    pub fn try_default_header(self, name: &str, value: &str) -> crate::Result<Self> {
         let name = parse_header_name(name)?;
         let value = parse_header_value(name.as_str(), value)?;
         Ok(self.default_header(name, value))
@@ -161,7 +160,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn adaptive_concurrency(
+    pub fn adaptive_concurrency_policy(
         mut self,
         adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
     ) -> Self {
@@ -286,11 +285,11 @@ impl HttpClientBuilder {
         self.interceptor_arc(Arc::new(interceptor))
     }
 
-    pub fn try_build(self) -> ReqxResult<HttpClient> {
+    pub fn build(self) -> crate::Result<HttpClient> {
         validate_base_url(&self.base_url)?;
 
         if !backend_is_available(self.tls_backend) {
-            return Err(HttpClientError::TlsBackendUnavailable {
+            return Err(Error::TlsBackendUnavailable {
                 backend: self.tls_backend.as_str(),
             });
         }
@@ -312,11 +311,10 @@ impl HttpClientBuilder {
         )?;
 
         let proxied = if let Some(proxy_config) = &proxy_config {
-            let proxy = ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| {
-                HttpClientError::InvalidUri {
+            let proxy =
+                ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| Error::InvalidUri {
                     uri: proxy_config.uri.to_string(),
-                }
-            })?;
+                })?;
 
             Some(make_agent(
                 self.tls_backend,
@@ -369,15 +367,6 @@ impl HttpClientBuilder {
             connect_timeout: self.connect_timeout,
             metrics: HttpClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
-        })
-    }
-
-    #[track_caller]
-    pub fn build(self) -> HttpClient {
-        self.try_build().unwrap_or_else(|error| {
-            panic!(
-                "failed to build reqx blocking http client: {error}; use try_build() to handle configuration errors"
-            )
         })
     }
 }

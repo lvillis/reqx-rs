@@ -26,12 +26,11 @@ use tracing::{debug, info_span, warn};
 ))]
 use hyper_rustls::HttpsConnectorBuilder;
 
-use crate::ReqxResult;
 use crate::body::{
     DecodeContentEncodingError, ReadBodyError, ReqBody, RequestBody, buffered_req_body,
     build_http_request, decode_content_encoded_body_limited, empty_req_body, read_all_body_limited,
 };
-use crate::error::{HttpClientError, TimeoutPhase};
+use crate::error::{Error, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
 use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
 use crate::otel::OtelTelemetry;
@@ -59,11 +58,11 @@ use crate::tls::{
     TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
 };
 use crate::util::{
-    bounded_retry_delay, classify_transport_error, deadline_exceeded_error, ensure_accept_encoding,
-    is_redirect_status, lock_unpoisoned, merge_headers, parse_header_name, parse_header_value,
-    parse_retry_after, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
-    redirect_location, redirect_method, resolve_redirect_uri, resolve_uri, same_origin,
-    sanitize_headers_for_redirect, truncate_body, validate_base_url,
+    bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
+    ensure_accept_encoding_async, is_redirect_status, lock_unpoisoned, merge_headers,
+    parse_header_name, parse_header_value, parse_retry_after, phase_timeout, rate_limit_bucket_key,
+    redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, resolve_uri,
+    same_origin, sanitize_headers_for_redirect, truncate_body, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -142,7 +141,7 @@ fn add_custom_rustls_root_certificates(
     tls_backend: TlsBackend,
     tls_options: &TlsOptions,
     root_store: &mut rustls::RootCertStore,
-) -> ReqxResult<usize> {
+) -> crate::Result<usize> {
     use rustls::pki_types::pem::PemObject;
 
     let mut added_total = 0usize;
@@ -198,7 +197,7 @@ fn add_custom_rustls_root_certificates(
 fn build_rustls_root_store(
     tls_backend: TlsBackend,
     tls_options: &TlsOptions,
-) -> ReqxResult<rustls::RootCertStore> {
+) -> crate::Result<rustls::RootCertStore> {
     if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
     {
         return Err(tls_config_error(
@@ -260,14 +259,14 @@ fn build_rustls_tls_config(
     tls_backend: TlsBackend,
     provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
     tls_options: &TlsOptions,
-) -> ReqxResult<rustls::ClientConfig> {
+) -> crate::Result<rustls::ClientConfig> {
     use rustls::pki_types::pem::PemObject;
 
     let root_store = build_rustls_root_store(tls_backend, tls_options)?;
 
     let config_builder = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
-        .map_err(|source| HttpClientError::TlsBackendInit {
+        .map_err(|source| Error::TlsBackendInit {
             backend: tls_backend.as_str(),
             message: source.to_string(),
         })?
@@ -392,8 +391,8 @@ fn decode_content_encoding_error(
     message: String,
     method: &Method,
     uri: &str,
-) -> HttpClientError {
-    HttpClientError::DecodeContentEncoding {
+) -> Error {
+    Error::DecodeContentEncoding {
         encoding,
         message,
         method: method.clone(),
@@ -406,19 +405,17 @@ fn decode_response_body_error(
     max_bytes: usize,
     method: &Method,
     uri: &str,
-) -> HttpClientError {
+) -> Error {
     match error {
         DecodeContentEncodingError::Decode { encoding, message } => {
             decode_content_encoding_error(encoding, message, method, uri)
         }
-        DecodeContentEncodingError::TooLarge { actual_bytes } => {
-            HttpClientError::ResponseBodyTooLarge {
-                limit_bytes: max_bytes,
-                actual_bytes,
-                method: method.clone(),
-                uri: uri.to_owned(),
-            }
-        }
+        DecodeContentEncodingError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
+            limit_bytes: max_bytes,
+            actual_bytes,
+            method: method.clone(),
+            uri: uri.to_owned(),
+        },
     }
 }
 
@@ -435,7 +432,7 @@ fn build_rustls_ring_transport(
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
-) -> ReqxResult<TransportClient> {
+) -> crate::Result<TransportClient> {
     let connector = ProxyConnector::new(proxy_config, connect_timeout);
     let tls_config = build_rustls_tls_config(
         TlsBackend::RustlsRing,
@@ -464,8 +461,8 @@ fn build_rustls_ring_transport(
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
-) -> ReqxResult<TransportClient> {
-    Err(HttpClientError::TlsBackendUnavailable {
+) -> crate::Result<TransportClient> {
+    Err(Error::TlsBackendUnavailable {
         backend: TlsBackend::RustlsRing.as_str(),
     })
 }
@@ -478,7 +475,7 @@ fn build_rustls_aws_lc_rs_transport(
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
-) -> ReqxResult<TransportClient> {
+) -> crate::Result<TransportClient> {
     let connector = ProxyConnector::new(proxy_config, connect_timeout);
     let tls_config = build_rustls_tls_config(
         TlsBackend::RustlsAwsLcRs,
@@ -507,8 +504,8 @@ fn build_rustls_aws_lc_rs_transport(
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
-) -> ReqxResult<TransportClient> {
-    Err(HttpClientError::TlsBackendUnavailable {
+) -> crate::Result<TransportClient> {
+    Err(Error::TlsBackendUnavailable {
         backend: TlsBackend::RustlsAwsLcRs.as_str(),
     })
 }
@@ -516,7 +513,7 @@ fn build_rustls_aws_lc_rs_transport(
 #[cfg(feature = "async-tls-native")]
 fn build_native_tls_connector(
     tls_options: &TlsOptions,
-) -> ReqxResult<hyper_tls::native_tls::TlsConnector> {
+) -> crate::Result<hyper_tls::native_tls::TlsConnector> {
     let mut connector_builder = hyper_tls::native_tls::TlsConnector::builder();
 
     if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
@@ -613,7 +610,7 @@ fn build_native_tls_connector(
 
     connector_builder
         .build()
-        .map_err(|source| HttpClientError::TlsBackendInit {
+        .map_err(|source| Error::TlsBackendInit {
             backend: TlsBackend::NativeTls.as_str(),
             message: source.to_string(),
         })
@@ -627,7 +624,7 @@ fn build_native_tls_transport(
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
-) -> ReqxResult<TransportClient> {
+) -> crate::Result<TransportClient> {
     let connector = ProxyConnector::new(proxy_config, connect_timeout);
     let https = if tls_options.has_customizations() {
         let tls_connector = build_native_tls_connector(tls_options)?;
@@ -651,8 +648,8 @@ fn build_native_tls_transport(
     _pool_idle_timeout: Duration,
     _pool_max_idle_per_host: usize,
     _http2_only: bool,
-) -> ReqxResult<TransportClient> {
-    Err(HttpClientError::TlsBackendUnavailable {
+) -> crate::Result<TransportClient> {
+    Err(Error::TlsBackendUnavailable {
         backend: TlsBackend::NativeTls.as_str(),
     })
 }
@@ -665,7 +662,7 @@ fn build_transport_client(
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_only: bool,
-) -> ReqxResult<TransportClient> {
+) -> crate::Result<TransportClient> {
     match tls_backend {
         TlsBackend::RustlsRing => build_rustls_ring_transport(
             proxy_config,
@@ -711,8 +708,8 @@ struct AdaptiveConcurrencyController {
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
         let initial_limit = policy
-            .initial_limit_value()
-            .clamp(policy.min_limit_value(), policy.max_limit_value());
+            .configured_initial_limit()
+            .clamp(policy.configured_min_limit(), policy.configured_max_limit());
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState {
@@ -752,17 +749,21 @@ impl AdaptiveConcurrencyController {
             state.ewma_latency_ms = state.ewma_latency_ms * 0.8 + latency_ms * 0.2;
         }
 
-        let threshold_ms = self.policy.high_latency_threshold_value().as_secs_f64() * 1000.0;
+        let threshold_ms = self
+            .policy
+            .configured_high_latency_threshold()
+            .as_secs_f64()
+            * 1000.0;
         let should_decrease = !success || state.ewma_latency_ms > threshold_ms;
         if should_decrease {
-            let decreased =
-                (state.current_limit as f64 * self.policy.decrease_ratio_value()).floor() as usize;
-            state.current_limit = decreased.max(self.policy.min_limit_value());
+            let decreased = (state.current_limit as f64 * self.policy.configured_decrease_ratio())
+                .floor() as usize;
+            state.current_limit = decreased.max(self.policy.configured_min_limit());
         } else {
             state.current_limit = state
                 .current_limit
-                .saturating_add(self.policy.increase_step_value())
-                .min(self.policy.max_limit_value());
+                .saturating_add(self.policy.configured_increase_step())
+                .min(self.policy.configured_max_limit());
         }
 
         self.notify.notify_waiters();
@@ -914,7 +915,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn try_proxy_authorization(self, proxy_authorization: &str) -> ReqxResult<Self> {
+    pub fn try_proxy_authorization(self, proxy_authorization: &str) -> crate::Result<Self> {
         let proxy_authorization = parse_header_value("proxy-authorization", proxy_authorization)?;
         Ok(self.proxy_authorization(proxy_authorization))
     }
@@ -943,7 +944,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn try_default_header(self, name: &str, value: &str) -> ReqxResult<Self> {
+    pub fn try_default_header(self, name: &str, value: &str) -> crate::Result<Self> {
         let name = parse_header_name(name)?;
         let value = parse_header_value(name.as_str(), value)?;
         Ok(self.default_header(name, value))
@@ -969,7 +970,7 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn adaptive_concurrency(
+    pub fn adaptive_concurrency_policy(
         mut self,
         adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
     ) -> Self {
@@ -1104,7 +1105,7 @@ impl HttpClientBuilder {
         self.interceptor_arc(Arc::new(interceptor))
     }
 
-    pub fn try_build(self) -> ReqxResult<HttpClient> {
+    pub fn build(self) -> crate::Result<HttpClient> {
         validate_base_url(&self.base_url)?;
 
         let proxy_config = self.http_proxy.map(|uri| ProxyConfig {
@@ -1157,13 +1158,6 @@ impl HttpClientBuilder {
             request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
             metrics: HttpClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
-        })
-    }
-
-    #[track_caller]
-    pub fn build(self) -> HttpClient {
-        self.try_build().unwrap_or_else(|error| {
-            panic!("failed to build reqx http client: {error}; use try_build() to handle configuration errors")
         })
     }
 }
@@ -1245,7 +1239,7 @@ impl HttpClient {
         }
     }
 
-    fn run_error_interceptors(&self, context: &RequestContext, error: &HttpClientError) {
+    fn run_error_interceptors(&self, context: &RequestContext, error: &Error) {
         for interceptor in &self.interceptors {
             interceptor.on_error(context, error);
         }
@@ -1257,14 +1251,14 @@ impl HttpClient {
         }
     }
 
-    fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), HttpClientError> {
+    fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
         let Some(retry_budget) = &self.retry_budget else {
             return Ok(());
         };
         if retry_budget.try_consume_retry() {
             Ok(())
         } else {
-            Err(HttpClientError::RetryBudgetExhausted {
+            Err(Error::RetryBudgetExhausted {
                 method: method.clone(),
                 uri: uri.to_owned(),
             })
@@ -1275,14 +1269,14 @@ impl HttpClient {
         &self,
         method: &Method,
         uri: &str,
-    ) -> Result<Option<crate::resilience::CircuitAttempt>, HttpClientError> {
+    ) -> Result<Option<crate::resilience::CircuitAttempt>, Error> {
         let Some(circuit_breaker) = &self.circuit_breaker else {
             return Ok(None);
         };
 
         match circuit_breaker.begin() {
             Ok(attempt) => Ok(Some(attempt)),
-            Err(retry_after) => Err(HttpClientError::CircuitOpen {
+            Err(retry_after) => Err(Error::CircuitOpen {
                 method: method.clone(),
                 uri: uri.to_owned(),
                 retry_after_ms: retry_after.as_millis(),
@@ -1302,7 +1296,7 @@ impl HttpClient {
         request_started_at: Instant,
         method: &Method,
         uri: &str,
-    ) -> Result<(), HttpClientError> {
+    ) -> Result<(), Error> {
         let Some(rate_limiter) = &self.rate_limiter else {
             return Ok(());
         };
@@ -1342,10 +1336,7 @@ impl HttpClient {
         );
     }
 
-    async fn acquire_request_permits(
-        &self,
-        host: Option<&str>,
-    ) -> Result<RequestPermits, HttpClientError> {
+    async fn acquire_request_permits(&self, host: Option<&str>) -> Result<RequestPermits, Error> {
         match &self.request_limiters {
             Some(limiters) => limiters.acquire(host).await,
             None => Ok(RequestPermits {
@@ -1374,11 +1365,11 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, HttpClientError> {
+    ) -> Result<HttpResponse, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding(&mut merged_headers);
+        ensure_accept_encoding_async(&mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
@@ -1428,11 +1419,11 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponseStream, HttpClientError> {
+    ) -> Result<HttpResponseStream, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding(&mut merged_headers);
+        ensure_accept_encoding_async(&mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
@@ -1483,7 +1474,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponseStream, HttpClientError> {
+    ) -> Result<HttpResponseStream, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -1509,7 +1500,7 @@ impl HttpClient {
             .supports_retry(&method, &merged_headers)
             && body_replayable
         {
-            retry_policy.max_attempts_value()
+            retry_policy.configured_max_attempts()
         } else {
             1
         };
@@ -1592,7 +1583,7 @@ impl HttpClient {
                 Ok(response) => response,
                 Err(TransportRequestError::Transport(source)) => {
                     let kind = classify_transport_error(&source);
-                    let error = HttpClientError::Transport {
+                    let error = Error::Transport {
                         kind,
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -1639,7 +1630,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 Err(TransportRequestError::Timeout) => {
-                    let error = HttpClientError::Timeout {
+                    let error = Error::Timeout {
                         phase: TimeoutPhase::Transport,
                         timeout_ms: transport_timeout.as_millis(),
                         method: current_method.clone(),
@@ -1691,7 +1682,7 @@ impl HttpClient {
             let response_headers = response.headers().clone();
             if redirect_policy.enabled() && is_redirect_status(status) {
                 if redirect_count >= redirect_policy.max_redirects() {
-                    let error = HttpClientError::RedirectLimitExceeded {
+                    let error = Error::RedirectLimitExceeded {
                         max_redirects: redirect_policy.max_redirects(),
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -1705,7 +1696,7 @@ impl HttpClient {
                         Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
                     )
                 {
-                    let error = HttpClientError::RedirectBodyNotReplayable {
+                    let error = Error::RedirectBodyNotReplayable {
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
                     };
@@ -1713,7 +1704,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 let Some(location) = redirect_location(&response_headers) else {
-                    let error = HttpClientError::MissingRedirectLocation {
+                    let error = Error::MissingRedirectLocation {
                         status: status.as_u16(),
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -1722,7 +1713,7 @@ impl HttpClient {
                     return Err(error);
                 };
                 let Some(next_uri) = resolve_redirect_uri(&current_uri, &location) else {
-                    let error = HttpClientError::InvalidRedirectLocation {
+                    let error = Error::InvalidRedirectLocation {
                         location,
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -1759,7 +1750,7 @@ impl HttpClient {
                         .retry_eligibility
                         .supports_retry(&current_method, &current_headers)
                 {
-                    max_attempts = retry_policy.max_attempts_value();
+                    max_attempts = retry_policy.configured_max_attempts();
                 }
                 continue;
             }
@@ -1784,14 +1775,14 @@ impl HttpClient {
                 {
                     Ok(Ok(body)) => body,
                     Ok(Err(ReadBodyError::Read(source))) => {
-                        let error = HttpClientError::ReadBody {
+                        let error = Error::ReadBody {
                             source: Box::new(source),
                         };
                         self.run_error_interceptors(&context, &error);
                         return Err(error);
                     }
                     Ok(Err(ReadBodyError::TooLarge { actual_bytes })) => {
-                        let error = HttpClientError::ResponseBodyTooLarge {
+                        let error = Error::ResponseBodyTooLarge {
                             limit_bytes: max_response_body_bytes,
                             actual_bytes,
                             method: current_method.clone(),
@@ -1801,7 +1792,7 @@ impl HttpClient {
                         return Err(error);
                     }
                     Err(_) => {
-                        let error = HttpClientError::Timeout {
+                        let error = Error::Timeout {
                             phase: TimeoutPhase::ResponseBody,
                             timeout_ms: read_timeout.as_millis(),
                             method: current_method.clone(),
@@ -1826,7 +1817,7 @@ impl HttpClient {
                 })?;
                 self.run_response_interceptors(&context, status, &response_headers);
 
-                let error = HttpClientError::HttpStatus {
+                let error = Error::HttpStatus {
                     status: status.as_u16(),
                     method: current_method.clone(),
                     uri: current_redacted_uri.clone(),
@@ -1916,7 +1907,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, HttpClientError> {
+    ) -> Result<HttpResponse, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -1942,7 +1933,7 @@ impl HttpClient {
             .supports_retry(&method, &merged_headers)
             && body_replayable
         {
-            retry_policy.max_attempts_value()
+            retry_policy.configured_max_attempts()
         } else {
             1
         };
@@ -2025,7 +2016,7 @@ impl HttpClient {
                 Ok(response) => response,
                 Err(TransportRequestError::Transport(source)) => {
                     let kind = classify_transport_error(&source);
-                    let error = HttpClientError::Transport {
+                    let error = Error::Transport {
                         kind,
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -2077,7 +2068,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 Err(TransportRequestError::Timeout) => {
-                    let error = HttpClientError::Timeout {
+                    let error = Error::Timeout {
                         phase: TimeoutPhase::Transport,
                         timeout_ms: transport_timeout.as_millis(),
                         method: current_method.clone(),
@@ -2134,7 +2125,7 @@ impl HttpClient {
             let mut response_headers = response.headers().clone();
             if redirect_policy.enabled() && is_redirect_status(status) {
                 if redirect_count >= redirect_policy.max_redirects() {
-                    let error = HttpClientError::RedirectLimitExceeded {
+                    let error = Error::RedirectLimitExceeded {
                         max_redirects: redirect_policy.max_redirects(),
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -2148,7 +2139,7 @@ impl HttpClient {
                         Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
                     )
                 {
-                    let error = HttpClientError::RedirectBodyNotReplayable {
+                    let error = Error::RedirectBodyNotReplayable {
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
                     };
@@ -2156,7 +2147,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 let Some(location) = redirect_location(&response_headers) else {
-                    let error = HttpClientError::MissingRedirectLocation {
+                    let error = Error::MissingRedirectLocation {
                         status: status.as_u16(),
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -2165,7 +2156,7 @@ impl HttpClient {
                     return Err(error);
                 };
                 let Some(next_uri) = resolve_redirect_uri(&current_uri, &location) else {
-                    let error = HttpClientError::InvalidRedirectLocation {
+                    let error = Error::InvalidRedirectLocation {
                         location,
                         method: current_method.clone(),
                         uri: current_redacted_uri.clone(),
@@ -2202,7 +2193,7 @@ impl HttpClient {
                         .retry_eligibility
                         .supports_retry(&current_method, &current_headers)
                 {
-                    max_attempts = retry_policy.max_attempts_value();
+                    max_attempts = retry_policy.configured_max_attempts();
                 }
                 continue;
             }
@@ -2222,7 +2213,7 @@ impl HttpClient {
             {
                 Ok(Ok(body)) => body,
                 Ok(Err(ReadBodyError::Read(source))) => {
-                    let error = HttpClientError::ReadBody {
+                    let error = Error::ReadBody {
                         source: Box::new(source),
                     };
                     let retry_decision = RetryDecision {
@@ -2271,7 +2262,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 Ok(Err(ReadBodyError::TooLarge { actual_bytes })) => {
-                    let error = HttpClientError::ResponseBodyTooLarge {
+                    let error = Error::ResponseBodyTooLarge {
                         limit_bytes: max_response_body_bytes,
                         actual_bytes,
                         method: current_method.clone(),
@@ -2281,7 +2272,7 @@ impl HttpClient {
                     return Err(error);
                 }
                 Err(_) => {
-                    let error = HttpClientError::Timeout {
+                    let error = Error::Timeout {
                         phase: TimeoutPhase::ResponseBody,
                         timeout_ms: read_timeout.as_millis(),
                         method: current_method.clone(),
@@ -2358,7 +2349,7 @@ impl HttpClient {
             self.run_response_interceptors(&context, status, &response_headers);
 
             if !status.is_success() {
-                let error = HttpClientError::HttpStatus {
+                let error = Error::HttpStatus {
                     status: status.as_u16(),
                     method: current_method.clone(),
                     uri: current_redacted_uri.clone(),

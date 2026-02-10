@@ -3,8 +3,7 @@ use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::ReqxResult;
-use crate::error::HttpClientError;
+use crate::error::Error;
 use crate::util::truncate_body;
 
 #[derive(Clone, Debug)]
@@ -39,11 +38,11 @@ impl HttpResponse {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    pub fn json<T>(&self) -> ReqxResult<T>
+    pub fn json<T>(&self) -> crate::Result<T>
     where
         T: DeserializeOwned,
     {
-        serde_json::from_slice(&self.body).map_err(|source| HttpClientError::Deserialize {
+        serde_json::from_slice(&self.body).map_err(|source| Error::DeserializeJson {
             source,
             body: truncate_body(&self.body),
         })
@@ -59,12 +58,11 @@ mod stream {
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-    use crate::ReqxResult;
     use crate::body::{
         DecodeContentEncodingError, ReadBodyError, decode_content_encoded_body_limited,
         read_all_body_limited,
     };
-    use crate::error::HttpClientError;
+    use crate::error::Error;
     use crate::response::HttpResponse;
 
     fn map_read_body_error(
@@ -72,12 +70,12 @@ mod stream {
         method: &http::Method,
         uri: &str,
         max_bytes: usize,
-    ) -> HttpClientError {
+    ) -> Error {
         match error {
-            ReadBodyError::Read(source) => HttpClientError::ReadBody {
+            ReadBodyError::Read(source) => Error::ReadBody {
                 source: Box::new(source),
             },
-            ReadBodyError::TooLarge { actual_bytes } => HttpClientError::ResponseBodyTooLarge {
+            ReadBodyError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
                 limit_bytes: max_bytes,
                 actual_bytes,
                 method: method.clone(),
@@ -91,24 +89,22 @@ mod stream {
         method: &http::Method,
         uri: &str,
         max_bytes: usize,
-    ) -> HttpClientError {
+    ) -> Error {
         match error {
             DecodeContentEncodingError::Decode { encoding, message } => {
-                HttpClientError::DecodeContentEncoding {
+                Error::DecodeContentEncoding {
                     encoding,
                     method: method.clone(),
                     uri: uri.to_owned(),
                     message,
                 }
             }
-            DecodeContentEncodingError::TooLarge { actual_bytes } => {
-                HttpClientError::ResponseBodyTooLarge {
-                    limit_bytes: max_bytes,
-                    actual_bytes,
-                    method: method.clone(),
-                    uri: uri.to_owned(),
-                }
-            }
+            DecodeContentEncodingError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
+                limit_bytes: max_bytes,
+                actual_bytes,
+                method: method.clone(),
+                uri: uri.to_owned(),
+            },
         }
     }
 
@@ -158,39 +154,36 @@ mod stream {
             self.body
         }
 
-        pub async fn into_bytes_limited(self, max_bytes: usize) -> ReqxResult<Bytes> {
+        pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
             let max_bytes = max_bytes.max(1);
             read_all_body_limited(self.body, max_bytes)
                 .await
                 .map_err(|error| map_read_body_error(error, &self.method, &self.uri, max_bytes))
         }
 
-        pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> ReqxResult<u64>
+        pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
         where
             W: AsyncWrite + Unpin + Send + ?Sized,
         {
             let mut copied = 0_u64;
 
             while let Some(frame) = self.body.frame().await {
-                let frame = frame.map_err(|source| HttpClientError::ReadBody {
+                let frame = frame.map_err(|source| Error::ReadBody {
                     source: Box::new(source),
                 })?;
                 if let Some(data) = frame.data_ref() {
                     writer
                         .write_all(data)
                         .await
-                        .map_err(|source| HttpClientError::ReadBody {
+                        .map_err(|source| Error::ReadBody {
                             source: Box::new(source),
                         })?;
                     copied = copied.saturating_add(data.len() as u64);
                 }
             }
-            writer
-                .flush()
-                .await
-                .map_err(|source| HttpClientError::ReadBody {
-                    source: Box::new(source),
-                })?;
+            writer.flush().await.map_err(|source| Error::ReadBody {
+                source: Box::new(source),
+            })?;
             Ok(copied)
         }
 
@@ -198,7 +191,7 @@ mod stream {
             mut self,
             writer: &mut W,
             max_bytes: usize,
-        ) -> ReqxResult<u64>
+        ) -> crate::Result<u64>
         where
             W: AsyncWrite + Unpin + Send + ?Sized,
         {
@@ -206,13 +199,13 @@ mod stream {
             let mut copied = 0_u64;
 
             while let Some(frame) = self.body.frame().await {
-                let frame = frame.map_err(|source| HttpClientError::ReadBody {
+                let frame = frame.map_err(|source| Error::ReadBody {
                     source: Box::new(source),
                 })?;
                 if let Some(data) = frame.data_ref() {
                     copied = copied.saturating_add(data.len() as u64);
                     if copied > max_bytes as u64 {
-                        return Err(HttpClientError::ResponseBodyTooLarge {
+                        return Err(Error::ResponseBodyTooLarge {
                             limit_bytes: max_bytes,
                             actual_bytes: copied as usize,
                             method: self.method.clone(),
@@ -222,21 +215,18 @@ mod stream {
                     writer
                         .write_all(data)
                         .await
-                        .map_err(|source| HttpClientError::ReadBody {
+                        .map_err(|source| Error::ReadBody {
                             source: Box::new(source),
                         })?;
                 }
             }
-            writer
-                .flush()
-                .await
-                .map_err(|source| HttpClientError::ReadBody {
-                    source: Box::new(source),
-                })?;
+            writer.flush().await.map_err(|source| Error::ReadBody {
+                source: Box::new(source),
+            })?;
             Ok(copied)
         }
 
-        pub async fn into_response_limited(self, max_bytes: usize) -> ReqxResult<HttpResponse> {
+        pub async fn into_response_limited(self, max_bytes: usize) -> crate::Result<HttpResponse> {
             let HttpResponseStream {
                 status,
                 mut headers,
@@ -257,12 +247,12 @@ mod stream {
             Ok(HttpResponse::new(status, headers, body))
         }
 
-        pub async fn into_text_limited(self, max_bytes: usize) -> ReqxResult<String> {
+        pub async fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
             let response = self.into_response_limited(max_bytes).await?;
             Ok(response.text_lossy())
         }
 
-        pub async fn into_json_limited<T>(self, max_bytes: usize) -> ReqxResult<T>
+        pub async fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
         where
             T: DeserializeOwned,
         {
@@ -280,8 +270,7 @@ mod blocking_stream {
     use http::{HeaderMap, StatusCode};
     use serde::de::DeserializeOwned;
 
-    use crate::ReqxResult;
-    use crate::error::{HttpClientError, TimeoutPhase};
+    use crate::error::{Error, TimeoutPhase};
     use crate::response::HttpResponse;
 
     fn map_read_error(
@@ -289,14 +278,14 @@ mod blocking_stream {
         method: &http::Method,
         uri: &str,
         timeout_ms: u128,
-    ) -> HttpClientError {
+    ) -> Error {
         if let Some(ureq_error) = source
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<ureq::Error>())
         {
             if let ureq::Error::Timeout(timeout) = ureq_error {
                 let _ = timeout;
-                return HttpClientError::Timeout {
+                return Error::Timeout {
                     phase: TimeoutPhase::ResponseBody,
                     timeout_ms,
                     method: method.clone(),
@@ -310,7 +299,7 @@ mod blocking_stream {
                 feature = "blocking-tls-native"
             ))]
             if let ureq::Error::Decompress(encoding, decode_error) = ureq_error {
-                return HttpClientError::DecodeContentEncoding {
+                return Error::DecodeContentEncoding {
                     encoding: encoding.to_string(),
                     method: method.clone(),
                     uri: uri.to_owned(),
@@ -319,7 +308,7 @@ mod blocking_stream {
             }
         }
 
-        HttpClientError::ReadBody {
+        Error::ReadBody {
             source: Box::new(source),
         }
     }
@@ -373,14 +362,14 @@ mod blocking_stream {
             self.body
         }
 
-        pub fn read_chunk(&mut self, buffer: &mut [u8]) -> ReqxResult<usize> {
+        pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
             self.body
                 .as_reader()
                 .read(buffer)
                 .map_err(|source| map_read_error(source, &self.method, &self.uri, self.timeout_ms))
         }
 
-        pub fn copy_to_writer<W>(mut self, writer: &mut W) -> ReqxResult<u64>
+        pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
         where
             W: Write + ?Sized,
         {
@@ -393,12 +382,12 @@ mod blocking_stream {
                 }
                 writer
                     .write_all(&chunk[..read])
-                    .map_err(|source| HttpClientError::ReadBody {
+                    .map_err(|source| Error::ReadBody {
                         source: Box::new(source),
                     })?;
                 copied = copied.saturating_add(read as u64);
             }
-            writer.flush().map_err(|source| HttpClientError::ReadBody {
+            writer.flush().map_err(|source| Error::ReadBody {
                 source: Box::new(source),
             })?;
             Ok(copied)
@@ -408,7 +397,7 @@ mod blocking_stream {
             mut self,
             writer: &mut W,
             max_bytes: usize,
-        ) -> ReqxResult<u64>
+        ) -> crate::Result<u64>
         where
             W: Write + ?Sized,
         {
@@ -422,7 +411,7 @@ mod blocking_stream {
                 }
                 copied = copied.saturating_add(read as u64);
                 if copied > max_bytes as u64 {
-                    return Err(HttpClientError::ResponseBodyTooLarge {
+                    return Err(Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: copied as usize,
                         method: self.method.clone(),
@@ -431,17 +420,17 @@ mod blocking_stream {
                 }
                 writer
                     .write_all(&chunk[..read])
-                    .map_err(|source| HttpClientError::ReadBody {
+                    .map_err(|source| Error::ReadBody {
                         source: Box::new(source),
                     })?;
             }
-            writer.flush().map_err(|source| HttpClientError::ReadBody {
+            writer.flush().map_err(|source| Error::ReadBody {
                 source: Box::new(source),
             })?;
             Ok(copied)
         }
 
-        pub fn into_bytes_limited(mut self, max_bytes: usize) -> ReqxResult<Bytes> {
+        pub fn into_bytes_limited(mut self, max_bytes: usize) -> crate::Result<Bytes> {
             let max_bytes = max_bytes.max(1);
             let mut chunk = [0_u8; 8192];
             let mut collected = Vec::new();
@@ -454,7 +443,7 @@ mod blocking_stream {
                 }
                 total_len = total_len.saturating_add(read);
                 if total_len > max_bytes {
-                    return Err(HttpClientError::ResponseBodyTooLarge {
+                    return Err(Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
                         method: self.method.clone(),
@@ -467,7 +456,7 @@ mod blocking_stream {
             Ok(Bytes::from(collected))
         }
 
-        pub fn into_response_limited(self, max_bytes: usize) -> ReqxResult<HttpResponse> {
+        pub fn into_response_limited(self, max_bytes: usize) -> crate::Result<HttpResponse> {
             let BlockingHttpResponseStream {
                 status,
                 mut headers,
@@ -491,7 +480,7 @@ mod blocking_stream {
                 }
                 total_len = total_len.saturating_add(read);
                 if total_len > max_bytes {
-                    return Err(HttpClientError::ResponseBodyTooLarge {
+                    return Err(Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
                         method: method.clone(),
@@ -508,12 +497,12 @@ mod blocking_stream {
             Ok(HttpResponse::new(status, headers, body))
         }
 
-        pub fn into_text_limited(self, max_bytes: usize) -> ReqxResult<String> {
+        pub fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
             let response = self.into_response_limited(max_bytes)?;
             Ok(response.text_lossy())
         }
 
-        pub fn into_json_limited<T>(self, max_bytes: usize) -> ReqxResult<T>
+        pub fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
         where
             T: DeserializeOwned,
         {

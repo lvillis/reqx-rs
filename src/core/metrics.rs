@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use http::Method;
 
-use crate::error::{HttpClientError, TimeoutPhase};
+use crate::error::{Error, TimeoutPhase};
 use crate::otel::{OtelRequestSpan, OtelTelemetry};
 #[cfg(feature = "_blocking")]
 use crate::response::BlockingHttpResponseStream;
@@ -94,7 +94,7 @@ impl HttpClientMetrics {
     pub(crate) fn finish_otel_request_span_error(
         &self,
         request_span: OtelRequestSpan,
-        error: &HttpClientError,
+        error: &Error,
     ) {
         self.otel.finish_request_span_error(request_span, error);
     }
@@ -127,7 +127,7 @@ impl HttpClientMetrics {
 
     pub(crate) fn record_request_completed(
         &self,
-        result: &Result<HttpResponse, HttpClientError>,
+        result: &Result<HttpResponse, Error>,
         latency: Duration,
     ) {
         match result {
@@ -151,7 +151,7 @@ impl HttpClientMetrics {
     #[cfg(feature = "_async")]
     pub(crate) fn record_request_completed_stream(
         &self,
-        result: &Result<HttpResponseStream, HttpClientError>,
+        result: &Result<HttpResponseStream, Error>,
         latency: Duration,
     ) {
         match result {
@@ -174,7 +174,7 @@ impl HttpClientMetrics {
     #[cfg(feature = "_blocking")]
     pub(crate) fn record_request_completed_blocking_stream(
         &self,
-        result: &Result<BlockingHttpResponseStream, HttpClientError>,
+        result: &Result<BlockingHttpResponseStream, Error>,
         latency: Duration,
     ) {
         match result {
@@ -194,11 +194,7 @@ impl HttpClientMetrics {
         self.record_latency(latency);
     }
 
-    pub(crate) fn record_request_completed_error(
-        &self,
-        error: &HttpClientError,
-        latency: Duration,
-    ) {
+    pub(crate) fn record_request_completed_error(&self, error: &Error, latency: Duration) {
         if let Some(inner) = &self.inner {
             inner.requests_failed.fetch_add(1, Ordering::Relaxed);
         }
@@ -208,7 +204,7 @@ impl HttpClientMetrics {
         self.add_error_count(error.code().as_str().to_owned());
 
         match error {
-            HttpClientError::Timeout { phase, .. } => {
+            Error::Timeout { phase, .. } => {
                 if let Some(inner) = &self.inner {
                     match phase {
                         TimeoutPhase::Transport => {
@@ -221,55 +217,55 @@ impl HttpClientMetrics {
                 }
                 self.add_error_count(format!("timeout:{phase}"));
             }
-            HttpClientError::DeadlineExceeded { .. } => {
+            Error::DeadlineExceeded { .. } => {
                 if let Some(inner) = &self.inner {
                     inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            HttpClientError::Transport { kind, .. } => {
+            Error::Transport { kind, .. } => {
                 if let Some(inner) = &self.inner {
                     inner.transport_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_error_count(format!("transport:{kind}"));
             }
-            HttpClientError::ReadBody { .. } => {
+            Error::ReadBody { .. } => {
                 if let Some(inner) = &self.inner {
                     inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            HttpClientError::ResponseBodyTooLarge { .. } => {
+            Error::ResponseBodyTooLarge { .. } => {
                 if let Some(inner) = &self.inner {
                     inner
                         .response_body_too_large
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            HttpClientError::HttpStatus { status, .. } => {
+            Error::HttpStatus { status, .. } => {
                 if let Some(inner) = &self.inner {
                     inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_status_count(*status);
                 self.add_error_count(format!("http_status:{status}"));
             }
-            HttpClientError::InvalidUri { .. }
-            | HttpClientError::Serialize { .. }
-            | HttpClientError::SerializeQuery { .. }
-            | HttpClientError::SerializeForm { .. }
-            | HttpClientError::RequestBuild { .. }
-            | HttpClientError::Deserialize { .. }
-            | HttpClientError::InvalidHeaderName { .. }
-            | HttpClientError::InvalidHeaderValue { .. }
-            | HttpClientError::DecodeContentEncoding { .. }
-            | HttpClientError::ConcurrencyLimitClosed
-            | HttpClientError::TlsBackendUnavailable { .. }
-            | HttpClientError::TlsBackendInit { .. }
-            | HttpClientError::TlsConfig { .. }
-            | HttpClientError::RetryBudgetExhausted { .. }
-            | HttpClientError::CircuitOpen { .. }
-            | HttpClientError::MissingRedirectLocation { .. }
-            | HttpClientError::InvalidRedirectLocation { .. }
-            | HttpClientError::RedirectLimitExceeded { .. }
-            | HttpClientError::RedirectBodyNotReplayable { .. } => {}
+            Error::InvalidUri { .. }
+            | Error::SerializeJson { .. }
+            | Error::SerializeQuery { .. }
+            | Error::SerializeForm { .. }
+            | Error::RequestBuild { .. }
+            | Error::DeserializeJson { .. }
+            | Error::InvalidHeaderName { .. }
+            | Error::InvalidHeaderValue { .. }
+            | Error::DecodeContentEncoding { .. }
+            | Error::ConcurrencyLimitClosed
+            | Error::TlsBackendUnavailable { .. }
+            | Error::TlsBackendInit { .. }
+            | Error::TlsConfig { .. }
+            | Error::RetryBudgetExhausted { .. }
+            | Error::CircuitOpen { .. }
+            | Error::MissingRedirectLocation { .. }
+            | Error::InvalidRedirectLocation { .. }
+            | Error::RedirectLimitExceeded { .. }
+            | Error::RedirectBodyNotReplayable { .. } => {}
         }
     }
 

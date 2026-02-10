@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::disabled())
         .max_in_flight(1)
-        .try_build()?;
+        .build()?;
 
     let started = Instant::now();
     let mut handles = Vec::new();

@@ -1,4 +1,4 @@
-use crate::error::HttpClientError;
+use crate::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsBackend {
@@ -60,8 +60,8 @@ impl TlsOptions {
     }
 }
 
-pub(crate) fn tls_config_error(backend: TlsBackend, message: impl Into<String>) -> HttpClientError {
-    HttpClientError::TlsConfig {
+pub(crate) fn tls_config_error(backend: TlsBackend, message: impl Into<String>) -> Error {
+    Error::TlsConfig {
         backend: backend.as_str(),
         message: message.into(),
     }

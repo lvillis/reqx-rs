@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
 use reqx::prelude::{
-    CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy,
-    RequestContext, RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase,
-    TlsRootStore,
+    CircuitBreakerPolicy, Error, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
+    RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase, TlsRootStore,
 };
 use serde_json::Value;
 
@@ -309,7 +308,8 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
 
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
-        .build();
+        .build()
+        .expect("client should build");
 
     let body: Value = client
         .get("/v1/ping")
@@ -323,11 +323,12 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[0].path, "/v1/ping");
     assert_eq!(requests[0].body, Vec::<u8>::new());
-    assert!(
+    assert_eq!(
         requests[0]
             .headers
             .get("accept-encoding")
-            .is_some_and(|value| value.contains("gzip"))
+            .map(String::as_str),
+        Some("gzip, br")
     );
 }
 
@@ -355,7 +356,8 @@ fn blocking_retries_idempotent_post_then_succeeds() {
     let client = HttpClient::builder(server.base_url.clone())
         .retry_policy(retry_policy)
         .request_timeout(Duration::from_secs(1))
-        .build();
+        .build()
+        .expect("client should build");
 
     let response: Value = client
         .post("/v1/items")
@@ -385,7 +387,8 @@ fn blocking_global_rate_limit_applies_between_requests() {
                 .requests_per_second(20.0)
                 .burst(1),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let started = Instant::now();
     let first = client
@@ -420,14 +423,15 @@ fn blocking_retry_after_429_backpressures_following_request() {
                 .requests_per_second(500.0)
                 .burst(50),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let first = client
         .get("/v1/throttled")
         .send()
         .expect_err("first request should return 429");
     match first {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -470,14 +474,15 @@ fn blocking_retry_after_429_auto_scope_throttles_same_host_only() {
                 .requests_per_second(500.0)
                 .burst(50),
         )
-        .build();
+        .build()
+        .expect("client should build");
 
     let first = client
         .get("/v1/throttled")
         .send()
         .expect_err("first request should return 429");
     match first {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -532,14 +537,15 @@ fn blocking_retry_after_429_global_scope_backpressures_other_hosts() {
                 .burst(50),
         )
         .server_throttle_scope(ServerThrottleScope::Global)
-        .build();
+        .build()
+        .expect("client should build");
 
     let first = client
         .get("/v1/throttled")
         .send()
         .expect_err("first request should return 429");
     match first {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -585,7 +591,8 @@ fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
                 .min_retries_per_window(1),
         )
         .request_timeout(Duration::from_secs(1))
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/v1/budget")
@@ -593,7 +600,7 @@ fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
         .expect_err("retry budget should stop retries after one retry");
 
     match error {
-        HttpClientError::RetryBudgetExhausted { .. } => {}
+        Error::RetryBudgetExhausted { .. } => {}
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(server.served_count(), 2);
@@ -617,14 +624,15 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
                 .half_open_success_threshold(1),
         )
         .request_timeout(Duration::from_secs(1))
-        .build();
+        .build()
+        .expect("client should build");
 
     let first = client
         .get("/v1/open")
         .send()
         .expect_err("first request should return 503");
     match first {
-        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 503),
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected first error: {other}"),
     }
 
@@ -633,7 +641,7 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
         .send()
         .expect_err("second request should be rejected by circuit");
     match second {
-        HttpClientError::CircuitOpen { .. } => {}
+        Error::CircuitOpen { .. } => {}
         other => panic!("unexpected second error: {other}"),
     }
 
@@ -644,14 +652,14 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
 fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("specific root store without roots should fail"),
         Err(error) => error,
     };
 
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -659,16 +667,32 @@ fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
 }
 
 #[test]
-fn blocking_try_build_rejects_invalid_base_url_early() {
-    let result = HttpClient::builder("ftp://api.example.com").try_build();
+fn blocking_build_rejects_invalid_base_url_early() {
+    let result = HttpClient::builder("ftp://api.example.com").build();
     let error = match result {
         Ok(_) => panic!("non-http base url should fail at build time"),
         Err(error) => error,
     };
 
     match error {
-        HttpClientError::InvalidUri { uri } => {
+        Error::InvalidUri { uri } => {
             assert_eq!(uri, "ftp://api.example.com");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_base_url_with_query() {
+    let result = HttpClient::builder("https://api.example.com/v1?token=abc").build();
+    let error = match result {
+        Ok(_) => panic!("base url with query should fail at build time"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://api.example.com/v1?token=abc");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -679,14 +703,14 @@ fn blocking_tls_root_store_system_rejects_custom_roots() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::System)
         .tls_root_ca_der([1_u8, 2, 3, 4])
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("system root store should reject custom roots"),
         Err(error) => error,
     };
 
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -697,14 +721,14 @@ fn blocking_tls_root_store_system_rejects_custom_roots() {
 fn blocking_custom_root_ca_requires_specific_root_store() {
     let result = HttpClient::builder("https://api.example.com")
         .tls_root_ca_der([1_u8, 2, 3, 4])
-        .try_build();
+        .build();
     let error = match result {
         Ok(_) => panic!("custom root ca should require specific root store"),
         Err(error) => error,
     };
 
     match error {
-        HttpClientError::TlsConfig { message, .. } => {
+        Error::TlsConfig { message, .. } => {
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -722,7 +746,8 @@ fn blocking_response_body_limit_returns_specific_error() {
     let client = HttpClient::builder(server.base_url.clone())
         .max_response_body_bytes(4)
         .request_timeout(Duration::from_secs(1))
-        .build();
+        .build()
+        .expect("client should build");
 
     let error = client
         .get("/v1/large")
@@ -730,7 +755,7 @@ fn blocking_response_body_limit_returns_specific_error() {
         .expect_err("response body should exceed max size");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             ..
@@ -754,7 +779,8 @@ fn blocking_send_stream_downloads_body_and_status() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/v1/stream")
@@ -781,7 +807,8 @@ fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/v1/stream-large")
@@ -792,7 +819,7 @@ fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
         .expect_err("stream body should exceed max size");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             actual_bytes,
             method,
@@ -819,7 +846,8 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(80))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/v1/slow-stream")
@@ -830,7 +858,7 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
         .expect_err("body read should time out");
 
     match error {
-        HttpClientError::Timeout {
+        Error::Timeout {
             phase, method, uri, ..
         } => {
             assert_eq!(phase, TimeoutPhase::ResponseBody);
@@ -855,7 +883,8 @@ fn blocking_send_stream_maps_decode_error_consistently() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let streamed = client
         .get("/v1/decode-error")
@@ -866,7 +895,7 @@ fn blocking_send_stream_maps_decode_error_consistently() {
         .expect_err("invalid gzip body should fail decoding");
 
     match error {
-        HttpClientError::DecodeContentEncoding {
+        Error::DecodeContentEncoding {
             encoding,
             method,
             uri,
@@ -892,7 +921,8 @@ fn blocking_download_to_writer_writes_stream_without_buffering() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let mut output = Vec::new();
     let written = client
@@ -914,7 +944,8 @@ fn blocking_download_to_writer_limited_maps_limit_error() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
-        .build();
+        .build()
+        .expect("client should build");
 
     let mut output = Vec::new();
     let error = client
@@ -923,7 +954,7 @@ fn blocking_download_to_writer_limited_maps_limit_error() {
         .expect_err("download_to_writer_limited should enforce max bytes");
 
     match error {
-        HttpClientError::ResponseBodyTooLarge {
+        Error::ResponseBodyTooLarge {
             limit_bytes,
             method,
             uri,
@@ -952,7 +983,8 @@ fn blocking_redirect_policy_follows_relative_location() {
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .redirect_policy(RedirectPolicy::limited(3))
-        .build();
+        .build()
+        .expect("client should build");
 
     let body: Value = client
         .get("/v1/old")
@@ -990,7 +1022,7 @@ impl HttpInterceptor for BlockingHeaderInterceptor {
         self.response_hits.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn on_error(&self, _context: &RequestContext, _error: &HttpClientError) {
+    fn on_error(&self, _context: &RequestContext, _error: &Error) {
         self.error_hits.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -1015,7 +1047,8 @@ fn blocking_interceptor_can_mutate_headers_and_observe_lifecycle() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .interceptor_arc(interceptor)
-        .build();
+        .build()
+        .expect("client should build");
 
     let body: Value = client
         .get("/v1/interceptor")

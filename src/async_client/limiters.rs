@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::error::HttpClientError;
+use crate::error::Error;
 use crate::util::lock_unpoisoned;
 
 const PER_HOST_LIMITER_ENTRY_TTL: Duration = Duration::from_secs(300);
@@ -41,17 +41,14 @@ impl RequestLimiters {
         })
     }
 
-    pub(crate) async fn acquire(
-        &self,
-        host: Option<&str>,
-    ) -> Result<RequestPermits, HttpClientError> {
+    pub(crate) async fn acquire(&self, host: Option<&str>) -> Result<RequestPermits, Error> {
         let global = if let Some(semaphore) = &self.global {
             Some(
                 semaphore
                     .clone()
                     .acquire_owned()
                     .await
-                    .map_err(|_| HttpClientError::ConcurrencyLimitClosed)?,
+                    .map_err(|_| Error::ConcurrencyLimitClosed)?,
             )
         } else {
             None
@@ -75,7 +72,7 @@ impl RequestLimiters {
                     semaphore
                         .acquire_owned()
                         .await
-                        .map_err(|_| HttpClientError::ConcurrencyLimitClosed)?,
+                        .map_err(|_| Error::ConcurrencyLimitClosed)?,
                 )
             }
             _ => None,
