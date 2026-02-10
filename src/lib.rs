@@ -73,26 +73,31 @@ compile_error!(
 
 pub(crate) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
+#[cfg(feature = "_async")]
+mod async_client;
 #[cfg(feature = "_blocking")]
 mod blocking_client;
-#[cfg(feature = "_async")]
-mod body;
-#[cfg(feature = "_async")]
-mod client;
-mod error;
-#[cfg(feature = "_async")]
-mod limiters;
-mod metrics;
-mod policy;
-mod proxy;
+mod core;
+mod http;
 mod rate_limit;
-#[cfg(feature = "_async")]
-mod request;
 mod resilience;
-mod response;
-mod retry;
 mod tls;
-mod util;
+
+#[cfg(feature = "_async")]
+pub(crate) use crate::async_client::body;
+#[cfg(feature = "_async")]
+pub(crate) use crate::async_client::client;
+#[cfg(feature = "_async")]
+pub(crate) use crate::async_client::limiters;
+#[cfg(feature = "_async")]
+pub(crate) use crate::async_client::request;
+pub(crate) use crate::core::error;
+pub(crate) use crate::core::metrics;
+pub(crate) use crate::core::policy;
+pub(crate) use crate::core::proxy;
+pub(crate) use crate::core::retry;
+pub(crate) use crate::core::util;
+pub(crate) use crate::http::response;
 
 #[cfg(feature = "_blocking")]
 pub use crate::blocking_client::{

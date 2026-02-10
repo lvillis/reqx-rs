@@ -1,0 +1,347 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use http::header::{HeaderName, HeaderValue};
+use http::{HeaderMap, Uri};
+
+use crate::ReqxResult;
+use crate::error::HttpClientError;
+use crate::metrics::HttpClientMetrics;
+use crate::policy::{HttpInterceptor, RedirectPolicy};
+use crate::proxy::{NoProxyRule, ProxyConfig};
+use crate::rate_limit::{RateLimitPolicy, RateLimiter};
+use crate::resilience::{
+    AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
+};
+use crate::retry::{
+    PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
+};
+use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate};
+use crate::util::{parse_header_name, parse_header_value};
+
+use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
+use super::{
+    AdaptiveConcurrencyController, DEFAULT_CLIENT_NAME, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_MAX_RESPONSE_BODY_BYTES, DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_MAX_IDLE_CONNECTIONS,
+    DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT, HttpClient, HttpClientBuilder,
+};
+
+impl HttpClientBuilder {
+    pub(crate) fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            default_headers: HeaderMap::new(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            total_timeout: None,
+            max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
+            pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
+            pool_max_idle_connections: DEFAULT_POOL_MAX_IDLE_CONNECTIONS,
+            http_proxy: None,
+            proxy_authorization: None,
+            no_proxy_rules: Vec::new(),
+            retry_policy: RetryPolicy::standard(),
+            retry_eligibility: Arc::new(StrictRetryEligibility),
+            retry_budget_policy: None,
+            circuit_breaker_policy: None,
+            adaptive_concurrency_policy: None,
+            global_rate_limit_policy: None,
+            per_host_rate_limit_policy: None,
+            redirect_policy: RedirectPolicy::none(),
+            tls_backend: default_tls_backend(),
+            tls_options: TlsOptions::default(),
+            client_name: DEFAULT_CLIENT_NAME.to_owned(),
+            interceptors: Vec::new(),
+        }
+    }
+
+    pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
+        self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
+        self.max_response_body_bytes = max_response_body_bytes.max(1);
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn pool_idle_timeout(mut self, pool_idle_timeout: Duration) -> Self {
+        self.pool_idle_timeout = pool_idle_timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn pool_max_idle_per_host(mut self, pool_max_idle_per_host: usize) -> Self {
+        self.pool_max_idle_per_host = pool_max_idle_per_host.max(1);
+        self
+    }
+
+    pub fn pool_max_idle_connections(mut self, pool_max_idle_connections: usize) -> Self {
+        self.pool_max_idle_connections = pool_max_idle_connections.max(1);
+        self
+    }
+
+    pub fn http_proxy(mut self, proxy_uri: Uri) -> Self {
+        self.http_proxy = Some(proxy_uri);
+        self
+    }
+
+    pub fn proxy_authorization(mut self, mut proxy_authorization: HeaderValue) -> Self {
+        proxy_authorization.set_sensitive(true);
+        self.proxy_authorization = Some(proxy_authorization);
+        self
+    }
+
+    pub fn try_proxy_authorization(self, proxy_authorization: &str) -> ReqxResult<Self> {
+        let proxy_authorization = parse_header_value("proxy-authorization", proxy_authorization)?;
+        Ok(self.proxy_authorization(proxy_authorization))
+    }
+
+    pub fn no_proxy<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.no_proxy_rules = rules
+            .into_iter()
+            .filter_map(|rule| NoProxyRule::parse(rule.as_ref()))
+            .collect();
+        self
+    }
+
+    pub fn add_no_proxy(mut self, rule: impl AsRef<str>) -> Self {
+        if let Some(rule) = NoProxyRule::parse(rule.as_ref()) {
+            self.no_proxy_rules.push(rule);
+        }
+        self
+    }
+
+    pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.default_headers.insert(name, value);
+        self
+    }
+
+    pub fn try_default_header(self, name: &str, value: &str) -> ReqxResult<Self> {
+        let name = parse_header_name(name)?;
+        let value = parse_header_value(name.as_str(), value)?;
+        Ok(self.default_header(name, value))
+    }
+
+    pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    pub fn retry_eligibility(mut self, retry_eligibility: Arc<dyn RetryEligibility>) -> Self {
+        self.retry_eligibility = retry_eligibility;
+        self
+    }
+
+    pub fn retry_budget_policy(mut self, retry_budget_policy: RetryBudgetPolicy) -> Self {
+        self.retry_budget_policy = Some(retry_budget_policy);
+        self
+    }
+
+    pub fn circuit_breaker_policy(mut self, circuit_breaker_policy: CircuitBreakerPolicy) -> Self {
+        self.circuit_breaker_policy = Some(circuit_breaker_policy);
+        self
+    }
+
+    pub fn adaptive_concurrency(
+        mut self,
+        adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
+    ) -> Self {
+        self.adaptive_concurrency_policy = Some(adaptive_concurrency_policy);
+        self
+    }
+
+    pub fn global_rate_limit_policy(mut self, global_rate_limit_policy: RateLimitPolicy) -> Self {
+        self.global_rate_limit_policy = Some(global_rate_limit_policy);
+        self
+    }
+
+    pub fn per_host_rate_limit_policy(
+        mut self,
+        per_host_rate_limit_policy: RateLimitPolicy,
+    ) -> Self {
+        self.per_host_rate_limit_policy = Some(per_host_rate_limit_policy);
+        self
+    }
+
+    pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
+        self.redirect_policy = redirect_policy;
+        self
+    }
+
+    pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
+        self.tls_backend = tls_backend;
+        self
+    }
+
+    pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
+        self.tls_options
+            .root_certificates
+            .push(TlsRootCertificate::Pem(certificate_pem.into()));
+        self
+    }
+
+    pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
+        self.tls_options
+            .root_certificates
+            .push(TlsRootCertificate::Der(certificate_der.into()));
+        self
+    }
+
+    pub fn clear_tls_root_cas(mut self) -> Self {
+        self.tls_options.root_certificates.clear();
+        self
+    }
+
+    pub fn tls_client_identity_pem(
+        mut self,
+        cert_chain_pem: impl Into<Vec<u8>>,
+        private_key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.tls_options.client_identity = Some(TlsClientIdentity::Pem {
+            cert_chain_pem: cert_chain_pem.into(),
+            private_key_pem: private_key_pem.into(),
+        });
+        self
+    }
+
+    pub fn tls_client_identity_pkcs12(
+        mut self,
+        identity_der: impl Into<Vec<u8>>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.tls_options.client_identity = Some(TlsClientIdentity::Pkcs12 {
+            identity_der: identity_der.into(),
+            password: password.into(),
+        });
+        self
+    }
+
+    pub fn clear_tls_client_identity(mut self) -> Self {
+        self.tls_options.client_identity = None;
+        self
+    }
+
+    pub fn allow_non_idempotent_retries(mut self, allow: bool) -> Self {
+        self.retry_eligibility = if allow {
+            Arc::new(PermissiveRetryEligibility)
+        } else {
+            Arc::new(StrictRetryEligibility)
+        };
+        self
+    }
+
+    pub fn client_name(mut self, client_name: impl Into<String>) -> Self {
+        self.client_name = client_name.into();
+        self
+    }
+
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    pub fn interceptor<I>(self, interceptor: I) -> Self
+    where
+        I: HttpInterceptor + 'static,
+    {
+        self.interceptor_arc(Arc::new(interceptor))
+    }
+
+    pub fn try_build(self) -> ReqxResult<HttpClient> {
+        if !backend_is_available(self.tls_backend) {
+            return Err(HttpClientError::TlsBackendUnavailable {
+                backend: self.tls_backend.as_str(),
+            });
+        }
+
+        let proxy_config = self.http_proxy.map(|uri| ProxyConfig {
+            uri,
+            authorization: self.proxy_authorization,
+            no_proxy_rules: self.no_proxy_rules,
+        });
+
+        let direct = make_agent(
+            self.tls_backend,
+            &self.tls_options,
+            &self.client_name,
+            self.pool_idle_timeout,
+            self.pool_max_idle_per_host,
+            self.pool_max_idle_connections,
+            None,
+        )?;
+
+        let proxied = if let Some(proxy_config) = &proxy_config {
+            let proxy = ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| {
+                HttpClientError::InvalidUri {
+                    uri: proxy_config.uri.to_string(),
+                }
+            })?;
+
+            Some(make_agent(
+                self.tls_backend,
+                &self.tls_options,
+                &self.client_name,
+                self.pool_idle_timeout,
+                self.pool_max_idle_per_host,
+                self.pool_max_idle_connections,
+                Some(proxy),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(HttpClient {
+            base_url: self.base_url,
+            default_headers: self.default_headers,
+            request_timeout: self.request_timeout,
+            total_timeout: self.total_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            retry_policy: self.retry_policy,
+            retry_eligibility: self.retry_eligibility,
+            retry_budget: self
+                .retry_budget_policy
+                .map(|policy| Arc::new(RetryBudget::new(policy))),
+            circuit_breaker: self
+                .circuit_breaker_policy
+                .map(|policy| Arc::new(CircuitBreaker::new(policy))),
+            adaptive_concurrency: self
+                .adaptive_concurrency_policy
+                .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),
+            rate_limiter: RateLimiter::new(
+                self.global_rate_limit_policy,
+                self.per_host_rate_limit_policy,
+            )
+            .map(Arc::new),
+            redirect_policy: self.redirect_policy,
+            tls_backend: self.tls_backend,
+            transport: TransportAgents {
+                direct,
+                proxy: proxied,
+            },
+            proxy_config,
+            connect_timeout: self.connect_timeout,
+            metrics: HttpClientMetrics::default(),
+            interceptors: self.interceptors,
+        })
+    }
+
+    pub fn build(self) -> HttpClient {
+        self.try_build()
+            .unwrap_or_else(|error| panic!("failed to build reqx blocking http client: {error}"))
+    }
+}
