@@ -5,7 +5,7 @@ use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://httpbin.org")
+    let client = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-concurrency")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::disabled())

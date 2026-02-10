@@ -7,7 +7,7 @@ use reqx::prelude::{HttpClient, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://httpbin.org")
+    let client = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-stream")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::standard().max_attempts(2))
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     let upload_response = client
-        .post("/anything")
+        .post("/post")
         .idempotency_key("stream-upload-001")?
         .body_stream(upload_stream)
         .send_stream()

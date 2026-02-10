@@ -4,7 +4,7 @@ use reqx::prelude::{HttpClient, TlsBackend};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = HttpClient::builder("https://httpbin.org")
+    let mut builder = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-tls")
         .request_timeout(Duration::from_secs(3));
 

@@ -7,7 +7,7 @@ use reqx::prelude::{HttpClient, RetryPolicy};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_uri: Uri = "http://proxy.example.com:8080".parse()?;
 
-    let client = HttpClient::builder("https://httpbin.org")
+    let client = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-proxy")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())

@@ -18,7 +18,7 @@ struct LoginForm<'a> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://httpbin.org")
+    let client = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-request-helpers")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())

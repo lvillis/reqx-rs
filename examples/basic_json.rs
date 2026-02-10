@@ -16,7 +16,7 @@ struct EchoResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://httpbin.org")
+    let client = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-basic")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(10))
@@ -47,12 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let echoed: EchoResponse = client
-        .post("/anything")
+        .post("/post")
         .idempotency_key("create-item-001")?
         .json(&payload)?
         .send_json()
         .await?;
 
-    println!("POST /anything => echoed_json={:?}", echoed.json);
+    println!("POST /post => echoed_json={:?}", echoed.json);
     Ok(())
 }

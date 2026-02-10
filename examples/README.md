@@ -8,6 +8,8 @@ Run any example:
 cargo run --example <name>
 ```
 
+Note: examples that perform real HTTP calls use `https://postman-echo.com`.
+
 ## Recommended Learning Path
 
 1. `basic_json` - Base client, retries, JSON send/receive.
@@ -28,23 +30,23 @@ cargo run --example <name>
 
 ## Example Index
 
-| Example                 | Focus                                               | Run                                      |
-|-------------------------|-----------------------------------------------------|------------------------------------------|
-| `basic_json.rs`         | Standard SDK request flow with JSON                 | `cargo run --example basic_json`         |
-| `request_helpers.rs`    | `.query()`, `.form()`, default/request headers      | `cargo run --example request_helpers`    |
-| `request_overrides.rs`  | Override timeout/retry at request level             | `cargo run --example request_overrides`  |
-| `error_handling.rs`     | Match error variants and print error codes          | `cargo run --example error_handling`     |
-| `metrics_snapshot.rs`   | Observe requests/retries/status/error counters      | `cargo run --example metrics_snapshot`   |
-| `streaming.rs`          | `body_stream()` upload and `send_stream()` download | `cargo run --example streaming`          |
-| `concurrency_limits.rs` | Demonstrate serialized execution with limiter       | `cargo run --example concurrency_limits` |
-| `resilience_controls.rs` | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls` |
-| `rate_limit_429.rs`    | Configure global/per-host rate limits and 429 backpressure | `cargo run --example rate_limit_429` |
-| `retry_classifier.rs`   | Plug in custom retry classifier logic               | `cargo run --example retry_classifier`   |
-| `proxy_and_no_proxy.rs` | Configure proxy auth and `no_proxy` rules           | `cargo run --example proxy_and_no_proxy` |
-| `tls_backends.rs`       | Choose TLS backend based on enabled features        | `cargo run --example tls_backends`       |
-| `custom_ca_mtls.rs`     | Configure custom CA trust and mTLS client identity  | `cargo run --example custom_ca_mtls`     |
-| `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy      | `cargo run --example interceptor_redirect` |
-| `blocking_basic.rs`     | Blocking request flow with sync transport           | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
+| Example                   | Focus                                                             | Run                                                                                    |
+|---------------------------|-------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| `basic_json.rs`           | Standard SDK request flow with JSON                               | `cargo run --example basic_json`                                                       |
+| `request_helpers.rs`      | `.query()`, `.form()`, default/request headers                    | `cargo run --example request_helpers`                                                  |
+| `request_overrides.rs`    | Override timeout/retry at request level                           | `cargo run --example request_overrides`                                                |
+| `error_handling.rs`       | Match error variants and print error codes                        | `cargo run --example error_handling`                                                   |
+| `metrics_snapshot.rs`     | Observe requests/retries/status/error counters                    | `cargo run --example metrics_snapshot`                                                 |
+| `streaming.rs`            | `body_stream()` upload and `send_stream()` download               | `cargo run --example streaming`                                                        |
+| `concurrency_limits.rs`   | Demonstrate serialized execution with limiter                     | `cargo run --example concurrency_limits`                                               |
+| `resilience_controls.rs`  | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls`                                              |
+| `rate_limit_429.rs`       | Configure global/per-host rate limits and 429 backpressure        | `cargo run --example rate_limit_429`                                                   |
+| `retry_classifier.rs`     | Plug in custom retry classifier logic                             | `cargo run --example retry_classifier`                                                 |
+| `proxy_and_no_proxy.rs`   | Configure proxy auth and `no_proxy` rules                         | `cargo run --example proxy_and_no_proxy`                                               |
+| `tls_backends.rs`         | Choose TLS backend based on enabled features                      | `cargo run --example tls_backends`                                                     |
+| `custom_ca_mtls.rs`       | Configure custom CA trust and mTLS client identity                | `cargo run --example custom_ca_mtls`                                                   |
+| `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy                     | `cargo run --example interceptor_redirect`                                             |
+| `blocking_basic.rs`       | Blocking request flow with sync transport                         | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
 
 ## Feature-Specific TLS Runs
 
