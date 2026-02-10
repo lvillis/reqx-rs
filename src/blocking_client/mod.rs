@@ -8,7 +8,7 @@ use http::{HeaderMap, Uri};
 use crate::metrics::HttpClientMetrics;
 use crate::policy::{HttpInterceptor, RedirectPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
-use crate::rate_limit::{RateLimitPolicy, RateLimiter};
+use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
@@ -163,6 +163,7 @@ pub struct HttpClientBuilder {
     adaptive_concurrency_policy: Option<AdaptiveConcurrencyPolicy>,
     global_rate_limit_policy: Option<RateLimitPolicy>,
     per_host_rate_limit_policy: Option<RateLimitPolicy>,
+    server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
@@ -184,6 +185,7 @@ pub struct HttpClient {
     circuit_breaker: Option<Arc<CircuitBreaker>>,
     adaptive_concurrency: Option<Arc<AdaptiveConcurrencyController>>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     transport: transport::TransportAgents,

@@ -15,7 +15,7 @@ use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{
     HttpClient, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
-    RetryPolicy, TimeoutPhase,
+    RetryPolicy, ServerThrottleScope, TimeoutPhase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -686,6 +686,126 @@ async fn retry_after_429_backpressures_following_request() {
         "retry-after should backpressure the next request"
     );
     assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_after_429_auto_scope_throttles_same_host_only() {
+    let server_a = MockServer::start(vec![
+        MockResponse::new(429, vec![("Retry-After", "1")], "busy", Duration::ZERO),
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok-a", Duration::ZERO),
+    ]);
+    let server_b = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok-b",
+        Duration::ZERO,
+    )]);
+
+    let host_b_url = format!("{}/other-host", server_b.base_url);
+
+    let client = HttpClient::builder(server_a.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .build();
+
+    let first_error = client
+        .get("/throttled")
+        .send()
+        .await
+        .expect_err("first request should return 429");
+    match first_error {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let cross_host_started = Instant::now();
+    let cross_host = client
+        .get(host_b_url.clone())
+        .send()
+        .await
+        .expect("other host request should not be backpressured in auto scope");
+    assert_eq!(cross_host.status().as_u16(), 200);
+    assert!(
+        cross_host_started.elapsed() < Duration::from_millis(250),
+        "cross-host request should not inherit host-a retry-after backpressure"
+    );
+
+    let same_host_started = Instant::now();
+    let same_host = client
+        .get("/recovered-a")
+        .send()
+        .await
+        .expect("same host request should eventually succeed");
+    assert_eq!(same_host.status().as_u16(), 200);
+    assert!(
+        same_host_started.elapsed() >= Duration::from_millis(900),
+        "same host should be backpressured by retry-after"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_after_429_global_scope_backpressures_other_hosts() {
+    let server_a = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1")],
+        "busy",
+        Duration::ZERO,
+    )]);
+    let server_b = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok-b",
+        Duration::ZERO,
+    )]);
+    let host_b_url = format!("{}/other-host", server_b.base_url);
+
+    let client = HttpClient::builder(server_a.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .server_throttle_scope(ServerThrottleScope::Global)
+        .build();
+
+    let first_error = client
+        .get("/throttled")
+        .send()
+        .await
+        .expect_err("first request should return 429");
+    match first_error {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let cross_host_started = Instant::now();
+    let cross_host = client
+        .get(host_b_url)
+        .send()
+        .await
+        .expect("cross-host request should still succeed");
+    assert_eq!(cross_host.status().as_u16(), 200);
+    assert!(
+        cross_host_started.elapsed() >= Duration::from_millis(900),
+        "global scope should backpressure requests for other hosts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

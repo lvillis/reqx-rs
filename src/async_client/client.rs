@@ -43,7 +43,9 @@ use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 ))]
 use crate::proxy::ProxyConnector;
 use crate::proxy::{NoProxyRule, ProxyConfig};
-use crate::rate_limit::{RateLimitPolicy, RateLimiter};
+use crate::rate_limit::{
+    RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
+};
 use crate::request::RequestBuilder;
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
@@ -57,8 +59,9 @@ use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, 
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error, ensure_accept_encoding,
     is_redirect_status, lock_unpoisoned, merge_headers, parse_header_name, parse_header_value,
-    parse_retry_after, phase_timeout, redact_uri_for_logs, redirect_location, redirect_method,
-    resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect, truncate_body,
+    parse_retry_after, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
+    redirect_location, redirect_method, resolve_redirect_uri, resolve_uri, same_origin,
+    sanitize_headers_for_redirect, truncate_body,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -688,6 +691,7 @@ pub struct HttpClientBuilder {
     adaptive_concurrency_policy: Option<AdaptiveConcurrencyPolicy>,
     global_rate_limit_policy: Option<RateLimitPolicy>,
     per_host_rate_limit_policy: Option<RateLimitPolicy>,
+    server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
@@ -721,6 +725,7 @@ impl HttpClientBuilder {
             adaptive_concurrency_policy: None,
             global_rate_limit_policy: None,
             per_host_rate_limit_policy: None,
+            server_throttle_scope: ServerThrottleScope::Auto,
             redirect_policy: RedirectPolicy::none(),
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
@@ -852,6 +857,11 @@ impl HttpClientBuilder {
         per_host_rate_limit_policy: RateLimitPolicy,
     ) -> Self {
         self.per_host_rate_limit_policy = Some(per_host_rate_limit_policy);
+        self
+    }
+
+    pub fn server_throttle_scope(mut self, server_throttle_scope: ServerThrottleScope) -> Self {
+        self.server_throttle_scope = server_throttle_scope;
         self
     }
 
@@ -1002,6 +1012,7 @@ impl HttpClientBuilder {
                 self.per_host_rate_limit_policy,
             )
             .map(Arc::new),
+            server_throttle_scope: self.server_throttle_scope,
             redirect_policy: self.redirect_policy,
             client_name: self.client_name,
             tls_backend: self.tls_backend,
@@ -1031,6 +1042,7 @@ pub struct HttpClient {
     circuit_breaker: Option<Arc<CircuitBreaker>>,
     adaptive_concurrency: Option<Arc<AdaptiveConcurrencyController>>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
     client_name: String,
     tls_backend: TlsBackend,
@@ -1183,7 +1195,12 @@ impl HttpClient {
         };
         let throttle_delay =
             parse_retry_after(headers, SystemTime::now()).unwrap_or(fallback_delay);
-        rate_limiter.observe_server_throttle(host, throttle_delay);
+        rate_limiter.observe_server_throttle(
+            host,
+            throttle_delay,
+            self.server_throttle_scope,
+            server_throttle_scope_from_headers(headers),
+        );
     }
 
     async fn acquire_request_permits(
@@ -1383,9 +1400,10 @@ impl HttpClient {
                 redirect_count,
             );
             debug!("sending stream request");
+            let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self
                 .acquire_rate_limit_slot(
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     total_timeout,
                     request_started_at,
                     &current_method,
@@ -1674,7 +1692,7 @@ impl HttpClient {
                 self.observe_server_throttle(
                     status,
                     &response_headers,
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     retry_policy.backoff_for_retry(attempt),
                 );
                 let retry_decision = RetryDecision {
@@ -1813,9 +1831,10 @@ impl HttpClient {
             );
 
             debug!("sending request");
+            let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self
                 .acquire_rate_limit_slot(
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     total_timeout,
                     request_started_at,
                     &current_method,
@@ -2201,7 +2220,7 @@ impl HttpClient {
                 self.observe_server_throttle(
                     status,
                     &response_headers,
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     retry_policy.backoff_for_retry(attempt),
                 );
                 let retry_decision = RetryDecision {

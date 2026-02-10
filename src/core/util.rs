@@ -293,12 +293,20 @@ pub(crate) fn redirect_location(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn default_port(uri: &Uri) -> Option<u16> {
+pub(crate) fn default_port(uri: &Uri) -> Option<u16> {
     uri.port_u16().or_else(|| match uri.scheme_str() {
         Some("https") => Some(443),
         Some("http") => Some(80),
         _ => None,
     })
+}
+
+pub(crate) fn rate_limit_bucket_key(uri: &Uri) -> Option<String> {
+    let host = uri.host()?.to_ascii_lowercase();
+    let Some(port) = default_port(uri) else {
+        return Some(host);
+    };
+    Some(format!("{host}:{port}"))
 }
 
 pub(crate) fn same_origin(left: &Uri, right: &Uri) -> bool {

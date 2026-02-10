@@ -7,6 +7,49 @@ use crate::util::lock_unpoisoned;
 const PER_HOST_RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(300);
 const PER_HOST_RATE_LIMIT_MAX_ENTRIES: usize = 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ServerThrottleScope {
+    #[default]
+    Auto,
+    Host,
+    Global,
+    Both,
+}
+
+pub(crate) fn server_throttle_scope_from_headers(
+    headers: &http::HeaderMap,
+) -> Option<ServerThrottleScope> {
+    const RATE_LIMIT_SCOPE_HEADERS: [&str; 3] =
+        ["x-ratelimit-scope", "ratelimit-scope", "x-rate-limit-scope"];
+
+    for header_name in RATE_LIMIT_SCOPE_HEADERS {
+        let Some(value) = headers.get(header_name).and_then(|raw| raw.to_str().ok()) else {
+            continue;
+        };
+
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized.contains("both") || normalized.contains("all") {
+            return Some(ServerThrottleScope::Both);
+        }
+        if normalized.contains("global") || normalized.contains("shared") {
+            return Some(ServerThrottleScope::Global);
+        }
+        if normalized.contains("host")
+            || normalized.contains("resource")
+            || normalized.contains("bucket")
+            || normalized.contains("user")
+            || normalized.contains("local")
+        {
+            return Some(ServerThrottleScope::Host);
+        }
+    }
+
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RateLimitPolicy {
     requests_per_second: f64,
@@ -234,20 +277,38 @@ impl RateLimiter {
         Duration::ZERO
     }
 
-    pub(crate) fn observe_server_throttle(&self, host: Option<&str>, delay: Duration) {
+    pub(crate) fn observe_server_throttle(
+        &self,
+        host: Option<&str>,
+        delay: Duration,
+        configured_scope: ServerThrottleScope,
+        header_scope_hint: Option<ServerThrottleScope>,
+    ) {
         if delay.is_zero() {
             return;
         }
 
         let now = Instant::now();
         let host_key = host.map(|item| item.to_ascii_lowercase());
+        let resolved_scope = self.resolve_server_throttle_scope(
+            configured_scope,
+            header_scope_hint,
+            host_key.is_some(),
+        );
 
-        if let Some(global) = &self.global {
+        let mut applied = false;
+
+        if resolved_scope.apply_global()
+            && let Some(global) = &self.global
+        {
             let mut bucket = lock_unpoisoned(global);
             bucket.apply_throttle(now, delay);
+            applied = true;
         }
 
-        if let (Some(policy), Some(host)) = (self.per_host_policy, host_key) {
+        if resolved_scope.apply_host()
+            && let (Some(policy), Some(host)) = (self.per_host_policy, host_key.clone())
+        {
             let mut per_host = lock_unpoisoned(&self.per_host);
             cleanup_stale_per_host_rate_limits(&mut per_host, now);
             let entry = per_host
@@ -258,7 +319,61 @@ impl RateLimiter {
                 });
             entry.last_used_at = now;
             entry.bucket.apply_throttle(now, delay);
+            applied = true;
         }
+
+        if !applied {
+            if let (Some(policy), Some(host)) = (self.per_host_policy, host_key) {
+                let mut per_host = lock_unpoisoned(&self.per_host);
+                cleanup_stale_per_host_rate_limits(&mut per_host, now);
+                let entry = per_host
+                    .entry(host)
+                    .or_insert_with(|| PerHostRateLimitEntry {
+                        bucket: TokenBucket::new(policy, now),
+                        last_used_at: now,
+                    });
+                entry.last_used_at = now;
+                entry.bucket.apply_throttle(now, delay);
+            } else if let Some(global) = &self.global {
+                let mut bucket = lock_unpoisoned(global);
+                bucket.apply_throttle(now, delay);
+            }
+        }
+    }
+
+    fn resolve_server_throttle_scope(
+        &self,
+        configured_scope: ServerThrottleScope,
+        header_scope_hint: Option<ServerThrottleScope>,
+        has_host: bool,
+    ) -> ServerThrottleScope {
+        match configured_scope {
+            ServerThrottleScope::Auto => match header_scope_hint {
+                Some(ServerThrottleScope::Host) => ServerThrottleScope::Host,
+                Some(ServerThrottleScope::Global) => ServerThrottleScope::Global,
+                Some(ServerThrottleScope::Both) => ServerThrottleScope::Both,
+                _ => {
+                    if has_host && self.per_host_policy.is_some() {
+                        ServerThrottleScope::Host
+                    } else if self.global.is_some() {
+                        ServerThrottleScope::Global
+                    } else {
+                        ServerThrottleScope::Host
+                    }
+                }
+            },
+            other => other,
+        }
+    }
+}
+
+impl ServerThrottleScope {
+    const fn apply_host(self) -> bool {
+        matches!(self, Self::Host | Self::Both)
+    }
+
+    const fn apply_global(self) -> bool {
+        matches!(self, Self::Global | Self::Both)
     }
 }
 
@@ -285,7 +400,9 @@ fn cleanup_stale_per_host_rate_limits(
 mod tests {
     use std::thread::sleep;
 
-    use super::{RateLimitPolicy, RateLimiter};
+    use super::{
+        RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
+    };
 
     #[test]
     fn global_rate_limiter_respects_burst_and_refill() {
@@ -327,9 +444,80 @@ mod tests {
         limiter.observe_server_throttle(
             Some("api.example.com"),
             std::time::Duration::from_millis(120),
+            ServerThrottleScope::Auto,
+            None,
         );
         assert!(
             limiter.acquire_delay(Some("api.example.com")) >= std::time::Duration::from_millis(110)
+        );
+    }
+
+    #[test]
+    fn auto_server_throttle_scope_prefers_host_bucket_when_available() {
+        let limiter = RateLimiter::new(
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+        )
+        .expect("limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api-a.example.com"),
+            std::time::Duration::from_millis(120),
+            ServerThrottleScope::Auto,
+            None,
+        );
+
+        let host_a_wait = limiter.acquire_delay(Some("api-a.example.com"));
+        let host_b_wait = limiter.acquire_delay(Some("api-b.example.com"));
+        assert!(host_a_wait >= std::time::Duration::from_millis(110));
+        assert!(host_b_wait <= std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn global_server_throttle_scope_backpressures_all_hosts() {
+        let limiter = RateLimiter::new(
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+        )
+        .expect("limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api-a.example.com"),
+            std::time::Duration::from_millis(120),
+            ServerThrottleScope::Global,
+            None,
+        );
+
+        let host_b_wait = limiter.acquire_delay(Some("api-b.example.com"));
+        assert!(host_b_wait >= std::time::Duration::from_millis(110));
+    }
+
+    #[test]
+    fn scope_header_is_parsed() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("global"),
+        );
+        assert_eq!(
+            server_throttle_scope_from_headers(&headers),
+            Some(ServerThrottleScope::Global)
         );
     }
 }

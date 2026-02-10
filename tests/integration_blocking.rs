@@ -12,7 +12,7 @@ use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
 use reqx::prelude::{
     CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy,
-    RequestContext, RetryBudgetPolicy, RetryPolicy, TimeoutPhase,
+    RequestContext, RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase,
 };
 use serde_json::Value;
 
@@ -441,6 +441,117 @@ fn blocking_retry_after_429_backpressures_following_request() {
         "retry-after should backpressure the next request"
     );
     assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_retry_after_429_auto_scope_throttles_same_host_only() {
+    let server_a = MockServer::start(vec![
+        MockResponse::new(429, vec![("Retry-After", "1")], b"busy".to_vec()),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-a".to_vec()),
+    ]);
+    let server_b = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok-b".to_vec(),
+    )]);
+    let host_b_url = format!("{}/other-host", server_b.base_url);
+
+    let client = HttpClient::builder(server_a.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .build();
+
+    let first = client
+        .get("/v1/throttled")
+        .send()
+        .expect_err("first request should return 429");
+    match first {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let cross_host_started = Instant::now();
+    let cross_host = client
+        .get(host_b_url)
+        .send()
+        .expect("cross-host request should not be backpressured in auto scope");
+    assert_eq!(cross_host.status().as_u16(), 200);
+    assert!(
+        cross_host_started.elapsed() < Duration::from_millis(250),
+        "cross-host request should not inherit host-a retry-after backpressure"
+    );
+
+    let same_host_started = Instant::now();
+    let same_host = client
+        .get("/v1/recovered-a")
+        .send()
+        .expect("same host request should eventually succeed");
+    assert_eq!(same_host.status().as_u16(), 200);
+    assert!(
+        same_host_started.elapsed() >= Duration::from_millis(900),
+        "same host should be backpressured by retry-after"
+    );
+}
+
+#[test]
+fn blocking_retry_after_429_global_scope_backpressures_other_hosts() {
+    let server_a = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1")],
+        b"busy".to_vec(),
+    )]);
+    let server_b = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok-b".to_vec(),
+    )]);
+    let host_b_url = format!("{}/other-host", server_b.base_url);
+
+    let client = HttpClient::builder(server_a.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .server_throttle_scope(ServerThrottleScope::Global)
+        .build();
+
+    let first = client
+        .get("/v1/throttled")
+        .send()
+        .expect_err("first request should return 429");
+    match first {
+        HttpClientError::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected first error: {other}"),
+    }
+
+    let cross_host_started = Instant::now();
+    let cross_host = client
+        .get(host_b_url)
+        .send()
+        .expect("cross-host request should succeed");
+    assert_eq!(cross_host.status().as_u16(), 200);
+    assert!(
+        cross_host_started.elapsed() >= Duration::from_millis(900),
+        "global scope should backpressure requests for other hosts"
+    );
 }
 
 #[test]

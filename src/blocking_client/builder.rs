@@ -10,7 +10,7 @@ use crate::metrics::HttpClientMetrics;
 use crate::otel::OtelTelemetry;
 use crate::policy::{HttpInterceptor, RedirectPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
-use crate::rate_limit::{RateLimitPolicy, RateLimiter};
+use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
@@ -49,6 +49,7 @@ impl HttpClientBuilder {
             adaptive_concurrency_policy: None,
             global_rate_limit_policy: None,
             per_host_rate_limit_policy: None,
+            server_throttle_scope: ServerThrottleScope::Auto,
             redirect_policy: RedirectPolicy::none(),
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
@@ -178,6 +179,11 @@ impl HttpClientBuilder {
         per_host_rate_limit_policy: RateLimitPolicy,
     ) -> Self {
         self.per_host_rate_limit_policy = Some(per_host_rate_limit_policy);
+        self
+    }
+
+    pub fn server_throttle_scope(mut self, server_throttle_scope: ServerThrottleScope) -> Self {
+        self.server_throttle_scope = server_throttle_scope;
         self
     }
 
@@ -345,6 +351,7 @@ impl HttpClientBuilder {
                 self.per_host_rate_limit_policy,
             )
             .map(Arc::new),
+            server_throttle_scope: self.server_throttle_scope,
             redirect_policy: self.redirect_policy,
             tls_backend: self.tls_backend,
             transport: TransportAgents {

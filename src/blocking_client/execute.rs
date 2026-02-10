@@ -8,14 +8,15 @@ use http::{HeaderMap, Method, Uri};
 use crate::error::{HttpClientError, TimeoutPhase};
 use crate::metrics::HttpClientMetricsSnapshot;
 use crate::policy::RequestContext;
+use crate::rate_limit::server_throttle_scope_from_headers;
 use crate::response::{BlockingHttpResponseStream, HttpResponse};
 use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding, is_redirect_status,
-    merge_headers, parse_retry_after, phase_timeout, redact_uri_for_logs, redirect_location,
-    redirect_method, resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect,
-    truncate_body,
+    merge_headers, parse_retry_after, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
+    redirect_location, redirect_method, resolve_redirect_uri, resolve_uri, same_origin,
+    sanitize_headers_for_redirect, truncate_body,
 };
 
 use super::transport::{
@@ -170,7 +171,12 @@ impl HttpClient {
         };
         let throttle_delay =
             parse_retry_after(headers, SystemTime::now()).unwrap_or(fallback_delay);
-        rate_limiter.observe_server_throttle(host, throttle_delay);
+        rate_limiter.observe_server_throttle(
+            host,
+            throttle_delay,
+            self.server_throttle_scope,
+            server_throttle_scope_from_headers(headers),
+        );
     }
 
     fn select_agent(&self, uri: &Uri) -> (&ureq::Agent, bool) {
@@ -425,8 +431,9 @@ impl HttpClient {
                 max_attempts,
                 redirect_count,
             );
+            let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self.acquire_rate_limit_slot(
-                current_uri.host(),
+                rate_limit_host.as_deref(),
                 total_timeout,
                 request_started_at,
                 &current_method,
@@ -762,7 +769,7 @@ impl HttpClient {
                 self.observe_server_throttle(
                     status,
                     &response_headers,
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     retry_policy.backoff_for_retry(attempt),
                 );
                 let retry_decision = RetryDecision {
@@ -898,8 +905,9 @@ impl HttpClient {
                 max_attempts,
                 redirect_count,
             );
+            let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self.acquire_rate_limit_slot(
-                current_uri.host(),
+                rate_limit_host.as_deref(),
                 total_timeout,
                 request_started_at,
                 &current_method,
@@ -1230,7 +1238,7 @@ impl HttpClient {
                 self.observe_server_throttle(
                     status,
                     &response_headers,
-                    current_uri.host(),
+                    rate_limit_host.as_deref(),
                     retry_policy.backoff_for_retry(attempt),
                 );
                 let retry_decision = RetryDecision {

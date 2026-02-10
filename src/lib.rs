@@ -111,7 +111,7 @@ pub use crate::client::{HttpClient, HttpClientBuilder};
 pub use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
 pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
-pub use crate::rate_limit::RateLimitPolicy;
+pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
@@ -148,8 +148,8 @@ pub mod prelude {
         RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RedirectPolicy, RequestContext,
         ReqxResult, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
-        RetryPolicy, StrictRetryEligibility, TimeoutPhase, TlsBackend, TransportErrorKind,
-        UploadedPart,
+        RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
+        TransportErrorKind, UploadedPart,
     };
     #[cfg(feature = "_async")]
     pub use crate::{
