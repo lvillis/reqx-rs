@@ -27,6 +27,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 13. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
 14. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
 15. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
+16. `blocking_streaming` - Blocking stream download with limited read helpers.
 
 ## Example Index
 
@@ -47,6 +48,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 | `custom_ca_mtls.rs`       | Configure custom CA trust and mTLS client identity                | `cargo run --example custom_ca_mtls`                                                   |
 | `interceptor_redirect.rs` | Interceptor lifecycle hooks + redirect policy                     | `cargo run --example interceptor_redirect`                                             |
 | `blocking_basic.rs`       | Blocking request flow with sync transport                         | `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring` |
+| `blocking_streaming.rs`   | Blocking `send_stream()` + consistent stream read errors          | `cargo run --example blocking_streaming --no-default-features -F blocking-tls-rustls-ring` |
 
 ## Feature-Specific TLS Runs
 
@@ -66,4 +68,8 @@ Use blocking sync client (`ureq + rustls`):
 
 ```bash
 cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring
+```
+
+```bash
+cargo run --example blocking_streaming --no-default-features -F blocking-tls-rustls-ring
 ```

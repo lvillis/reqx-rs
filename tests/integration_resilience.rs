@@ -937,3 +937,76 @@ async fn send_stream_downloads_body_without_buffered_send_path() {
         .expect("stream body collect should succeed");
     assert_eq!(collected.to_bytes().to_vec(), payload);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_stream_into_response_limited_returns_buffered_response() {
+    let payload = b"{\"ok\":true}".to_vec();
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            payload,
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/stream-buffer")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    let buffered = streamed
+        .into_response_limited(1024)
+        .await
+        .expect("into_response_limited should succeed");
+
+    assert_eq!(buffered.status().as_u16(), 200);
+    assert_eq!(buffered.text_lossy(), "{\"ok\":true}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_stream_into_response_limited_enforces_limit_with_consistent_error() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            vec![("Content-Type", "application/octet-stream")],
+            b"0123456789".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = HttpClient::builder(format!("http://{}", server.authority()))
+        .request_timeout(Duration::from_millis(400))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/stream-over-limit")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    let error = streamed
+        .into_response_limited(4)
+        .await
+        .expect_err("stream body should exceed max size");
+
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            method,
+            uri,
+        } => {
+            assert_eq!(limit_bytes, 4);
+            assert!(actual_bytes > limit_bytes);
+            assert_eq!(method, http::Method::GET);
+            assert!(uri.contains("/stream-over-limit"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}

@@ -113,6 +113,8 @@ pub use crate::rate_limit::RateLimitPolicy;
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
+#[cfg(feature = "_blocking")]
+pub use crate::response::BlockingHttpResponseStream;
 pub use crate::response::HttpResponse;
 #[cfg(feature = "_async")]
 pub use crate::response::HttpResponseStream;
@@ -139,7 +141,8 @@ pub mod prelude {
     };
     #[cfg(feature = "_blocking")]
     pub use crate::{
-        BlockingHttpClient, BlockingHttpClientBuilder, BlockingRequestBuilder, blocking,
+        BlockingHttpClient, BlockingHttpClientBuilder, BlockingHttpResponseStream,
+        BlockingRequestBuilder, blocking,
     };
     #[cfg(feature = "_async")]
     pub use crate::{HttpClient, HttpResponseStream};

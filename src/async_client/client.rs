@@ -1684,6 +1684,8 @@ impl HttpClient {
                 status,
                 response_headers,
                 response.into_body(),
+                current_method.clone(),
+                current_redacted_uri.clone(),
             ));
         }
 

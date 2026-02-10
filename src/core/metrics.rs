@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::error::{HttpClientError, TimeoutPhase};
+#[cfg(feature = "_blocking")]
+use crate::response::BlockingHttpResponseStream;
 use crate::response::HttpResponse;
 #[cfg(feature = "_async")]
 use crate::response::HttpResponseStream;
@@ -101,6 +103,27 @@ impl HttpClientMetrics {
     pub(crate) fn record_request_completed_stream(
         &self,
         result: &Result<HttpResponseStream, HttpClientError>,
+        latency: Duration,
+    ) {
+        match result {
+            Ok(response) => {
+                self.inner
+                    .requests_succeeded
+                    .fetch_add(1, Ordering::Relaxed);
+                self.add_status_count(response.status().as_u16());
+            }
+            Err(error) => {
+                self.record_request_completed_error(error, latency);
+                return;
+            }
+        }
+        self.record_latency(latency);
+    }
+
+    #[cfg(feature = "_blocking")]
+    pub(crate) fn record_request_completed_blocking_stream(
+        &self,
+        result: &Result<BlockingHttpResponseStream, HttpClientError>,
         latency: Duration,
     ) {
         match result {

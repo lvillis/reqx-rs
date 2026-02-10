@@ -12,7 +12,7 @@ use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::HttpClient;
 use reqx::prelude::{
     CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy,
-    RequestContext, RetryBudgetPolicy, RetryPolicy,
+    RequestContext, RetryBudgetPolicy, RetryPolicy, TimeoutPhase,
 };
 use serde_json::Value;
 
@@ -116,6 +116,79 @@ impl MockServer {
 }
 
 impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct SplitBodyServer {
+    base_url: String,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SplitBodyServer {
+    fn start(
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        body_delay: Duration,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind split body server");
+        let address = listener
+            .local_addr()
+            .expect("read split body server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set split body listener nonblocking");
+
+        let join = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = read_request(&mut stream);
+
+                        let mut head = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            status,
+                            status_text(status),
+                            body.len()
+                        );
+                        for (name, value) in &headers {
+                            head.push_str(name);
+                            head.push_str(": ");
+                            head.push_str(value);
+                            head.push_str("\r\n");
+                        }
+                        head.push_str("\r\n");
+
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.flush();
+                        if !body_delay.is_zero() {
+                            thread::sleep(body_delay);
+                        }
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url: format!("http://{address}"),
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for SplitBodyServer {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -481,6 +554,144 @@ fn blocking_response_body_limit_returns_specific_error() {
         } => {
             assert_eq!(limit_bytes, 4);
             assert!(actual_bytes > limit_bytes);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_send_stream_downloads_body_and_status() {
+    let payload = b"blocking-stream-ok".to_vec();
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        payload.clone(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/v1/stream")
+        .send_stream()
+        .expect("stream request should succeed");
+    assert_eq!(streamed.status().as_u16(), 200);
+    assert_eq!(streamed.method().as_str(), "GET");
+    assert!(streamed.uri().contains("/v1/stream"));
+
+    let body = streamed
+        .into_bytes_limited(1024)
+        .expect("stream body read should succeed");
+    assert_eq!(body.to_vec(), payload);
+}
+
+#[test]
+fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"0123456789".to_vec(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/v1/stream-large")
+        .send_stream()
+        .expect("stream request should succeed");
+    let error = streamed
+        .into_bytes_limited(4)
+        .expect_err("stream body should exceed max size");
+
+    match error {
+        HttpClientError::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            method,
+            uri,
+        } => {
+            assert_eq!(limit_bytes, 4);
+            assert!(actual_bytes > limit_bytes);
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/stream-large"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+        b"delayed".to_vec(),
+        Duration::from_millis(180),
+    );
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(80))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/v1/slow-stream")
+        .send_stream()
+        .expect("headers should be read before timeout");
+    let error = streamed
+        .into_bytes_limited(1024)
+        .expect_err("body read should time out");
+
+    match error {
+        HttpClientError::Timeout {
+            phase, method, uri, ..
+        } => {
+            assert_eq!(phase, TimeoutPhase::ResponseBody);
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/slow-stream"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_send_stream_maps_decode_error_consistently() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Encoding", "gzip"),
+        ],
+        b"not-valid-gzip".to_vec(),
+    )]);
+
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let streamed = client
+        .get("/v1/decode-error")
+        .send_stream()
+        .expect("stream request should succeed");
+    let error = streamed
+        .into_bytes_limited(1024)
+        .expect_err("invalid gzip body should fail decoding");
+
+    match error {
+        HttpClientError::DecodeContentEncoding {
+            encoding,
+            method,
+            uri,
+            ..
+        } => {
+            assert_eq!(encoding.to_ascii_lowercase(), "gzip");
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/decode-error"));
         }
         other => panic!("unexpected error: {other}"),
     }

@@ -6,7 +6,7 @@ use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 use http::{HeaderMap, Method, Uri};
 
 use crate::ReqxResult;
-use crate::error::{HttpClientError, TimeoutPhase, TransportErrorKind};
+use crate::error::{HttpClientError, TransportErrorKind};
 use crate::proxy::ProxyConfig;
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
 
@@ -201,13 +201,6 @@ pub(super) fn make_agent(
 pub(super) struct TransportAgents {
     pub(super) direct: ureq::Agent,
     pub(super) proxy: Option<ureq::Agent>,
-}
-
-pub(super) fn ureq_timeout_phase(timeout: ureq::Timeout) -> TimeoutPhase {
-    match timeout {
-        ureq::Timeout::RecvBody => TimeoutPhase::ResponseBody,
-        _ => TimeoutPhase::Transport,
-    }
 }
 
 pub(super) fn classify_ureq_transport_error(error: &ureq::Error) -> TransportErrorKind {

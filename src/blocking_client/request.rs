@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::ReqxResult;
 use crate::policy::RedirectPolicy;
-use crate::response::HttpResponse;
+use crate::response::{BlockingHttpResponseStream, HttpResponse};
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
 
@@ -171,6 +171,24 @@ impl<'a> RequestBuilder<'a> {
             redirect_policy: self.redirect_policy,
         };
         self.client.send_request(
+            self.method,
+            path,
+            self.headers,
+            self.body,
+            execution_options,
+        )
+    }
+
+    pub fn send_stream(self) -> ReqxResult<BlockingHttpResponseStream> {
+        let path = append_query_pairs(&self.path, &self.query_pairs);
+        let execution_options = RequestExecutionOptions {
+            request_timeout: self.timeout,
+            total_timeout: self.total_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            retry_policy: self.retry_policy,
+            redirect_policy: self.redirect_policy,
+        };
+        self.client.send_request_stream(
             self.method,
             path,
             self.headers,
