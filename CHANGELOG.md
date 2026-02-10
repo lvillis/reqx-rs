@@ -1,8 +1,17 @@
+## [0.1.8] - 2026-02-10
+
+### 🚜 Refactor
+
+- Standardize public and internal naming conventions
 ## [0.1.7] - 2026-02-10
 
 ### 🐛 Bug Fixes
 
 - Harden decoding limits and validate base URLs early
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.7
 ## [0.1.6] - 2026-02-10
 
 ### 🐛 Bug Fixes
