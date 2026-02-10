@@ -17,7 +17,7 @@ use crate::resilience::{
 use crate::retry::{
     PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
 };
-use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate};
+use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{parse_header_name, parse_header_value};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
@@ -194,6 +194,11 @@ impl HttpClientBuilder {
 
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
+        self
+    }
+
+    pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
+        self.tls_options.root_store = tls_root_store;
         self
     }
 

@@ -17,6 +17,15 @@ impl TlsBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TlsRootStore {
+    #[default]
+    BackendDefault,
+    WebPki,
+    System,
+    Specific,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum TlsRootCertificate {
     Pem(Vec<u8>),
@@ -37,6 +46,7 @@ pub(crate) enum TlsClientIdentity {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TlsOptions {
+    pub(crate) root_store: TlsRootStore,
     pub(crate) root_certificates: Vec<TlsRootCertificate>,
     pub(crate) client_identity: Option<TlsClientIdentity>,
 }
@@ -44,7 +54,9 @@ pub(crate) struct TlsOptions {
 #[cfg(all(feature = "_async", feature = "async-tls-native"))]
 impl TlsOptions {
     pub(crate) fn has_customizations(&self) -> bool {
-        !self.root_certificates.is_empty() || self.client_identity.is_some()
+        self.root_store != TlsRootStore::BackendDefault
+            || !self.root_certificates.is_empty()
+            || self.client_identity.is_some()
     }
 }
 

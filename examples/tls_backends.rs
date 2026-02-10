@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, TlsBackend};
+use reqx::prelude::{HttpClient, TlsBackend, TlsRootStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = HttpClient::builder("https://postman-echo.com")
         .client_name("reqx-example-tls")
-        .request_timeout(Duration::from_secs(3));
+        .request_timeout(Duration::from_secs(3))
+        .tls_root_store(TlsRootStore::System);
 
     #[cfg(feature = "async-tls-native")]
     {

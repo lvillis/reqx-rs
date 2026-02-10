@@ -11,7 +11,7 @@ use crate::error::{HttpClientError, HttpClientErrorCode, TimeoutPhase, Transport
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
 use crate::response::HttpResponse;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
-use crate::tls::TlsBackend;
+use crate::tls::{TlsBackend, TlsRootStore};
 use crate::util::{
     append_query_pairs, bounded_retry_delay, ensure_accept_encoding, join_base_path,
     parse_retry_after, redact_uri_for_logs, resolve_uri,
@@ -411,6 +411,40 @@ fn invalid_tls_root_ca_pem_returns_tls_config_error() {
 }
 
 #[test]
+fn tls_root_store_specific_without_roots_returns_tls_config_error() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_store(TlsRootStore::Specific)
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("specific root store without roots should fail"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::Specific"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn custom_root_ca_requires_specific_root_store() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_ca_der([1_u8, 2, 3, 4])
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("custom root ca should require specific root store"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::Specific"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn rustls_backend_rejects_pkcs12_identity_configuration() {
     #[cfg(feature = "async-tls-rustls-ring")]
     let backend = Some(TlsBackend::RustlsRing);
@@ -459,6 +493,25 @@ fn native_tls_invalid_pkcs12_identity_returns_tls_config_error() {
     };
     match error {
         HttpClientError::TlsConfig { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "async-tls-native")]
+#[test]
+fn native_tls_webpki_root_store_is_rejected() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_backend(TlsBackend::NativeTls)
+        .tls_root_store(TlsRootStore::WebPki)
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("native tls should reject webpki root store"),
+        Err(error) => error,
+    };
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::WebPki"));
+        }
         other => panic!("unexpected error: {other}"),
     }
 }

@@ -55,7 +55,9 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
 };
-use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
+use crate::tls::{
+    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
+};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error, ensure_accept_encoding,
     is_redirect_status, lock_unpoisoned, merge_headers, parse_header_name, parse_header_value,
@@ -136,15 +138,14 @@ fn extract_pem_certificate_blocks(pem_bundle: &[u8]) -> Vec<Vec<u8>> {
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
-fn build_rustls_tls_config(
+fn add_custom_rustls_root_certificates(
     tls_backend: TlsBackend,
-    provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
     tls_options: &TlsOptions,
-) -> ReqxResult<rustls::ClientConfig> {
+    root_store: &mut rustls::RootCertStore,
+) -> ReqxResult<usize> {
     use rustls::pki_types::pem::PemObject;
 
-    let mut root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut added_total = 0usize;
     for certificate in &tls_options.root_certificates {
         match certificate {
             TlsRootCertificate::Pem(pem) => {
@@ -171,6 +172,7 @@ fn build_rustls_tls_config(
                         "failed to parse PEM root certificate(s)",
                     ));
                 }
+                added_total = added_total.saturating_add(added);
             }
             TlsRootCertificate::Der(der) => {
                 root_store
@@ -181,9 +183,87 @@ fn build_rustls_tls_config(
                             format!("failed to add DER root certificate: {source}"),
                         )
                     })?;
+                added_total = added_total.saturating_add(1);
             }
         }
     }
+
+    Ok(added_total)
+}
+
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+fn build_rustls_root_store(
+    tls_backend: TlsBackend,
+    tls_options: &TlsOptions,
+) -> ReqxResult<rustls::RootCertStore> {
+    if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
+    {
+        return Err(tls_config_error(
+            tls_backend,
+            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+        ));
+    }
+
+    let mut root_store = match tls_options.root_store {
+        TlsRootStore::BackendDefault | TlsRootStore::WebPki => {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        }
+        TlsRootStore::System | TlsRootStore::Specific => rustls::RootCertStore::empty(),
+    };
+
+    if tls_options.root_store == TlsRootStore::Specific && tls_options.root_certificates.is_empty()
+    {
+        return Err(tls_config_error(
+            tls_backend,
+            "tls_root_store(TlsRootStore::Specific) requires at least one root CA",
+        ));
+    }
+
+    let mut system_added = 0usize;
+    if tls_options.root_store == TlsRootStore::System {
+        let loaded = rustls_native_certs::load_native_certs();
+        if !loaded.errors.is_empty() {
+            warn!(
+                backend = tls_backend.as_str(),
+                error_count = loaded.errors.len(),
+                "system root certificate loading returned partial errors"
+            );
+        }
+        let (added, _ignored) = root_store.add_parsable_certificates(loaded.certs);
+        system_added = added;
+    }
+
+    let custom_added = if tls_options.root_store == TlsRootStore::Specific {
+        add_custom_rustls_root_certificates(tls_backend, tls_options, &mut root_store)?
+    } else {
+        0
+    };
+
+    if tls_options.root_store == TlsRootStore::System && system_added + custom_added == 0 {
+        return Err(tls_config_error(
+            tls_backend,
+            "failed to load system root certificates",
+        ));
+    }
+
+    Ok(root_store)
+}
+
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+fn build_rustls_tls_config(
+    tls_backend: TlsBackend,
+    provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
+    tls_options: &TlsOptions,
+) -> ReqxResult<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+
+    let root_store = build_rustls_root_store(tls_backend, tls_options)?;
 
     let config_builder = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
@@ -417,6 +497,35 @@ fn build_native_tls_connector(
     tls_options: &TlsOptions,
 ) -> ReqxResult<hyper_tls::native_tls::TlsConnector> {
     let mut connector_builder = hyper_tls::native_tls::TlsConnector::builder();
+
+    if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
+    {
+        return Err(tls_config_error(
+            TlsBackend::NativeTls,
+            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+        ));
+    }
+
+    match tls_options.root_store {
+        TlsRootStore::BackendDefault | TlsRootStore::System => {
+            connector_builder.disable_built_in_roots(false);
+        }
+        TlsRootStore::Specific => {
+            if tls_options.root_certificates.is_empty() {
+                return Err(tls_config_error(
+                    TlsBackend::NativeTls,
+                    "tls_root_store(TlsRootStore::Specific) requires at least one root CA",
+                ));
+            }
+            connector_builder.disable_built_in_roots(true);
+        }
+        TlsRootStore::WebPki => {
+            return Err(tls_config_error(
+                TlsBackend::NativeTls,
+                "tls_root_store(TlsRootStore::WebPki) is unsupported for native-tls backend; use System or Specific",
+            ));
+        }
+    }
 
     for certificate in &tls_options.root_certificates {
         match certificate {
@@ -872,6 +981,11 @@ impl HttpClientBuilder {
 
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
+        self
+    }
+
+    pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
+        self.tls_options.root_store = tls_root_store;
         self
     }
 

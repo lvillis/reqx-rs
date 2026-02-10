@@ -8,7 +8,9 @@ use http::{HeaderMap, Method, Uri};
 use crate::ReqxResult;
 use crate::error::{HttpClientError, TransportErrorKind};
 use crate::proxy::ProxyConfig;
-use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, tls_config_error};
+use crate::tls::{
+    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
+};
 
 #[cfg(feature = "blocking-tls-rustls-aws-lc-rs")]
 use std::sync::Arc;
@@ -103,20 +105,44 @@ fn build_sync_tls_config(
 
     let mut tls_config_builder = ureq::tls::TlsConfig::builder().provider(provider);
 
-    if !tls_options.root_certificates.is_empty() {
-        let mut roots = Vec::new();
-        for root_certificate in &tls_options.root_certificates {
-            match root_certificate {
-                TlsRootCertificate::Pem(pem) => {
-                    roots.extend(parse_pem_certificates(backend, pem, "root certificate")?);
-                }
-                TlsRootCertificate::Der(der) => {
-                    roots.push(ureq::tls::Certificate::from_der(der).to_owned());
-                }
+    let mut roots = Vec::new();
+    for root_certificate in &tls_options.root_certificates {
+        match root_certificate {
+            TlsRootCertificate::Pem(pem) => {
+                roots.extend(parse_pem_certificates(backend, pem, "root certificate")?);
+            }
+            TlsRootCertificate::Der(der) => {
+                roots.push(ureq::tls::Certificate::from_der(der).to_owned());
             }
         }
-        tls_config_builder =
-            tls_config_builder.root_certs(ureq::tls::RootCerts::new_with_certs(&roots));
+    }
+
+    if !roots.is_empty() && tls_options.root_store != TlsRootStore::Specific {
+        return Err(tls_config_error(
+            backend,
+            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+        ));
+    }
+
+    match tls_options.root_store {
+        TlsRootStore::BackendDefault => {}
+        TlsRootStore::WebPki => {
+            tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+        }
+        TlsRootStore::System => {
+            tls_config_builder =
+                tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
+        }
+        TlsRootStore::Specific => {
+            if roots.is_empty() {
+                return Err(tls_config_error(
+                    backend,
+                    "tls_root_store(TlsRootStore::Specific) requires at least one root CA",
+                ));
+            }
+            tls_config_builder =
+                tls_config_builder.root_certs(ureq::tls::RootCerts::new_with_certs(&roots));
+        }
     }
 
     if let Some(identity) = &tls_options.client_identity {

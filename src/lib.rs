@@ -124,7 +124,7 @@ pub use crate::retry::{
     PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
 };
-pub use crate::tls::TlsBackend;
+pub use crate::tls::{TlsBackend, TlsRootStore};
 #[cfg(feature = "_async")]
 pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
 pub use crate::upload::{
@@ -149,7 +149,7 @@ pub mod prelude {
         ReqxResult, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
         RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
-        TransportErrorKind, UploadedPart,
+        TlsRootStore, TransportErrorKind, UploadedPart,
     };
     #[cfg(feature = "_async")]
     pub use crate::{

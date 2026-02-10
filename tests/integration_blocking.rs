@@ -13,6 +13,7 @@ use reqx::blocking::HttpClient;
 use reqx::prelude::{
     CircuitBreakerPolicy, HttpClientError, HttpInterceptor, RateLimitPolicy, RedirectPolicy,
     RequestContext, RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase,
+    TlsRootStore,
 };
 use serde_json::Value;
 
@@ -637,6 +638,61 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
     }
 
     assert_eq!(server.served_count(), 1);
+}
+
+#[test]
+fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_store(TlsRootStore::Specific)
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("specific root store without roots should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::Specific"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_tls_root_store_system_rejects_custom_roots() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_store(TlsRootStore::System)
+        .tls_root_ca_der([1_u8, 2, 3, 4])
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("system root store should reject custom roots"),
+        Err(error) => error,
+    };
+
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::Specific"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_custom_root_ca_requires_specific_root_store() {
+    let result = HttpClient::builder("https://api.example.com")
+        .tls_root_ca_der([1_u8, 2, 3, 4])
+        .try_build();
+    let error = match result {
+        Ok(_) => panic!("custom root ca should require specific root store"),
+        Err(error) => error,
+    };
+
+    match error {
+        HttpClientError::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::Specific"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
