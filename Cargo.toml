@@ -64,6 +64,7 @@ blocking-tls-rustls-aws-lc-rs = [
     "rustls/aws_lc_rs",
 ]
 blocking-tls-native = ["_blocking", "ureq/native-tls", "ureq/gzip", "ureq/brotli"]
+otel = ["dep:opentelemetry"]
 
 [dependencies]
 # Async runtime and stream primitives.
@@ -95,6 +96,8 @@ ureq = { version = "3.2.0", default-features = false, optional = true }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
 serde_urlencoded = { version = "0.7.1", default-features = false }
+md5 = { version = "0.8.0", default-features = false }
+sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
 
 # Content-encoding codecs.
 brotli = { version = "8.0.2", default-features = false, features = ["std"] }
@@ -105,6 +108,7 @@ zstd = { version = "0.13.3" }
 thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 rand = { version = "0.10.0", default-features = false, features = ["std", "thread_rng"] }
 tracing = { version = "0.1.44", default-features = false, features = ["attributes", "std"] }
+opentelemetry = { version = "0.31.0", default-features = false, features = ["metrics", "trace"], optional = true }
 
 [dev-dependencies]
 # Benchmark framework.

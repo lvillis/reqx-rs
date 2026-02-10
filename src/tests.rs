@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
@@ -310,6 +310,47 @@ fn error_code_maps_expected_variant() {
     };
     assert_eq!(error.code(), HttpClientErrorCode::InvalidUri);
     assert_eq!(error.code().as_str(), "invalid_uri");
+}
+
+#[test]
+fn error_code_contract_table_is_stable() {
+    let codes = HttpClientErrorCode::all();
+    assert_eq!(codes.len(), 25);
+
+    let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "invalid_uri",
+            "serialize_json",
+            "serialize_query",
+            "serialize_form",
+            "request_build",
+            "transport",
+            "timeout",
+            "deadline_exceeded",
+            "read_body",
+            "response_body_too_large",
+            "http_status",
+            "deserialize",
+            "invalid_header_name",
+            "invalid_header_value",
+            "decode_content_encoding",
+            "concurrency_limit_closed",
+            "tls_backend_unavailable",
+            "tls_backend_init",
+            "tls_config",
+            "retry_budget_exhausted",
+            "circuit_open",
+            "missing_redirect_location",
+            "invalid_redirect_location",
+            "redirect_limit_exceeded",
+            "redirect_body_not_replayable",
+        ]
+    );
+
+    let unique: BTreeSet<&str> = names.iter().copied().collect();
+    assert_eq!(unique.len(), names.len());
 }
 
 #[test]

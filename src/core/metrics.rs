@@ -4,7 +4,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use http::Method;
+
 use crate::error::{HttpClientError, TimeoutPhase};
+use crate::otel::{OtelRequestSpan, OtelTelemetry};
 #[cfg(feature = "_blocking")]
 use crate::response::BlockingHttpResponseStream;
 use crate::response::HttpResponse;
@@ -36,6 +39,7 @@ pub struct HttpClientMetricsSnapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HttpClientMetrics {
     inner: Option<Arc<HttpClientMetricsInner>>,
+    otel: OtelTelemetry,
 }
 
 #[derive(Debug, Default)]
@@ -63,21 +67,43 @@ pub(crate) struct InFlightGuard {
 }
 
 impl HttpClientMetrics {
-    pub(crate) fn enabled() -> Self {
+    pub(crate) fn with_options(metrics_enabled: bool, otel: OtelTelemetry) -> Self {
         Self {
-            inner: Some(Arc::new(HttpClientMetricsInner::default())),
+            inner: metrics_enabled.then(|| Arc::new(HttpClientMetricsInner::default())),
+            otel,
         }
     }
 
-    pub(crate) fn disabled() -> Self {
-        Self::default()
+    pub(crate) fn start_otel_request_span(
+        &self,
+        method: &Method,
+        uri: &str,
+        stream: bool,
+    ) -> OtelRequestSpan {
+        self.otel.start_request_span(method, uri, stream)
+    }
+
+    pub(crate) fn finish_otel_request_span_success(
+        &self,
+        request_span: OtelRequestSpan,
+        status: u16,
+    ) {
+        self.otel.finish_request_span_success(request_span, status);
+    }
+
+    pub(crate) fn finish_otel_request_span_error(
+        &self,
+        request_span: OtelRequestSpan,
+        error: &HttpClientError,
+    ) {
+        self.otel.finish_request_span_error(request_span, error);
     }
 
     pub(crate) fn record_request_started(&self) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.requests_started.fetch_add(1, Ordering::Relaxed);
+        if let Some(inner) = &self.inner {
+            inner.requests_started.fetch_add(1, Ordering::Relaxed);
+        }
+        self.otel.record_request_started();
     }
 
     pub(crate) fn enter_in_flight(&self) -> InFlightGuard {
@@ -93,10 +119,10 @@ impl HttpClientMetrics {
     }
 
     pub(crate) fn record_retry(&self) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.retries.fetch_add(1, Ordering::Relaxed);
+        if let Some(inner) = &self.inner {
+            inner.retries.fetch_add(1, Ordering::Relaxed);
+        }
+        self.otel.record_retry();
     }
 
     pub(crate) fn record_request_completed(
@@ -104,16 +130,14 @@ impl HttpClientMetrics {
         result: &Result<HttpResponse, HttpClientError>,
         latency: Duration,
     ) {
-        if self.inner.is_none() {
-            return;
-        }
-
         match result {
             Ok(response) => {
                 if let Some(inner) = &self.inner {
                     inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_status_count(response.status().as_u16());
+                self.otel
+                    .record_request_succeeded(response.status().as_u16());
             }
             Err(error) => {
                 self.record_request_completed_error(error, latency);
@@ -130,16 +154,14 @@ impl HttpClientMetrics {
         result: &Result<HttpResponseStream, HttpClientError>,
         latency: Duration,
     ) {
-        if self.inner.is_none() {
-            return;
-        }
-
         match result {
             Ok(response) => {
                 if let Some(inner) = &self.inner {
                     inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_status_count(response.status().as_u16());
+                self.otel
+                    .record_request_succeeded(response.status().as_u16());
             }
             Err(error) => {
                 self.record_request_completed_error(error, latency);
@@ -155,16 +177,14 @@ impl HttpClientMetrics {
         result: &Result<BlockingHttpResponseStream, HttpClientError>,
         latency: Duration,
     ) {
-        if self.inner.is_none() {
-            return;
-        }
-
         match result {
             Ok(response) => {
                 if let Some(inner) = &self.inner {
                     inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_status_count(response.status().as_u16());
+                self.otel
+                    .record_request_succeeded(response.status().as_u16());
             }
             Err(error) => {
                 self.record_request_completed_error(error, latency);
@@ -179,103 +199,77 @@ impl HttpClientMetrics {
         error: &HttpClientError,
         latency: Duration,
     ) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.requests_failed.fetch_add(1, Ordering::Relaxed);
+        if let Some(inner) = &self.inner {
+            inner.requests_failed.fetch_add(1, Ordering::Relaxed);
+        }
         self.record_latency(latency);
+        self.otel.record_request_failed(error);
+
+        self.add_error_count(error.code().as_str().to_owned());
+
         match error {
             HttpClientError::Timeout { phase, .. } => {
-                match phase {
-                    TimeoutPhase::Transport => {
-                        inner.timeout_transport.fetch_add(1, Ordering::Relaxed);
-                    }
-                    TimeoutPhase::ResponseBody => {
-                        inner.timeout_response_body.fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    match phase {
+                        TimeoutPhase::Transport => {
+                            inner.timeout_transport.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TimeoutPhase::ResponseBody => {
+                            inner.timeout_response_body.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 self.add_error_count(format!("timeout:{phase}"));
             }
             HttpClientError::DeadlineExceeded { .. } => {
-                inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
-                self.add_error_count("deadline_exceeded".to_owned());
+                if let Some(inner) = &self.inner {
+                    inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+                }
             }
             HttpClientError::Transport { kind, .. } => {
-                inner.transport_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    inner.transport_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 self.add_error_count(format!("transport:{kind}"));
             }
             HttpClientError::ReadBody { .. } => {
-                inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
-                self.add_error_count("read_body".to_owned());
+                if let Some(inner) = &self.inner {
+                    inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
             HttpClientError::ResponseBodyTooLarge { .. } => {
-                inner
-                    .response_body_too_large
-                    .fetch_add(1, Ordering::Relaxed);
-                self.add_error_count("response_body_too_large".to_owned());
+                if let Some(inner) = &self.inner {
+                    inner
+                        .response_body_too_large
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             HttpClientError::HttpStatus { status, .. } => {
-                inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 self.add_status_count(*status);
                 self.add_error_count(format!("http_status:{status}"));
             }
-            HttpClientError::InvalidUri { .. } => {
-                self.add_error_count("invalid_uri".to_owned());
-            }
-            HttpClientError::Serialize { .. } => {
-                self.add_error_count("serialize".to_owned());
-            }
-            HttpClientError::SerializeQuery { .. } => {
-                self.add_error_count("serialize_query".to_owned());
-            }
-            HttpClientError::SerializeForm { .. } => {
-                self.add_error_count("serialize_form".to_owned());
-            }
-            HttpClientError::RequestBuild { .. } => {
-                self.add_error_count("request_build".to_owned());
-            }
-            HttpClientError::Deserialize { .. } => {
-                self.add_error_count("deserialize".to_owned());
-            }
-            HttpClientError::InvalidHeaderName { .. } => {
-                self.add_error_count("invalid_header_name".to_owned());
-            }
-            HttpClientError::InvalidHeaderValue { .. } => {
-                self.add_error_count("invalid_header_value".to_owned());
-            }
-            HttpClientError::DecodeContentEncoding { .. } => {
-                self.add_error_count("decode_content_encoding".to_owned());
-            }
-            HttpClientError::ConcurrencyLimitClosed => {
-                self.add_error_count("concurrency_limit_closed".to_owned());
-            }
-            HttpClientError::TlsBackendUnavailable { .. } => {
-                self.add_error_count("tls_backend_unavailable".to_owned());
-            }
-            HttpClientError::TlsBackendInit { .. } => {
-                self.add_error_count("tls_backend_init".to_owned());
-            }
-            HttpClientError::TlsConfig { .. } => {
-                self.add_error_count("tls_config".to_owned());
-            }
-            HttpClientError::RetryBudgetExhausted { .. } => {
-                self.add_error_count("retry_budget_exhausted".to_owned());
-            }
-            HttpClientError::CircuitOpen { .. } => {
-                self.add_error_count("circuit_open".to_owned());
-            }
-            HttpClientError::MissingRedirectLocation { .. } => {
-                self.add_error_count("missing_redirect_location".to_owned());
-            }
-            HttpClientError::InvalidRedirectLocation { .. } => {
-                self.add_error_count("invalid_redirect_location".to_owned());
-            }
-            HttpClientError::RedirectLimitExceeded { .. } => {
-                self.add_error_count("redirect_limit_exceeded".to_owned());
-            }
-            HttpClientError::RedirectBodyNotReplayable { .. } => {
-                self.add_error_count("redirect_body_not_replayable".to_owned());
-            }
+            HttpClientError::InvalidUri { .. }
+            | HttpClientError::Serialize { .. }
+            | HttpClientError::SerializeQuery { .. }
+            | HttpClientError::SerializeForm { .. }
+            | HttpClientError::RequestBuild { .. }
+            | HttpClientError::Deserialize { .. }
+            | HttpClientError::InvalidHeaderName { .. }
+            | HttpClientError::InvalidHeaderValue { .. }
+            | HttpClientError::DecodeContentEncoding { .. }
+            | HttpClientError::ConcurrencyLimitClosed
+            | HttpClientError::TlsBackendUnavailable { .. }
+            | HttpClientError::TlsBackendInit { .. }
+            | HttpClientError::TlsConfig { .. }
+            | HttpClientError::RetryBudgetExhausted { .. }
+            | HttpClientError::CircuitOpen { .. }
+            | HttpClientError::MissingRedirectLocation { .. }
+            | HttpClientError::InvalidRedirectLocation { .. }
+            | HttpClientError::RedirectLimitExceeded { .. }
+            | HttpClientError::RedirectBodyNotReplayable { .. } => {}
         }
     }
 
@@ -346,6 +340,8 @@ impl HttpClientMetrics {
     }
 
     fn record_latency(&self, latency: Duration) {
+        self.otel.record_request_latency(latency);
+
         let Some(inner) = &self.inner else {
             return;
         };

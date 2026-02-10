@@ -71,6 +71,38 @@ pub enum HttpClientErrorCode {
 }
 
 impl HttpClientErrorCode {
+    pub const ALL: [Self; 25] = [
+        Self::InvalidUri,
+        Self::SerializeJson,
+        Self::SerializeQuery,
+        Self::SerializeForm,
+        Self::RequestBuild,
+        Self::Transport,
+        Self::Timeout,
+        Self::DeadlineExceeded,
+        Self::ReadBody,
+        Self::ResponseBodyTooLarge,
+        Self::HttpStatus,
+        Self::Deserialize,
+        Self::InvalidHeaderName,
+        Self::InvalidHeaderValue,
+        Self::DecodeContentEncoding,
+        Self::ConcurrencyLimitClosed,
+        Self::TlsBackendUnavailable,
+        Self::TlsBackendInit,
+        Self::TlsConfig,
+        Self::RetryBudgetExhausted,
+        Self::CircuitOpen,
+        Self::MissingRedirectLocation,
+        Self::InvalidRedirectLocation,
+        Self::RedirectLimitExceeded,
+        Self::RedirectBodyNotReplayable,
+    ];
+
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUri => "invalid_uri",

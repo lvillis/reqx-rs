@@ -7,6 +7,7 @@ use http::{HeaderMap, Uri};
 use crate::ReqxResult;
 use crate::error::HttpClientError;
 use crate::metrics::HttpClientMetrics;
+use crate::otel::OtelTelemetry;
 use crate::policy::{HttpInterceptor, RedirectPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter};
@@ -53,6 +54,7 @@ impl HttpClientBuilder {
             tls_options: TlsOptions::default(),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             metrics_enabled: false,
+            otel_enabled: false,
             interceptors: Vec::new(),
         }
     }
@@ -256,6 +258,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn otel_enabled(mut self, enabled: bool) -> Self {
+        self.otel_enabled = enabled;
+        self
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -310,6 +317,11 @@ impl HttpClientBuilder {
         } else {
             None
         };
+        let otel = if self.otel_enabled {
+            OtelTelemetry::enabled(self.client_name.clone())
+        } else {
+            OtelTelemetry::disabled()
+        };
 
         Ok(HttpClient {
             base_url: self.base_url,
@@ -341,11 +353,7 @@ impl HttpClientBuilder {
             },
             proxy_config,
             connect_timeout: self.connect_timeout,
-            metrics: if self.metrics_enabled {
-                HttpClientMetrics::enabled()
-            } else {
-                HttpClientMetrics::disabled()
-            },
+            metrics: HttpClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
         })
     }

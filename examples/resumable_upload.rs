@@ -59,6 +59,7 @@ impl AsyncResumableUploadBackend for DemoBackend {
             part_number,
             etag: format!("etag-{part_number}"),
             size: chunk.len(),
+            checksum: None,
         })
     }
 

@@ -34,6 +34,7 @@ use crate::body::{
 use crate::error::{HttpClientError, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
 use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
+use crate::otel::OtelTelemetry;
 use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
 #[cfg(any(
     feature = "async-tls-native",
@@ -694,6 +695,7 @@ pub struct HttpClientBuilder {
     max_in_flight: Option<usize>,
     max_in_flight_per_host: Option<usize>,
     metrics_enabled: bool,
+    otel_enabled: bool,
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
@@ -726,6 +728,7 @@ impl HttpClientBuilder {
             max_in_flight: None,
             max_in_flight_per_host: None,
             metrics_enabled: false,
+            otel_enabled: false,
             interceptors: Vec::new(),
         }
     }
@@ -939,6 +942,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn otel_enabled(mut self, enabled: bool) -> Self {
+        self.otel_enabled = enabled;
+        self
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -966,6 +974,11 @@ impl HttpClientBuilder {
             self.pool_max_idle_per_host,
             self.http2_only,
         )?;
+        let otel = if self.otel_enabled {
+            OtelTelemetry::enabled(self.client_name.clone())
+        } else {
+            OtelTelemetry::disabled()
+        };
 
         Ok(HttpClient {
             base_url: self.base_url,
@@ -994,11 +1007,7 @@ impl HttpClientBuilder {
             tls_backend: self.tls_backend,
             transport,
             request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
-            metrics: if self.metrics_enabled {
-                HttpClientMetrics::enabled()
-            } else {
-                HttpClientMetrics::disabled()
-            },
+            metrics: HttpClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
         })
     }
@@ -1215,6 +1224,9 @@ impl HttpClient {
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
         ensure_accept_encoding(&mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
+        let otel_span = self
+            .metrics
+            .start_otel_request_span(&method, &redacted_uri_text, false);
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
@@ -1224,6 +1236,8 @@ impl HttpClient {
             Err(error) => {
                 self.metrics
                     .record_request_completed_error(&error, request_started_at.elapsed());
+                self.metrics
+                    .finish_otel_request_span_error(otel_span, &error);
                 return Err(error);
             }
         };
@@ -1240,6 +1254,14 @@ impl HttpClient {
             .await;
         self.metrics
             .record_request_completed(&result, request_started_at.elapsed());
+        match &result {
+            Ok(response) => self
+                .metrics
+                .finish_otel_request_span_success(otel_span, response.status().as_u16()),
+            Err(error) => self
+                .metrics
+                .finish_otel_request_span_error(otel_span, error),
+        }
         result
     }
 
@@ -1256,6 +1278,9 @@ impl HttpClient {
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
         ensure_accept_encoding(&mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
+        let otel_span = self
+            .metrics
+            .start_otel_request_span(&method, &redacted_uri_text, true);
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
@@ -1265,6 +1290,8 @@ impl HttpClient {
             Err(error) => {
                 self.metrics
                     .record_request_completed_error(&error, request_started_at.elapsed());
+                self.metrics
+                    .finish_otel_request_span_error(otel_span, &error);
                 return Err(error);
             }
         };
@@ -1281,6 +1308,14 @@ impl HttpClient {
             .await;
         self.metrics
             .record_request_completed_stream(&result, request_started_at.elapsed());
+        match &result {
+            Ok(response) => self
+                .metrics
+                .finish_otel_request_span_success(otel_span, response.status().as_u16()),
+            Err(error) => self
+                .metrics
+                .finish_otel_request_span_error(otel_span, error),
+        }
         result
     }
 

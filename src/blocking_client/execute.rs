@@ -294,6 +294,9 @@ impl HttpClient {
         ensure_accept_encoding(&mut merged_headers);
 
         let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
+        let otel_span = self
+            .metrics
+            .start_otel_request_span(&method, &redacted_uri_text, false);
 
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
@@ -310,6 +313,14 @@ impl HttpClient {
 
         self.metrics
             .record_request_completed(&result, request_started_at.elapsed());
+        match &result {
+            Ok(response) => self
+                .metrics
+                .finish_otel_request_span_success(otel_span, response.status().as_u16()),
+            Err(error) => self
+                .metrics
+                .finish_otel_request_span_error(otel_span, error),
+        }
         result
     }
 
@@ -327,6 +338,9 @@ impl HttpClient {
         ensure_accept_encoding(&mut merged_headers);
 
         let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
+        let otel_span = self
+            .metrics
+            .start_otel_request_span(&method, &redacted_uri_text, true);
 
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
@@ -343,6 +357,14 @@ impl HttpClient {
 
         self.metrics
             .record_request_completed_blocking_stream(&result, request_started_at.elapsed());
+        match &result {
+            Ok(response) => self
+                .metrics
+                .finish_otel_request_span_success(otel_span, response.status().as_u16()),
+            Err(error) => self
+                .metrics
+                .finish_otel_request_span_error(otel_span, error),
+        }
         result
     }
 

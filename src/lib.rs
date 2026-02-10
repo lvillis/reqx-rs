@@ -94,6 +94,7 @@ pub(crate) use crate::async_client::limiters;
 pub(crate) use crate::async_client::request;
 pub(crate) use crate::core::error;
 pub(crate) use crate::core::metrics;
+pub(crate) use crate::core::otel;
 pub(crate) use crate::core::policy;
 pub(crate) use crate::core::proxy;
 pub(crate) use crate::core::retry;
@@ -127,8 +128,9 @@ pub use crate::tls::TlsBackend;
 #[cfg(feature = "_async")]
 pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
 pub use crate::upload::{
-    BlockingResumableUploadBackend, BlockingResumableUploader, ResumableUploadCheckpoint,
-    ResumableUploadError, ResumableUploadOptions, ResumableUploadResult, UploadedPart,
+    BlockingResumableUploadBackend, BlockingResumableUploader, PartChecksumAlgorithm,
+    RESUMABLE_UPLOAD_CHECKPOINT_VERSION, ResumableUploadCheckpoint, ResumableUploadError,
+    ResumableUploadOptions, ResumableUploadResult, UploadedPart,
 };
 
 #[cfg(feature = "_blocking")]
@@ -142,11 +144,12 @@ pub mod prelude {
     pub use crate::{
         AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
         CircuitBreakerPolicy, HttpClientError, HttpClientErrorCode, HttpClientMetricsSnapshot,
-        HttpInterceptor, HttpResponse, PermissiveRetryEligibility, RateLimitPolicy, RedirectPolicy,
-        RequestContext, ReqxResult, ResumableUploadCheckpoint, ResumableUploadError,
-        ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
-        RetryDecision, RetryEligibility, RetryPolicy, StrictRetryEligibility, TimeoutPhase,
-        TlsBackend, TransportErrorKind, UploadedPart,
+        HttpInterceptor, HttpResponse, PartChecksumAlgorithm, PermissiveRetryEligibility,
+        RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RedirectPolicy, RequestContext,
+        ReqxResult, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
+        ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
+        RetryPolicy, StrictRetryEligibility, TimeoutPhase, TlsBackend, TransportErrorKind,
+        UploadedPart,
     };
     #[cfg(feature = "_async")]
     pub use crate::{
