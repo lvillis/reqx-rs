@@ -1,8 +1,17 @@
+## [0.1.6] - 2026-02-10
+
+### 🐛 Bug Fixes
+
+- Gate examples and docs by feature set for blocking-only builds
 ## [0.1.5] - 2026-02-10
 
 ### 🚀 Features
 
 - Unify TLS trust-store semantics for custom CAs
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.5
 ## [0.1.4] - 2026-02-10
 
 ### 🧪 Testing
