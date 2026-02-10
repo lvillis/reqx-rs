@@ -35,7 +35,7 @@ pub struct HttpClientMetricsSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HttpClientMetrics {
-    inner: Arc<HttpClientMetricsInner>,
+    inner: Option<Arc<HttpClientMetricsInner>>,
 }
 
 #[derive(Debug, Default)]
@@ -59,23 +59,44 @@ struct HttpClientMetricsInner {
 }
 
 pub(crate) struct InFlightGuard {
-    metrics: HttpClientMetrics,
+    inner: Option<Arc<HttpClientMetricsInner>>,
 }
 
 impl HttpClientMetrics {
+    pub(crate) fn enabled() -> Self {
+        Self {
+            inner: Some(Arc::new(HttpClientMetricsInner::default())),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self::default()
+    }
+
     pub(crate) fn record_request_started(&self) {
-        self.inner.requests_started.fetch_add(1, Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.requests_started.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn enter_in_flight(&self) -> InFlightGuard {
-        self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
-        InFlightGuard {
-            metrics: self.clone(),
+        match &self.inner {
+            Some(inner) => {
+                inner.in_flight.fetch_add(1, Ordering::Relaxed);
+                InFlightGuard {
+                    inner: Some(Arc::clone(inner)),
+                }
+            }
+            None => InFlightGuard { inner: None },
         }
     }
 
     pub(crate) fn record_retry(&self) {
-        self.inner.retries.fetch_add(1, Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.retries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_request_completed(
@@ -83,11 +104,15 @@ impl HttpClientMetrics {
         result: &Result<HttpResponse, HttpClientError>,
         latency: Duration,
     ) {
+        if self.inner.is_none() {
+            return;
+        }
+
         match result {
             Ok(response) => {
-                self.inner
-                    .requests_succeeded
-                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
                 self.add_status_count(response.status().as_u16());
             }
             Err(error) => {
@@ -105,11 +130,15 @@ impl HttpClientMetrics {
         result: &Result<HttpResponseStream, HttpClientError>,
         latency: Duration,
     ) {
+        if self.inner.is_none() {
+            return;
+        }
+
         match result {
             Ok(response) => {
-                self.inner
-                    .requests_succeeded
-                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
                 self.add_status_count(response.status().as_u16());
             }
             Err(error) => {
@@ -126,11 +155,15 @@ impl HttpClientMetrics {
         result: &Result<BlockingHttpResponseStream, HttpClientError>,
         latency: Duration,
     ) {
+        if self.inner.is_none() {
+            return;
+        }
+
         match result {
             Ok(response) => {
-                self.inner
-                    .requests_succeeded
-                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(inner) = &self.inner {
+                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
                 self.add_status_count(response.status().as_u16());
             }
             Err(error) => {
@@ -146,44 +179,43 @@ impl HttpClientMetrics {
         error: &HttpClientError,
         latency: Duration,
     ) {
-        self.inner.requests_failed.fetch_add(1, Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.requests_failed.fetch_add(1, Ordering::Relaxed);
         self.record_latency(latency);
         match error {
             HttpClientError::Timeout { phase, .. } => {
                 match phase {
                     TimeoutPhase::Transport => {
-                        self.inner.timeout_transport.fetch_add(1, Ordering::Relaxed);
+                        inner.timeout_transport.fetch_add(1, Ordering::Relaxed);
                     }
                     TimeoutPhase::ResponseBody => {
-                        self.inner
-                            .timeout_response_body
-                            .fetch_add(1, Ordering::Relaxed);
+                        inner.timeout_response_body.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 self.add_error_count(format!("timeout:{phase}"));
             }
             HttpClientError::DeadlineExceeded { .. } => {
-                self.inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+                inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
                 self.add_error_count("deadline_exceeded".to_owned());
             }
             HttpClientError::Transport { kind, .. } => {
-                self.inner.transport_errors.fetch_add(1, Ordering::Relaxed);
+                inner.transport_errors.fetch_add(1, Ordering::Relaxed);
                 self.add_error_count(format!("transport:{kind}"));
             }
             HttpClientError::ReadBody { .. } => {
-                self.inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
+                inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
                 self.add_error_count("read_body".to_owned());
             }
             HttpClientError::ResponseBodyTooLarge { .. } => {
-                self.inner
+                inner
                     .response_body_too_large
                     .fetch_add(1, Ordering::Relaxed);
                 self.add_error_count("response_body_too_large".to_owned());
             }
             HttpClientError::HttpStatus { status, .. } => {
-                self.inner
-                    .http_status_errors
-                    .fetch_add(1, Ordering::Relaxed);
+                inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
                 self.add_status_count(*status);
                 self.add_error_count(format!("http_status:{status}"));
             }
@@ -248,27 +280,49 @@ impl HttpClientMetrics {
     }
 
     pub(crate) fn snapshot(&self) -> HttpClientMetricsSnapshot {
-        let requests_started = self.inner.requests_started.load(Ordering::Relaxed);
-        let requests_succeeded = self.inner.requests_succeeded.load(Ordering::Relaxed);
-        let requests_failed = self.inner.requests_failed.load(Ordering::Relaxed);
-        let retries = self.inner.retries.load(Ordering::Relaxed);
-        let timeout_transport = self.inner.timeout_transport.load(Ordering::Relaxed);
-        let timeout_response_body = self.inner.timeout_response_body.load(Ordering::Relaxed);
-        let deadline_exceeded = self.inner.deadline_exceeded.load(Ordering::Relaxed);
-        let transport_errors = self.inner.transport_errors.load(Ordering::Relaxed);
-        let read_body_errors = self.inner.read_body_errors.load(Ordering::Relaxed);
-        let response_body_too_large = self.inner.response_body_too_large.load(Ordering::Relaxed);
-        let http_status_errors = self.inner.http_status_errors.load(Ordering::Relaxed);
-        let in_flight = self.inner.in_flight.load(Ordering::Relaxed);
-        let latency_samples = self.inner.latency_samples.load(Ordering::Relaxed);
-        let latency_total_ms = self.inner.latency_total_ms.load(Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return HttpClientMetricsSnapshot {
+                requests_started: 0,
+                requests_succeeded: 0,
+                requests_failed: 0,
+                retries: 0,
+                timeout_transport: 0,
+                timeout_response_body: 0,
+                deadline_exceeded: 0,
+                transport_errors: 0,
+                read_body_errors: 0,
+                response_body_too_large: 0,
+                http_status_errors: 0,
+                in_flight: 0,
+                latency_samples: 0,
+                latency_total_ms: 0,
+                latency_avg_ms: 0.0,
+                status_counts: BTreeMap::new(),
+                error_counts: BTreeMap::new(),
+            };
+        };
+
+        let requests_started = inner.requests_started.load(Ordering::Relaxed);
+        let requests_succeeded = inner.requests_succeeded.load(Ordering::Relaxed);
+        let requests_failed = inner.requests_failed.load(Ordering::Relaxed);
+        let retries = inner.retries.load(Ordering::Relaxed);
+        let timeout_transport = inner.timeout_transport.load(Ordering::Relaxed);
+        let timeout_response_body = inner.timeout_response_body.load(Ordering::Relaxed);
+        let deadline_exceeded = inner.deadline_exceeded.load(Ordering::Relaxed);
+        let transport_errors = inner.transport_errors.load(Ordering::Relaxed);
+        let read_body_errors = inner.read_body_errors.load(Ordering::Relaxed);
+        let response_body_too_large = inner.response_body_too_large.load(Ordering::Relaxed);
+        let http_status_errors = inner.http_status_errors.load(Ordering::Relaxed);
+        let in_flight = inner.in_flight.load(Ordering::Relaxed);
+        let latency_samples = inner.latency_samples.load(Ordering::Relaxed);
+        let latency_total_ms = inner.latency_total_ms.load(Ordering::Relaxed);
         let latency_avg_ms = if latency_samples == 0 {
             0.0
         } else {
             latency_total_ms as f64 / latency_samples as f64
         };
-        let status_counts = lock_unpoisoned(&self.inner.status_counts).clone();
-        let error_counts = lock_unpoisoned(&self.inner.error_counts).clone();
+        let status_counts = lock_unpoisoned(&inner.status_counts).clone();
+        let error_counts = lock_unpoisoned(&inner.error_counts).clone();
 
         HttpClientMetricsSnapshot {
             requests_started,
@@ -292,26 +346,37 @@ impl HttpClientMetrics {
     }
 
     fn record_latency(&self, latency: Duration) {
-        self.inner.latency_samples.fetch_add(1, Ordering::Relaxed);
-        self.inner.latency_total_ms.fetch_add(
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.latency_samples.fetch_add(1, Ordering::Relaxed);
+        inner.latency_total_ms.fetch_add(
             latency.as_millis().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
     }
 
     fn add_status_count(&self, status: u16) {
-        let mut status_counts = lock_unpoisoned(&self.inner.status_counts);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut status_counts = lock_unpoisoned(&inner.status_counts);
         *status_counts.entry(status).or_insert(0) += 1;
     }
 
     fn add_error_count(&self, error_key: String) {
-        let mut error_counts = lock_unpoisoned(&self.inner.error_counts);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut error_counts = lock_unpoisoned(&inner.error_counts);
         *error_counts.entry(error_key).or_insert(0) += 1;
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.metrics.inner.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(inner) = &self.inner {
+            inner.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }

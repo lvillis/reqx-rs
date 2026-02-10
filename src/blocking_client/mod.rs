@@ -167,6 +167,7 @@ pub struct HttpClientBuilder {
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
     client_name: String,
+    metrics_enabled: bool,
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 

@@ -37,7 +37,7 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 | `request_helpers.rs`      | `.query()`, `.form()`, default/request headers                    | `cargo run --example request_helpers`                                                  |
 | `request_overrides.rs`    | Override timeout/retry at request level                           | `cargo run --example request_overrides`                                                |
 | `error_handling.rs`       | Match error variants and print error codes                        | `cargo run --example error_handling`                                                   |
-| `metrics_snapshot.rs`     | Observe requests/retries/status/error counters                    | `cargo run --example metrics_snapshot`                                                 |
+| `metrics_snapshot.rs`     | Observe counters with `.metrics_enabled(true)`                    | `cargo run --example metrics_snapshot`                                                 |
 | `streaming.rs`            | Async reader upload and writer download helpers                   | `cargo run --example streaming`                                                        |
 | `concurrency_limits.rs`   | Demonstrate serialized execution with limiter                     | `cargo run --example concurrency_limits`                                               |
 | `resilience_controls.rs`  | Configure retry budget, circuit breaker, and adaptive concurrency | `cargo run --example resilience_controls`                                              |

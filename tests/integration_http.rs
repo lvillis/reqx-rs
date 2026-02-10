@@ -428,6 +428,7 @@ async fn request_timeout_reports_transport_phase() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build();
 
     let error = client
@@ -698,6 +699,7 @@ async fn response_body_timeout_reports_phase_and_metrics() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build();
 
     let error = client
@@ -734,6 +736,7 @@ async fn decode_content_encoding_error_is_classified() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(200))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build();
 
     let error = client
@@ -777,6 +780,7 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     let client = HttpClient::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build();
 
     let first: Value = client
@@ -823,6 +827,35 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     );
     assert_eq!(metrics.in_flight, 0);
     assert_eq!(metrics.latency_samples, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_snapshot_is_noop_when_metrics_disabled() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+        Duration::ZERO,
+    )]);
+    let client = HttpClient::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+
+    let _response = client
+        .get("/metrics-disabled")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 0);
+    assert_eq!(metrics.requests_succeeded, 0);
+    assert_eq!(metrics.requests_failed, 0);
+    assert_eq!(metrics.retries, 0);
+    assert_eq!(metrics.latency_samples, 0);
+    assert!(metrics.status_counts.is_empty());
+    assert!(metrics.error_counts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8,6 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_name("reqx-example-metrics")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::standard().max_attempts(2))
+        .metrics_enabled(true)
         .try_build()?;
 
     let _ = client.get("/status/200").send().await;

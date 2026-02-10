@@ -693,6 +693,7 @@ pub struct HttpClientBuilder {
     client_name: String,
     max_in_flight: Option<usize>,
     max_in_flight_per_host: Option<usize>,
+    metrics_enabled: bool,
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
@@ -724,6 +725,7 @@ impl HttpClientBuilder {
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             max_in_flight: None,
             max_in_flight_per_host: None,
+            metrics_enabled: false,
             interceptors: Vec::new(),
         }
     }
@@ -932,6 +934,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn metrics_enabled(mut self, enabled: bool) -> Self {
+        self.metrics_enabled = enabled;
+        self
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -987,7 +994,11 @@ impl HttpClientBuilder {
             tls_backend: self.tls_backend,
             transport,
             request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
-            metrics: HttpClientMetrics::default(),
+            metrics: if self.metrics_enabled {
+                HttpClientMetrics::enabled()
+            } else {
+                HttpClientMetrics::disabled()
+            },
             interceptors: self.interceptors,
         })
     }

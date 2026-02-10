@@ -52,6 +52,7 @@ impl HttpClientBuilder {
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
+            metrics_enabled: false,
             interceptors: Vec::new(),
         }
     }
@@ -250,6 +251,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn metrics_enabled(mut self, enabled: bool) -> Self {
+        self.metrics_enabled = enabled;
+        self
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -335,7 +341,11 @@ impl HttpClientBuilder {
             },
             proxy_config,
             connect_timeout: self.connect_timeout,
-            metrics: HttpClientMetrics::default(),
+            metrics: if self.metrics_enabled {
+                HttpClientMetrics::enabled()
+            } else {
+                HttpClientMetrics::disabled()
+            },
             interceptors: self.interceptors,
         })
     }
