@@ -1,3 +1,8 @@
+## [0.1.11] - 2026-02-11
+
+### 🐛 Bug Fixes
+
+- Redact response bodies from error display messages
 ## [0.1.10] - 2026-02-11
 
 ### 🚀 Features
@@ -12,6 +17,10 @@
 
 - Align stream semantics and unify decode/retry paths
 - Polish transport API contracts, naming, and resilience flows
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.10
 ## [0.1.9] - 2026-02-11
 
 ### 🚜 Refactor
