@@ -135,7 +135,7 @@ impl ErrorCode {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     #[error("invalid request uri: {uri}")]
@@ -270,6 +270,16 @@ pub enum Error {
     },
     #[error("cannot follow redirect for non-replayable request body: {method} {uri}")]
     RedirectBodyNotReplayable { method: Method, uri: String },
+}
+
+impl std::fmt::Debug for Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Error")
+            .field("code", &self.code())
+            .field("message", &self.to_string())
+            .finish()
+    }
 }
 
 impl Error {

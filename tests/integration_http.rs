@@ -747,6 +747,53 @@ async fn decoded_gzip_response_still_respects_max_body_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_http_status_error_strips_decoded_encoding_headers() {
+    let body = gzip_bytes(br#"{"error":"bad-request"}"#);
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        400,
+        vec![
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ],
+        body,
+        Duration::ZERO,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/gzip-http-status-buffered")
+        .send()
+        .await
+        .expect_err("non-success request should return HttpStatus error");
+
+    match error {
+        Error::HttpStatus {
+            status,
+            headers,
+            body,
+            ..
+        } => {
+            assert_eq!(status, 400);
+            assert_eq!(body, r#"{"error":"bad-request"}"#);
+            assert!(
+                headers.get("content-encoding").is_none(),
+                "decoded error headers should not keep content-encoding"
+            );
+            assert!(
+                headers.get("content-length").is_none(),
+                "decoded error headers should not keep original content-length"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_into_response_limited_respects_decode_limit() {
     let expanded = vec![b'b'; 16 * 1024];
     let body = gzip_bytes(&expanded);

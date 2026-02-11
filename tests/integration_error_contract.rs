@@ -147,6 +147,35 @@ fn error_display_does_not_include_response_body_payloads() {
     }
 }
 
+#[test]
+fn error_debug_does_not_include_response_body_payloads() {
+    let secret = "token=super-secret-value";
+    let status_error = Error::HttpStatus {
+        status: 503,
+        method: http::Method::GET,
+        uri: "https://example.com/private".to_owned(),
+        headers: Box::new(http::HeaderMap::new()),
+        body: secret.to_owned(),
+    };
+    let status_text = format!("{status_error:?}");
+    assert!(
+        !status_text.contains(secret),
+        "http status debug should not leak response body"
+    );
+
+    let source = serde_json::from_slice::<serde_json::Value>(b"{not-json")
+        .expect_err("invalid json should produce a decode error");
+    let decode_error = Error::DeserializeJson {
+        source,
+        body: secret.to_owned(),
+    };
+    let decode_text = format!("{decode_error:?}");
+    assert!(
+        !decode_text.contains(secret),
+        "json decode debug should not leak response body"
+    );
+}
+
 #[derive(Clone)]
 struct CountingObserver {
     started: Arc<AtomicUsize>,
