@@ -2074,7 +2074,7 @@ impl Client {
             };
 
             let status = response.status();
-            let response_headers = response.headers().clone();
+            let mut response_headers = response.headers().clone();
             if redirect_policy.enabled() && is_redirect_status(status) {
                 if redirect_count >= redirect_policy.max_redirects() {
                     let error = Error::RedirectLimitExceeded {
@@ -2230,6 +2230,11 @@ impl Client {
                     Some(body) => body,
                     None => continue,
                 };
+                let should_decode_response_body = should_decode_content_encoded_body(
+                    &current_method,
+                    status,
+                    response_body.len(),
+                );
                 let response_body = self.decode_response_body_limited(
                     response_body,
                     &response_headers,
@@ -2237,6 +2242,9 @@ impl Client {
                     status,
                     &context,
                 )?;
+                if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
+                    remove_content_encoding_headers(&mut response_headers);
+                }
                 let error = http_status_error(
                     status,
                     &current_method,

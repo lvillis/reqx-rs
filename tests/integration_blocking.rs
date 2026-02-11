@@ -1031,6 +1031,55 @@ fn blocking_send_stream_keeps_raw_bytes_and_decode_is_explicit() {
 }
 
 #[test]
+fn blocking_send_stream_http_status_error_strips_decoded_encoding_headers() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(br#"{"error":"bad-request"}"#)
+        .expect("write gzip source bytes should succeed");
+    let body = encoder.finish().expect("finish gzip stream should succeed");
+    let server = MockServer::start(vec![MockResponse::new(
+        400,
+        vec![
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ],
+        body,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/gzip-http-status")
+        .send_stream()
+        .expect_err("non-success stream request should return HttpStatus error");
+
+    match error {
+        Error::HttpStatus {
+            status,
+            headers,
+            body,
+            ..
+        } => {
+            assert_eq!(status, 400);
+            assert_eq!(body, r#"{"error":"bad-request"}"#);
+            assert!(
+                headers.get("content-encoding").is_none(),
+                "decoded error headers should not keep content-encoding"
+            );
+            assert!(
+                headers.get("content-length").is_none(),
+                "decoded error headers should not keep original content-length"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_send_stream_accept_encoding_can_be_opted_in_per_request() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
