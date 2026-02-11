@@ -54,15 +54,15 @@ jobs:
           - name: async-rustls-ring
             command: cargo test --tests --no-default-features --features async-tls-rustls-ring
           - name: async-rustls-aws-lc-rs
-            command: cargo check --lib --tests --no-default-features --features async-tls-rustls-aws-lc-rs
+            command: cargo test --tests --no-default-features --features async-tls-rustls-aws-lc-rs
           - name: async-native
-            command: cargo check --lib --tests --no-default-features --features async-tls-native
+            command: cargo test --tests --no-default-features --features async-tls-native
           - name: blocking-rustls-ring
             command: cargo test --tests --no-default-features --features blocking-tls-rustls-ring
           - name: blocking-rustls-aws-lc-rs
-            command: cargo check --lib --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
+            command: cargo test --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
           - name: blocking-native
-            command: cargo check --lib --tests --no-default-features --features blocking-tls-native
+            command: cargo test --tests --no-default-features --features blocking-tls-native
           - name: hybrid-async-and-blocking
             command: cargo check --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
 

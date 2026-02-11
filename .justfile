@@ -32,11 +32,11 @@ test:
 
 feature-matrix:
     cargo test --tests --no-default-features --features async-tls-rustls-ring
-    cargo check --lib --tests --no-default-features --features async-tls-rustls-aws-lc-rs
-    cargo check --lib --tests --no-default-features --features async-tls-native
+    cargo test --tests --no-default-features --features async-tls-rustls-aws-lc-rs
+    cargo test --tests --no-default-features --features async-tls-native
     cargo test --tests --no-default-features --features blocking-tls-rustls-ring
-    cargo check --lib --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
-    cargo check --lib --tests --no-default-features --features blocking-tls-native
+    cargo test --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
+    cargo test --tests --no-default-features --features blocking-tls-native
     cargo check --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
 
 docsrs-check:

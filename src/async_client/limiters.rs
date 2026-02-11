@@ -23,9 +23,12 @@ struct PerHostLimiterEntry {
     last_used_at: Instant,
 }
 
-pub(crate) struct RequestPermits {
-    pub(crate) _global: Option<OwnedSemaphorePermit>,
-    pub(crate) _host: Option<OwnedSemaphorePermit>,
+pub(crate) struct GlobalRequestPermit {
+    pub(crate) _permit: Option<OwnedSemaphorePermit>,
+}
+
+pub(crate) struct HostRequestPermit {
+    pub(crate) _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RequestLimiters {
@@ -41,8 +44,8 @@ impl RequestLimiters {
         })
     }
 
-    pub(crate) async fn acquire(&self, host: Option<&str>) -> Result<RequestPermits, Error> {
-        let global = if let Some(semaphore) = &self.global {
+    pub(crate) async fn acquire_global(&self) -> Result<GlobalRequestPermit, Error> {
+        let permit = if let Some(semaphore) = &self.global {
             Some(
                 semaphore
                     .clone()
@@ -53,9 +56,15 @@ impl RequestLimiters {
         } else {
             None
         };
+        Ok(GlobalRequestPermit { _permit: permit })
+    }
 
+    pub(crate) async fn acquire_host(
+        &self,
+        host: Option<&str>,
+    ) -> Result<HostRequestPermit, Error> {
         let host = host.map(|item| item.to_ascii_lowercase());
-        let host_semaphore = match (self.per_host_limit, host) {
+        let permit = match (self.per_host_limit, host) {
             (Some(limit), Some(host)) => {
                 let semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
@@ -78,10 +87,7 @@ impl RequestLimiters {
             _ => None,
         };
 
-        Ok(RequestPermits {
-            _global: global,
-            _host: host_semaphore,
-        })
+        Ok(HostRequestPermit { _permit: permit })
     }
 }
 

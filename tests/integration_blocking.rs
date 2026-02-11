@@ -746,6 +746,92 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
 }
 
 #[test]
+fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_buffered() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+        ),
+        MockResponse::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/v1/response-mode-buffered")
+        .send_with_status()
+        .expect("first non-success response should be returned");
+    assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
+
+    let second = client
+        .get("/v1/response-mode-buffered")
+        .send_with_status()
+        .expect("second non-success response should be returned");
+    assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
+
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+        ),
+        MockResponse::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/v1/response-mode-stream")
+        .send_stream_with_status()
+        .expect("first non-success stream should be returned");
+    assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
+
+    let second = client
+        .get("/v1/response-mode-stream")
+        .send_stream_with_status()
+        .expect("second non-success stream should be returned");
+    assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
+
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
 fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
     let result = Client::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)

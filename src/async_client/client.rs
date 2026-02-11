@@ -42,7 +42,7 @@ use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, PolicyBackoffSource,
     PrimaryEndpointSelector, StandardBodyCodec, SystemClock,
 };
-use crate::limiters::{RequestLimiters, RequestPermits};
+use crate::limiters::{GlobalRequestPermit, HostRequestPermit, RequestLimiters};
 use crate::metrics::{ClientMetrics, MetricsSnapshot};
 use crate::observe::Observer;
 use crate::otel::OtelTelemetry;
@@ -1718,13 +1718,20 @@ impl Client {
         }
     }
 
-    async fn acquire_request_permits(&self, host: Option<&str>) -> Result<RequestPermits, Error> {
+    async fn acquire_global_request_permit(&self) -> Result<GlobalRequestPermit, Error> {
         match &self.request_limiters {
-            Some(limiters) => limiters.acquire(host).await,
-            None => Ok(RequestPermits {
-                _global: None,
-                _host: None,
-            }),
+            Some(limiters) => limiters.acquire_global().await,
+            None => Ok(GlobalRequestPermit { _permit: None }),
+        }
+    }
+
+    async fn acquire_host_request_permit(
+        &self,
+        host: Option<&str>,
+    ) -> Result<HostRequestPermit, Error> {
+        match &self.request_limiters {
+            Some(limiters) => limiters.acquire_host(host).await,
+            None => Ok(HostRequestPermit { _permit: None }),
         }
     }
 
@@ -1770,9 +1777,8 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let host = uri.host().map(|item| item.to_ascii_lowercase());
-        let _permits = match self.acquire_request_permits(host.as_deref()).await {
-            Ok(permits) => permits,
+        let _global_permit = match self.acquire_global_request_permit().await {
+            Ok(permit) => permit,
             Err(error) => {
                 self.metrics
                     .record_request_completed_error(&error, request_started_at.elapsed());
@@ -1835,9 +1841,8 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let host = uri.host().map(|item| item.to_ascii_lowercase());
-        let _permits = match self.acquire_request_permits(host.as_deref()).await {
-            Ok(permits) => permits,
+        let _global_permit = match self.acquire_global_request_permit().await {
+            Ok(permit) => permit,
             Err(error) => {
                 self.metrics
                     .record_request_completed_error(&error, request_started_at.elapsed());
@@ -1971,6 +1976,14 @@ impl Client {
             let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
+            let host = current_uri.host().map(|item| item.to_ascii_lowercase());
+            let _host_permit = match self.acquire_host_request_permit(host.as_deref()).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+            };
 
             let request_body = if let Some(body) = &buffered_body {
                 buffered_req_body(body.clone())
@@ -2201,6 +2214,12 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
                     return Ok(ResponseStream::new(
                         status,
                         response_headers,
@@ -2387,6 +2406,14 @@ impl Client {
             let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
+            let host = current_uri.host().map(|item| item.to_ascii_lowercase());
+            let _host_permit = match self.acquire_host_request_permit(host.as_deref()).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+            };
             let request_body = if let Some(body) = &buffered_body {
                 buffered_req_body(body.clone())
             } else {
@@ -2655,6 +2682,12 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
                     return Ok(Response::new(status, response_headers, response_body));
                 }
                 let error = http_status_error(

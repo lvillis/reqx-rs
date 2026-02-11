@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use http::Uri;
 use http_body_util::BodyExt;
-use reqx::prelude::{Client, Error, RetryPolicy};
+use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
 use reqx::{CircuitBreakerPolicy, RetryBudgetPolicy, RetryClassifier, RetryDecision};
 use tokio::io::sink;
 
@@ -667,6 +667,79 @@ async fn max_in_flight_per_host_limits_each_host_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_per_host_applies_to_redirect_target_host() {
+    let target = CountingServer::start(
+        4,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok-target".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let target_location = format!("http://{}/target", target.authority());
+    let redirect_headers = vec![("Location".to_owned(), target_location)];
+    let source_a = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            302,
+            redirect_headers.clone(),
+            Vec::<u8>::new(),
+            Duration::ZERO,
+        ),
+    );
+    let source_b = CountingServer::start(
+        2,
+        ResponseSpec::new(302, redirect_headers, Vec::<u8>::new(), Duration::ZERO),
+    );
+
+    let client = Client::builder(format!("http://{}", source_a.authority()))
+        .max_in_flight_per_host(1)
+        .request_timeout(Duration::from_millis(800))
+        .redirect_policy(RedirectPolicy::follow())
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+    let source_b_url = format!("http://{}", source_b.authority());
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for idx in 0..4 {
+        let cloned = client.clone();
+        let path = if idx % 2 == 0 {
+            "/from-source-a".to_owned()
+        } else {
+            format!("{source_b_url}/from-source-b")
+        };
+        tasks.push(tokio::spawn(async move {
+            cloned
+                .get(path)
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+        }));
+    }
+
+    for task in tasks {
+        let status = task
+            .await
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(420),
+        "redirect target host should be serialized by per-host limiter: {elapsed:?}"
+    );
+    assert_eq!(target.served_count(), 4);
+    assert_eq!(target.max_active(), 1);
+    assert_eq!(source_a.served_count(), 2);
+    assert_eq!(source_b.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn total_timeout_interrupts_retry_loop_with_retry_after() {
     let server = CountingServer::start(
         1,
@@ -903,6 +976,94 @@ async fn circuit_breaker_short_circuits_after_opening() {
     assert_eq!(
         server.wait_for_served_count(1, Duration::from_millis(200)),
         1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_response_mode_does_not_open_on_non_success_buffered() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/response-mode-buffered")
+        .send_with_status()
+        .await
+        .expect("first non-success response should be returned");
+    assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
+
+    let second = client
+        .get("/response-mode-buffered")
+        .send_with_status()
+        .await
+        .expect("second non-success response should be returned");
+    assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/response-mode-stream")
+        .send_stream_with_status()
+        .await
+        .expect("first non-success stream should be returned");
+    assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
+
+    let second = client
+        .get("/response-mode-stream")
+        .send_stream_with_status()
+        .await
+        .expect("second non-success stream should be returned");
+    assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
     );
 }
 

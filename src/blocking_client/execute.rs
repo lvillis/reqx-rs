@@ -912,6 +912,12 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
                     return Ok(BlockingResponseStream::new(
                         status,
                         response_headers,
@@ -1311,6 +1317,12 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
                     return Ok(Response::new(status, response_headers, response_body));
                 }
                 let error = http_status_error(
