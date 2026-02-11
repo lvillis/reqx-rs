@@ -1,8 +1,25 @@
+## [0.1.13] - 2026-02-11
+
+### 🚀 Features
+
+- Make stream Accept-Encoding opt-in by default
+
+### 🐛 Bug Fixes
+
+- Align stream HttpStatus headers with decoded error bodies
+- Harden error contracts and redact debug output
+- Harden async per-host concurrency and resilience paths
+- Align per-authority concurrency and case-insensitive URI semantics
+- Tighten feature-gated TLS paths and remove panic fallbacks
 ## [0.1.12] - 2026-02-11
 
 ### 🐛 Bug Fixes
 
 - Align content-decoding with HTTP body semantics
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.12
 ## [0.1.11] - 2026-02-11
 
 ### 🐛 Bug Fixes
