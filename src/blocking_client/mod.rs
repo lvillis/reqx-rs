@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Uri};
 
 use crate::metrics::HttpClientMetrics;
-use crate::policy::{HttpInterceptor, RedirectPolicy};
+use crate::policy::{RedirectPolicy, RequestInterceptor};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
@@ -174,7 +174,7 @@ pub struct ClientBuilder {
     client_name: String,
     metrics_enabled: bool,
     otel_enabled: bool,
-    interceptors: Vec<Arc<dyn HttpInterceptor>>,
+    interceptors: Vec<Arc<dyn RequestInterceptor>>,
 }
 
 pub struct Client {
@@ -196,5 +196,5 @@ pub struct Client {
     proxy_config: Option<ProxyConfig>,
     connect_timeout: Duration,
     metrics: HttpClientMetrics,
-    interceptors: Vec<Arc<dyn HttpInterceptor>>,
+    interceptors: Vec<Arc<dyn RequestInterceptor>>,
 }

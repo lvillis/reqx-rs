@@ -2,15 +2,15 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use http::header::CONTENT_ENCODING;
 use http::{HeaderMap, Method, Uri};
 
+use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::error::{Error, TimeoutPhase};
-use crate::metrics::HttpClientMetricsSnapshot;
+use crate::metrics::ClientMetricsSnapshot;
 use crate::policy::RequestContext;
 use crate::rate_limit::server_throttle_scope_from_headers;
 use crate::response::{BlockingResponseStream, Response};
-use crate::retry::RetryDecision;
+use crate::retry::{RetryDecision, RetryPolicy};
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
@@ -20,13 +20,26 @@ use crate::util::{
 };
 
 use super::transport::{
-    ReadBodyError, classify_ureq_transport_error, decode_content_encoding_error, is_proxy_bypassed,
-    read_all_body_limited, remove_content_encoding_headers, wrapped_ureq_error,
+    ReadBodyError, classify_ureq_transport_error, is_proxy_bypassed, read_all_body_limited,
+    remove_content_encoding_headers, wrapped_ureq_error,
 };
 use super::{
     AdaptiveConcurrencyPermit, Client, ClientBuilder, RequestBody, RequestBuilder,
     RequestExecutionOptions,
 };
+
+struct BodyReadRetryContext<'a> {
+    context: &'a RequestContext,
+    max_response_body_bytes: usize,
+    transport_timeout: Duration,
+    retry_policy: &'a RetryPolicy,
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    current_method: &'a Method,
+    current_redacted_uri: &'a str,
+    attempt: &'a mut usize,
+    max_attempts: usize,
+}
 
 impl Client {
     pub fn builder(base_url: impl Into<String>) -> ClientBuilder {
@@ -57,7 +70,7 @@ impl Client {
         self.request(Method::DELETE, path)
     }
 
-    pub fn metrics_snapshot(&self) -> HttpClientMetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> ClientMetricsSnapshot {
         self.metrics.snapshot()
     }
 
@@ -177,6 +190,182 @@ impl Client {
             self.server_throttle_scope,
             server_throttle_scope_from_headers(headers),
         );
+    }
+
+    fn map_decode_response_body_error(
+        error: DecodeContentEncodingError,
+        max_response_body_bytes: usize,
+        method: &Method,
+        redacted_uri: &str,
+    ) -> Error {
+        match error {
+            DecodeContentEncodingError::Decode { encoding, message } => {
+                Error::DecodeContentEncoding {
+                    encoding,
+                    message,
+                    method: method.clone(),
+                    uri: redacted_uri.to_owned(),
+                }
+            }
+            DecodeContentEncodingError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
+                limit_bytes: max_response_body_bytes,
+                actual_bytes,
+                method: method.clone(),
+                uri: redacted_uri.to_owned(),
+            },
+        }
+    }
+
+    fn decode_response_body_limited(
+        &self,
+        body: Bytes,
+        headers: &HeaderMap,
+        max_response_body_bytes: usize,
+        method: &Method,
+        redacted_uri: &str,
+        context: &RequestContext,
+    ) -> Result<Bytes, Error> {
+        decode_content_encoded_body_limited(body, headers, max_response_body_bytes).map_err(
+            |error| {
+                let error = Self::map_decode_response_body_error(
+                    error,
+                    max_response_body_bytes,
+                    method,
+                    redacted_uri,
+                );
+                self.run_error_interceptors(context, &error);
+                error
+            },
+        )
+    }
+
+    fn read_response_body_with_retry(
+        &self,
+        response: &mut ureq::http::Response<ureq::Body>,
+        retry_context: BodyReadRetryContext<'_>,
+    ) -> Result<Option<Bytes>, Error> {
+        let BodyReadRetryContext {
+            context,
+            max_response_body_bytes,
+            transport_timeout,
+            retry_policy,
+            total_timeout,
+            request_started_at,
+            current_method,
+            current_redacted_uri,
+            attempt,
+            max_attempts,
+        } = retry_context;
+
+        match read_all_body_limited(response, max_response_body_bytes) {
+            Ok(body) => Ok(Some(body)),
+            Err(ReadBodyError::TooLarge { actual_bytes }) => {
+                let error = Error::ResponseBodyTooLarge {
+                    limit_bytes: max_response_body_bytes,
+                    actual_bytes,
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.to_owned(),
+                };
+                self.run_error_interceptors(context, &error);
+                Err(error)
+            }
+            Err(ReadBodyError::Read(source)) => {
+                if let Some(ureq_error) = wrapped_ureq_error(&source)
+                    && let ureq::Error::Timeout(timeout) = ureq_error
+                {
+                    let _ = timeout;
+                    let timeout_phase = TimeoutPhase::ResponseBody;
+                    let error = Error::Timeout {
+                        phase: timeout_phase,
+                        timeout_ms: transport_timeout.as_millis(),
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.to_owned(),
+                    };
+                    let retry_decision = RetryDecision {
+                        attempt: *attempt,
+                        max_attempts,
+                        method: current_method.clone(),
+                        uri: current_redacted_uri.to_owned(),
+                        status: None,
+                        transport_error_kind: None,
+                        timeout_phase: Some(timeout_phase),
+                        response_body_read_error: false,
+                    };
+                    if *attempt < max_attempts
+                        && retry_policy.should_retry_decision(&retry_decision)
+                    {
+                        if let Err(error) =
+                            self.try_consume_retry_budget(current_method, current_redacted_uri)
+                        {
+                            self.run_error_interceptors(context, &error);
+                            return Err(error);
+                        }
+                        let retry_delay = retry_policy.backoff_for_retry(*attempt);
+                        let Some(retry_delay) =
+                            bounded_retry_delay(retry_delay, total_timeout, request_started_at)
+                        else {
+                            let error = deadline_exceeded_error(
+                                total_timeout,
+                                current_method,
+                                current_redacted_uri,
+                            );
+                            self.run_error_interceptors(context, &error);
+                            return Err(error);
+                        };
+                        self.metrics.record_retry();
+                        if !retry_delay.is_zero() {
+                            sleep(retry_delay);
+                        }
+                        *attempt += 1;
+                        return Ok(None);
+                    }
+                    self.run_error_interceptors(context, &error);
+                    return Err(error);
+                }
+
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                let retry_decision = RetryDecision {
+                    attempt: *attempt,
+                    max_attempts,
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.to_owned(),
+                    status: None,
+                    transport_error_kind: None,
+                    timeout_phase: None,
+                    response_body_read_error: true,
+                };
+                if *attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision) {
+                    if let Err(error) =
+                        self.try_consume_retry_budget(current_method, current_redacted_uri)
+                    {
+                        self.run_error_interceptors(context, &error);
+                        return Err(error);
+                    }
+                    let retry_delay = retry_policy.backoff_for_retry(*attempt);
+                    let Some(retry_delay) =
+                        bounded_retry_delay(retry_delay, total_timeout, request_started_at)
+                    else {
+                        let error = deadline_exceeded_error(
+                            total_timeout,
+                            current_method,
+                            current_redacted_uri,
+                        );
+                        self.run_error_interceptors(context, &error);
+                        return Err(error);
+                    };
+                    self.metrics.record_retry();
+                    if !retry_delay.is_zero() {
+                        sleep(retry_delay);
+                    }
+                    *attempt += 1;
+                    return Ok(None);
+                }
+                self.run_error_interceptors(context, &error);
+                Err(error)
+            }
+        }
     }
 
     fn select_agent(&self, uri: &Uri) -> (&ureq::Agent, bool) {
@@ -542,7 +731,7 @@ impl Client {
             };
 
             let status = response.status();
-            let mut response_headers = response.headers().clone();
+            let response_headers = response.headers().clone();
             if redirect_policy.enabled() && is_redirect_status(status) {
                 if redirect_count >= redirect_policy.max_redirects() {
                     let error = Error::RedirectLimitExceeded {
@@ -619,145 +808,32 @@ impl Client {
             }
 
             if !status.is_success() {
-                let response_body =
-                    match read_all_body_limited(&mut response, max_response_body_bytes) {
-                        Ok(body) => body,
-                        Err(ReadBodyError::TooLarge { actual_bytes }) => {
-                            let error = Error::ResponseBodyTooLarge {
-                                limit_bytes: max_response_body_bytes,
-                                actual_bytes,
-                                method: current_method.clone(),
-                                uri: current_redacted_uri.clone(),
-                            };
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-                        Err(ReadBodyError::Read(source)) => {
-                            if let Some(ureq_error) = wrapped_ureq_error(&source) {
-                                if let ureq::Error::Timeout(timeout) = ureq_error {
-                                    let _ = timeout;
-                                    let timeout_phase = TimeoutPhase::ResponseBody;
-                                    let error = Error::Timeout {
-                                        phase: timeout_phase,
-                                        timeout_ms: transport_timeout.as_millis(),
-                                        method: current_method.clone(),
-                                        uri: current_redacted_uri.clone(),
-                                    };
-                                    let retry_decision = RetryDecision {
-                                        attempt,
-                                        max_attempts,
-                                        method: current_method.clone(),
-                                        uri: current_redacted_uri.clone(),
-                                        status: None,
-                                        transport_error_kind: None,
-                                        timeout_phase: Some(timeout_phase),
-                                        response_body_read_error: false,
-                                    };
-                                    if attempt < max_attempts
-                                        && retry_policy.should_retry_decision(&retry_decision)
-                                    {
-                                        if let Err(error) = self.try_consume_retry_budget(
-                                            &current_method,
-                                            &current_redacted_uri,
-                                        ) {
-                                            self.run_error_interceptors(&context, &error);
-                                            return Err(error);
-                                        }
-                                        let retry_delay = retry_policy.backoff_for_retry(attempt);
-                                        let Some(retry_delay) = bounded_retry_delay(
-                                            retry_delay,
-                                            total_timeout,
-                                            request_started_at,
-                                        ) else {
-                                            let error = deadline_exceeded_error(
-                                                total_timeout,
-                                                &current_method,
-                                                &current_redacted_uri,
-                                            );
-                                            self.run_error_interceptors(&context, &error);
-                                            return Err(error);
-                                        };
-                                        self.metrics.record_retry();
-                                        if !retry_delay.is_zero() {
-                                            sleep(retry_delay);
-                                        }
-                                        attempt += 1;
-                                        continue;
-                                    }
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                }
-
-                                #[cfg(any(
-                                    feature = "blocking-tls-rustls-ring",
-                                    feature = "blocking-tls-rustls-aws-lc-rs",
-                                    feature = "blocking-tls-native"
-                                ))]
-                                if let ureq::Error::Decompress(encoding, decode_error) = ureq_error
-                                {
-                                    let error = decode_content_encoding_error(
-                                        encoding.to_string(),
-                                        decode_error.to_string(),
-                                        &current_method,
-                                        &current_redacted_uri,
-                                    );
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                }
-                            }
-
-                            let error = Error::ReadBody {
-                                source: Box::new(source),
-                            };
-                            let retry_decision = RetryDecision {
-                                attempt,
-                                max_attempts,
-                                method: current_method.clone(),
-                                uri: current_redacted_uri.clone(),
-                                status: None,
-                                transport_error_kind: None,
-                                timeout_phase: None,
-                                response_body_read_error: true,
-                            };
-                            if attempt < max_attempts
-                                && retry_policy.should_retry_decision(&retry_decision)
-                            {
-                                if let Err(error) = self.try_consume_retry_budget(
-                                    &current_method,
-                                    &current_redacted_uri,
-                                ) {
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                }
-                                let retry_delay = retry_policy.backoff_for_retry(attempt);
-                                let Some(retry_delay) = bounded_retry_delay(
-                                    retry_delay,
-                                    total_timeout,
-                                    request_started_at,
-                                ) else {
-                                    let error = deadline_exceeded_error(
-                                        total_timeout,
-                                        &current_method,
-                                        &current_redacted_uri,
-                                    );
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                };
-                                self.metrics.record_retry();
-                                if !retry_delay.is_zero() {
-                                    sleep(retry_delay);
-                                }
-                                attempt += 1;
-                                continue;
-                            }
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-                    };
-
-                if response_headers.contains_key(CONTENT_ENCODING) {
-                    remove_content_encoding_headers(&mut response_headers);
-                }
+                let response_body = match self.read_response_body_with_retry(
+                    &mut response,
+                    BodyReadRetryContext {
+                        context: &context,
+                        max_response_body_bytes,
+                        transport_timeout,
+                        retry_policy: &retry_policy,
+                        total_timeout,
+                        request_started_at,
+                        current_method: &current_method,
+                        current_redacted_uri: &current_redacted_uri,
+                        attempt: &mut attempt,
+                        max_attempts,
+                    },
+                )? {
+                    Some(body) => body,
+                    None => continue,
+                };
+                let response_body = self.decode_response_body_limited(
+                    response_body,
+                    &response_headers,
+                    max_response_body_bytes,
+                    &current_method,
+                    &current_redacted_uri,
+                    &context,
+                )?;
                 self.run_response_interceptors(&context, status, &response_headers);
 
                 let error = Error::HttpStatus {
@@ -815,9 +891,6 @@ impl Client {
                 return Err(error);
             }
 
-            if response_headers.contains_key(CONTENT_ENCODING) {
-                remove_content_encoding_headers(&mut response_headers);
-            }
             self.run_response_interceptors(&context, status, &response_headers);
             if let Some(attempt_guard) = circuit_attempt.take() {
                 attempt_guard.mark_success();
@@ -1092,138 +1165,33 @@ impl Client {
                 continue;
             }
 
-            let response_body = match read_all_body_limited(&mut response, max_response_body_bytes)
-            {
-                Ok(body) => body,
-                Err(ReadBodyError::TooLarge { actual_bytes }) => {
-                    let error = Error::ResponseBodyTooLarge {
-                        limit_bytes: max_response_body_bytes,
-                        actual_bytes,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
-                Err(ReadBodyError::Read(source)) => {
-                    if let Some(ureq_error) = wrapped_ureq_error(&source) {
-                        if let ureq::Error::Timeout(timeout) = ureq_error {
-                            let _ = timeout;
-                            let timeout_phase = TimeoutPhase::ResponseBody;
-                            let error = Error::Timeout {
-                                phase: timeout_phase,
-                                timeout_ms: transport_timeout.as_millis(),
-                                method: current_method.clone(),
-                                uri: current_redacted_uri.clone(),
-                            };
-                            let retry_decision = RetryDecision {
-                                attempt,
-                                max_attempts,
-                                method: current_method.clone(),
-                                uri: current_redacted_uri.clone(),
-                                status: None,
-                                transport_error_kind: None,
-                                timeout_phase: Some(timeout_phase),
-                                response_body_read_error: false,
-                            };
-                            if attempt < max_attempts
-                                && retry_policy.should_retry_decision(&retry_decision)
-                            {
-                                if let Err(error) = self.try_consume_retry_budget(
-                                    &current_method,
-                                    &current_redacted_uri,
-                                ) {
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                }
-                                let retry_delay = retry_policy.backoff_for_retry(attempt);
-                                let Some(retry_delay) = bounded_retry_delay(
-                                    retry_delay,
-                                    total_timeout,
-                                    request_started_at,
-                                ) else {
-                                    let error = deadline_exceeded_error(
-                                        total_timeout,
-                                        &current_method,
-                                        &current_redacted_uri,
-                                    );
-                                    self.run_error_interceptors(&context, &error);
-                                    return Err(error);
-                                };
-                                self.metrics.record_retry();
-                                if !retry_delay.is_zero() {
-                                    sleep(retry_delay);
-                                }
-                                attempt += 1;
-                                continue;
-                            }
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-
-                        #[cfg(any(
-                            feature = "blocking-tls-rustls-ring",
-                            feature = "blocking-tls-rustls-aws-lc-rs",
-                            feature = "blocking-tls-native"
-                        ))]
-                        if let ureq::Error::Decompress(encoding, decode_error) = ureq_error {
-                            let error = decode_content_encoding_error(
-                                encoding.to_string(),
-                                decode_error.to_string(),
-                                &current_method,
-                                &current_redacted_uri,
-                            );
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-                    }
-
-                    let error = Error::ReadBody {
-                        source: Box::new(source),
-                    };
-                    let retry_decision = RetryDecision {
-                        attempt,
-                        max_attempts,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                        status: None,
-                        transport_error_kind: None,
-                        timeout_phase: None,
-                        response_body_read_error: true,
-                    };
-                    if attempt < max_attempts && retry_policy.should_retry_decision(&retry_decision)
-                    {
-                        if let Err(error) =
-                            self.try_consume_retry_budget(&current_method, &current_redacted_uri)
-                        {
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-                        let retry_delay = retry_policy.backoff_for_retry(attempt);
-                        let Some(retry_delay) =
-                            bounded_retry_delay(retry_delay, total_timeout, request_started_at)
-                        else {
-                            let error = deadline_exceeded_error(
-                                total_timeout,
-                                &current_method,
-                                &current_redacted_uri,
-                            );
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        };
-                        self.metrics.record_retry();
-                        if !retry_delay.is_zero() {
-                            sleep(retry_delay);
-                        }
-                        attempt += 1;
-                        continue;
-                    }
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
+            let response_body = match self.read_response_body_with_retry(
+                &mut response,
+                BodyReadRetryContext {
+                    context: &context,
+                    max_response_body_bytes,
+                    transport_timeout,
+                    retry_policy: &retry_policy,
+                    total_timeout,
+                    request_started_at,
+                    current_method: &current_method,
+                    current_redacted_uri: &current_redacted_uri,
+                    attempt: &mut attempt,
+                    max_attempts,
+                },
+            )? {
+                Some(body) => body,
+                None => continue,
             };
-
-            if response_headers.contains_key(CONTENT_ENCODING) {
+            let response_body = self.decode_response_body_limited(
+                response_body,
+                &response_headers,
+                max_response_body_bytes,
+                &current_method,
+                &current_redacted_uri,
+                &context,
+            )?;
+            if response_headers.contains_key(http::header::CONTENT_ENCODING) {
                 remove_content_encoding_headers(&mut response_headers);
             }
             self.run_response_interceptors(&context, status, &response_headers);

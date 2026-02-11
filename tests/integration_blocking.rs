@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::Client;
 use reqx::prelude::{
-    CircuitBreakerPolicy, Error, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
-    RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase, TlsRootStore,
+    CircuitBreakerPolicy, Error, RateLimitPolicy, RedirectPolicy, RequestContext,
+    RequestInterceptor, RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase,
+    TlsRootStore,
 };
 use serde_json::Value;
 
@@ -328,7 +329,7 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
             .headers
             .get("accept-encoding")
             .map(String::as_str),
-        Some("gzip, br")
+        Some("gzip, br, deflate, zstd")
     );
 }
 
@@ -870,15 +871,25 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
 }
 
 #[test]
-fn blocking_send_stream_maps_decode_error_consistently() {
-    let server = MockServer::start(vec![MockResponse::new(
-        200,
-        vec![
-            ("Content-Type", "application/octet-stream"),
-            ("Content-Encoding", "gzip"),
-        ],
-        b"not-valid-gzip".to_vec(),
-    )]);
+fn blocking_send_stream_keeps_raw_bytes_and_decode_is_explicit() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            200,
+            vec![
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Encoding", "gzip"),
+            ],
+            b"not-valid-gzip".to_vec(),
+        ),
+        MockResponse::new(
+            200,
+            vec![
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Encoding", "gzip"),
+            ],
+            b"not-valid-gzip".to_vec(),
+        ),
+    ]);
 
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
@@ -890,9 +901,18 @@ fn blocking_send_stream_maps_decode_error_consistently() {
         .get("/v1/decode-error")
         .send_stream()
         .expect("stream request should succeed");
-    let error = streamed
+    let raw = streamed
         .into_bytes_limited(1024)
-        .expect_err("invalid gzip body should fail decoding");
+        .expect("stream read should return raw compressed bytes");
+    assert_eq!(raw.as_ref(), b"not-valid-gzip");
+
+    let streamed = client
+        .get("/v1/decode-error")
+        .send_stream()
+        .expect("stream request should succeed");
+    let error = streamed
+        .into_response_limited(1024)
+        .expect_err("decode should happen only in explicit buffered conversion");
 
     match error {
         Error::DecodeContentEncoding {
@@ -1004,7 +1024,7 @@ struct BlockingHeaderInterceptor {
     error_hits: Arc<AtomicUsize>,
 }
 
-impl HttpInterceptor for BlockingHeaderInterceptor {
+impl RequestInterceptor for BlockingHeaderInterceptor {
     fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
         self.request_hits.fetch_add(1, Ordering::SeqCst);
         headers.insert(

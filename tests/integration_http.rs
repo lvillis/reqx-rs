@@ -14,8 +14,8 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{
-    Client, Error, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext, RetryPolicy,
-    ServerThrottleScope, TimeoutPhase,
+    Client, Error, RateLimitPolicy, RedirectPolicy, RequestContext, RequestInterceptor,
+    RetryPolicy, ServerThrottleScope, TimeoutPhase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -560,6 +560,71 @@ async fn stream_into_response_limited_respects_decode_limit() {
         } => {
             assert_eq!(limit_bytes, 512);
             assert!(actual_bytes > limit_bytes);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_keeps_raw_bytes_and_decode_is_explicit() {
+    let server = MockServer::start(vec![
+        MockResponse::new_bytes(
+            200,
+            vec![
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Encoding", "gzip"),
+            ],
+            b"not-valid-gzip".to_vec(),
+            Duration::ZERO,
+        ),
+        MockResponse::new_bytes(
+            200,
+            vec![
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Encoding", "gzip"),
+            ],
+            b"not-valid-gzip".to_vec(),
+            Duration::ZERO,
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let streamed = client
+        .get("/gzip-stream-raw")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    let raw = streamed
+        .into_bytes_limited(1024)
+        .await
+        .expect("stream read should return raw bytes");
+    assert_eq!(raw.as_ref(), b"not-valid-gzip");
+
+    let streamed = client
+        .get("/gzip-stream-raw")
+        .send_stream()
+        .await
+        .expect("send_stream should succeed");
+    let error = streamed
+        .into_response_limited(1024)
+        .await
+        .expect_err("decode should happen only in explicit buffered conversion");
+
+    match error {
+        Error::DecodeContentEncoding {
+            encoding,
+            method,
+            uri,
+            ..
+        } => {
+            assert_eq!(encoding.to_ascii_lowercase(), "gzip");
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/gzip-stream-raw"));
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -1112,7 +1177,7 @@ struct HeaderInjectingInterceptor {
     error_hits: Arc<AtomicUsize>,
 }
 
-impl HttpInterceptor for HeaderInjectingInterceptor {
+impl RequestInterceptor for HeaderInjectingInterceptor {
     fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
         self.request_hits.fetch_add(1, Ordering::SeqCst);
         headers.insert(

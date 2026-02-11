@@ -41,7 +41,7 @@ pub(crate) fn ensure_accept_encoding_async(headers: &mut HeaderMap) {
 
 #[cfg(feature = "_blocking")]
 pub(crate) fn ensure_accept_encoding_blocking(headers: &mut HeaderMap) {
-    ensure_accept_encoding(headers, "gzip, br");
+    ensure_accept_encoding(headers, "gzip, br, deflate, zstd");
 }
 
 fn invalid_base_url_error(base_url: &str) -> Error {

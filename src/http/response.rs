@@ -270,6 +270,9 @@ mod blocking_stream {
     use http::{HeaderMap, StatusCode};
     use serde::de::DeserializeOwned;
 
+    use crate::content_encoding::{
+        DecodeContentEncodingError, decode_content_encoded_body_limited,
+    };
     use crate::error::{Error, TimeoutPhase};
     use crate::response::Response;
 
@@ -282,34 +285,43 @@ mod blocking_stream {
         if let Some(ureq_error) = source
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+            && let ureq::Error::Timeout(timeout) = ureq_error
         {
-            if let ureq::Error::Timeout(timeout) = ureq_error {
-                let _ = timeout;
-                return Error::Timeout {
-                    phase: TimeoutPhase::ResponseBody,
-                    timeout_ms,
-                    method: method.clone(),
-                    uri: uri.to_owned(),
-                };
-            }
-
-            #[cfg(any(
-                feature = "blocking-tls-rustls-ring",
-                feature = "blocking-tls-rustls-aws-lc-rs",
-                feature = "blocking-tls-native"
-            ))]
-            if let ureq::Error::Decompress(encoding, decode_error) = ureq_error {
-                return Error::DecodeContentEncoding {
-                    encoding: encoding.to_string(),
-                    method: method.clone(),
-                    uri: uri.to_owned(),
-                    message: decode_error.to_string(),
-                };
-            }
+            let _ = timeout;
+            return Error::Timeout {
+                phase: TimeoutPhase::ResponseBody,
+                timeout_ms,
+                method: method.clone(),
+                uri: uri.to_owned(),
+            };
         }
 
         Error::ReadBody {
             source: Box::new(source),
+        }
+    }
+
+    fn map_decode_error(
+        error: DecodeContentEncodingError,
+        method: &http::Method,
+        uri: &str,
+        max_bytes: usize,
+    ) -> Error {
+        match error {
+            DecodeContentEncodingError::Decode { encoding, message } => {
+                Error::DecodeContentEncoding {
+                    encoding,
+                    method: method.clone(),
+                    uri: uri.to_owned(),
+                    message,
+                }
+            }
+            DecodeContentEncodingError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
+                limit_bytes: max_bytes,
+                actual_bytes,
+                method: method.clone(),
+                uri: uri.to_owned(),
+            },
         }
     }
 
@@ -490,6 +502,8 @@ mod blocking_stream {
                 collected.extend_from_slice(&chunk[..read]);
             }
             let body = Bytes::from(collected);
+            let body = decode_content_encoded_body_limited(body, &headers, max_bytes)
+                .map_err(|error| map_decode_error(error, &method, &uri, max_bytes))?;
             if headers.contains_key(super::CONTENT_ENCODING) {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);

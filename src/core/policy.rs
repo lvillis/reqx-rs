@@ -89,7 +89,7 @@ impl RequestContext {
     }
 }
 
-pub trait HttpInterceptor: Send + Sync {
+pub trait RequestInterceptor: Send + Sync {
     fn on_request(&self, _context: &RequestContext, _headers: &mut HeaderMap) {}
 
     fn on_response(&self, _context: &RequestContext, _status: StatusCode, _headers: &HeaderMap) {}

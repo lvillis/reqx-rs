@@ -16,7 +16,7 @@ use crate::response::ResponseStream;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Debug)]
-pub struct HttpClientMetricsSnapshot {
+pub struct ClientMetricsSnapshot {
     pub requests_started: u64,
     pub requests_succeeded: u64,
     pub requests_failed: u64,
@@ -269,9 +269,9 @@ impl HttpClientMetrics {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> HttpClientMetricsSnapshot {
+    pub(crate) fn snapshot(&self) -> ClientMetricsSnapshot {
         let Some(inner) = &self.inner else {
-            return HttpClientMetricsSnapshot {
+            return ClientMetricsSnapshot {
                 requests_started: 0,
                 requests_succeeded: 0,
                 requests_failed: 0,
@@ -314,7 +314,7 @@ impl HttpClientMetrics {
         let status_counts = lock_unpoisoned(&inner.status_counts).clone();
         let error_counts = lock_unpoisoned(&inner.error_counts).clone();
 
-        HttpClientMetricsSnapshot {
+        ClientMetricsSnapshot {
             requests_started,
             requests_succeeded,
             requests_failed,

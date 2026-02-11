@@ -7,7 +7,7 @@ use http::{HeaderMap, Uri};
 use crate::error::Error;
 use crate::metrics::HttpClientMetrics;
 use crate::otel::OtelTelemetry;
-use crate::policy::{HttpInterceptor, RedirectPolicy};
+use crate::policy::{RedirectPolicy, RequestInterceptor};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
@@ -273,14 +273,14 @@ impl ClientBuilder {
         self
     }
 
-    pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn RequestInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
     pub fn interceptor<I>(self, interceptor: I) -> Self
     where
-        I: HttpInterceptor + 'static,
+        I: RequestInterceptor + 'static,
     {
         self.interceptor_arc(Arc::new(interceptor))
     }

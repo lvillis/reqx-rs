@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
-use http::{HeaderMap, Method, Uri};
+use http::{HeaderMap, Uri};
 
-use crate::error::{Error, TransportErrorKind};
+use crate::error::TransportErrorKind;
 use crate::proxy::ProxyConfig;
 use crate::tls::{
     TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
@@ -14,28 +14,22 @@ use crate::tls::{
 #[cfg(feature = "blocking-tls-rustls-aws-lc-rs")]
 use std::sync::Arc;
 
-pub(super) const fn default_tls_backend() -> TlsBackend {
-    #[cfg(feature = "blocking-tls-rustls-ring")]
-    {
-        return TlsBackend::RustlsRing;
-    }
-    #[cfg(all(
-        not(feature = "blocking-tls-rustls-ring"),
-        feature = "blocking-tls-rustls-aws-lc-rs"
-    ))]
-    {
-        return TlsBackend::RustlsAwsLcRs;
-    }
-    #[cfg(all(
-        not(feature = "blocking-tls-rustls-ring"),
-        not(feature = "blocking-tls-rustls-aws-lc-rs"),
-        feature = "blocking-tls-native"
-    ))]
-    {
-        return TlsBackend::NativeTls;
-    }
-    #[allow(unreachable_code)]
-    TlsBackend::RustlsRing
+#[cfg(feature = "blocking-tls-rustls-ring")]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsRing;
+#[cfg(all(
+    not(feature = "blocking-tls-rustls-ring"),
+    feature = "blocking-tls-rustls-aws-lc-rs"
+))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsAwsLcRs;
+#[cfg(all(
+    not(feature = "blocking-tls-rustls-ring"),
+    not(feature = "blocking-tls-rustls-aws-lc-rs"),
+    feature = "blocking-tls-native"
+))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::NativeTls;
+
+pub(super) fn default_tls_backend() -> TlsBackend {
+    DEFAULT_TLS_BACKEND
 }
 
 pub(super) fn backend_is_available(backend: TlsBackend) -> bool {
@@ -265,20 +259,6 @@ pub(super) fn classify_ureq_transport_error(error: &ureq::Error) -> TransportErr
             _ => TransportErrorKind::Other,
         },
         _ => TransportErrorKind::Other,
-    }
-}
-
-pub(super) fn decode_content_encoding_error(
-    encoding: String,
-    message: String,
-    method: &Method,
-    uri: &str,
-) -> Error {
-    Error::DecodeContentEncoding {
-        encoding,
-        message,
-        method: method.clone(),
-        uri: uri.to_owned(),
     }
 }
 

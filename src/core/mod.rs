@@ -1,3 +1,4 @@
+pub(crate) mod content_encoding;
 pub(crate) mod error;
 pub(crate) mod metrics;
 pub(crate) mod otel;

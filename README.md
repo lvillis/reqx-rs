@@ -132,10 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - transport timeout + response-body timeout + total deadline
 - separate connect timeout (`connect_timeout(...)`)
 - streaming upload and streaming response path
-- buffered-path automatic decoding:
-  async: `gzip`, `br`, `deflate`, `zstd`; blocking: `gzip`, `br`
+- stream `copy_to_writer*` / `into_bytes_limited` keep raw bytes (wire semantics)
+- explicit buffered conversion (`send()`, `into_response_limited`, `into_json_limited`) decodes
+  `gzip`, `br`, `deflate`, `zstd` for both async and blocking
 - proxy support with auth and `no_proxy`
-- interceptor hooks for SDK concerns (`HttpInterceptor`)
+- interceptor hooks for SDK concerns (`RequestInterceptor`)
 - response body size limit
 - structured error variants + machine error codes
 - metrics snapshot for retries, latency, status and error buckets

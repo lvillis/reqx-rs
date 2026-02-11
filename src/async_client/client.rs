@@ -32,9 +32,9 @@ use crate::body::{
 };
 use crate::error::{Error, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
-use crate::metrics::{HttpClientMetrics, HttpClientMetricsSnapshot};
+use crate::metrics::{ClientMetricsSnapshot, HttpClientMetrics};
 use crate::otel::OtelTelemetry;
-use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
+use crate::policy::{RedirectPolicy, RequestContext, RequestInterceptor};
 #[cfg(any(
     feature = "async-tls-native",
     feature = "async-tls-rustls-ring",
@@ -72,28 +72,22 @@ const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
 const DEFAULT_CLIENT_NAME: &str = "reqx";
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-const fn default_tls_backend() -> TlsBackend {
-    #[cfg(feature = "async-tls-rustls-ring")]
-    {
-        return TlsBackend::RustlsRing;
-    }
-    #[cfg(all(
-        not(feature = "async-tls-rustls-ring"),
-        feature = "async-tls-rustls-aws-lc-rs"
-    ))]
-    {
-        return TlsBackend::RustlsAwsLcRs;
-    }
-    #[cfg(all(
-        not(feature = "async-tls-rustls-ring"),
-        not(feature = "async-tls-rustls-aws-lc-rs"),
-        feature = "async-tls-native"
-    ))]
-    {
-        return TlsBackend::NativeTls;
-    }
-    #[allow(unreachable_code)]
-    TlsBackend::RustlsRing
+#[cfg(feature = "async-tls-rustls-ring")]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsRing;
+#[cfg(all(
+    not(feature = "async-tls-rustls-ring"),
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsAwsLcRs;
+#[cfg(all(
+    not(feature = "async-tls-rustls-ring"),
+    not(feature = "async-tls-rustls-aws-lc-rs"),
+    feature = "async-tls-native"
+))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::NativeTls;
+
+fn default_tls_backend() -> TlsBackend {
+    DEFAULT_TLS_BACKEND
 }
 
 #[cfg(feature = "async-tls-native")]
@@ -831,7 +825,7 @@ pub struct ClientBuilder {
     max_in_flight_per_host: Option<usize>,
     metrics_enabled: bool,
     otel_enabled: bool,
-    interceptors: Vec<Arc<dyn HttpInterceptor>>,
+    interceptors: Vec<Arc<dyn RequestInterceptor>>,
 }
 
 impl ClientBuilder {
@@ -1093,14 +1087,14 @@ impl ClientBuilder {
         self
     }
 
-    pub fn interceptor_arc(mut self, interceptor: Arc<dyn HttpInterceptor>) -> Self {
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn RequestInterceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
     pub fn interceptor<I>(self, interceptor: I) -> Self
     where
-        I: HttpInterceptor + 'static,
+        I: RequestInterceptor + 'static,
     {
         self.interceptor_arc(Arc::new(interceptor))
     }
@@ -1182,7 +1176,7 @@ pub struct Client {
     transport: TransportClient,
     request_limiters: Option<RequestLimiters>,
     metrics: HttpClientMetrics,
-    interceptors: Vec<Arc<dyn HttpInterceptor>>,
+    interceptors: Vec<Arc<dyn RequestInterceptor>>,
 }
 
 impl Client {
@@ -1214,7 +1208,7 @@ impl Client {
         self.request(Method::DELETE, path)
     }
 
-    pub fn metrics_snapshot(&self) -> HttpClientMetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> ClientMetricsSnapshot {
         self.metrics.snapshot()
     }
 

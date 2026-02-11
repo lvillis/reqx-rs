@@ -92,6 +92,7 @@ pub(crate) use crate::async_client::client;
 pub(crate) use crate::async_client::limiters;
 #[cfg(feature = "_async")]
 pub(crate) use crate::async_client::request;
+pub(crate) use crate::core::content_encoding;
 pub(crate) use crate::core::error;
 pub(crate) use crate::core::metrics;
 pub(crate) use crate::core::otel;
@@ -104,8 +105,8 @@ pub(crate) use crate::http::response;
 #[cfg(feature = "_async")]
 pub use crate::client::{Client, ClientBuilder};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
-pub use crate::metrics::HttpClientMetricsSnapshot;
-pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
+pub use crate::metrics::ClientMetricsSnapshot;
+pub use crate::policy::{RedirectPolicy, RequestContext, RequestInterceptor};
 pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
@@ -139,9 +140,9 @@ pub mod prelude {
     pub use crate::blocking;
     pub use crate::{
         AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
-        CircuitBreakerPolicy, Error, ErrorCode, HttpClientMetricsSnapshot, HttpInterceptor,
-        PartChecksumAlgorithm, PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
-        RateLimitPolicy, RedirectPolicy, RequestContext, Response, Result,
+        CircuitBreakerPolicy, ClientMetricsSnapshot, Error, ErrorCode, PartChecksumAlgorithm,
+        PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy,
+        RedirectPolicy, RequestContext, RequestInterceptor, Response, Result,
         ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
         RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
