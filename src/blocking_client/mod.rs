@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Uri};
 
 use crate::metrics::ClientMetrics;
-use crate::policy::{RedirectPolicy, RequestInterceptor};
+use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestInterceptor};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
@@ -140,6 +140,7 @@ struct RequestExecutionOptions {
     retry_policy: Option<RetryPolicy>,
     max_response_body_bytes: Option<usize>,
     redirect_policy: Option<RedirectPolicy>,
+    http_status_policy: Option<HttpStatusPolicy>,
 }
 
 enum RequestBody {

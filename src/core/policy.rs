@@ -42,6 +42,27 @@ impl Default for RedirectPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HttpStatusPolicy {
+    #[default]
+    Error,
+    Response,
+}
+
+impl HttpStatusPolicy {
+    pub const fn error() -> Self {
+        Self::Error
+    }
+
+    pub const fn response() -> Self {
+        Self::Response
+    }
+
+    pub const fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     method: Method,

@@ -1,4 +1,4 @@
-use http::Method;
+use http::{HeaderMap, Method};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,6 +197,7 @@ pub enum Error {
         status: u16,
         method: Method,
         uri: String,
+        headers: Box<HeaderMap>,
         body: String,
     },
     #[error("failed to decode response json: {source}; body={body}")]

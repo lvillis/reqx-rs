@@ -176,6 +176,52 @@ async fn async_error_code_contract_status_and_body_limit() {
     );
 }
 
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_http_status_error_carries_response_headers() {
+    use reqx::prelude::{Client, RetryPolicy};
+
+    let server = OneShotServer::start(
+        503,
+        vec![
+            ("retry-after".to_owned(), "3".to_owned()),
+            ("x-amz-request-id".to_owned(), "req-123".to_owned()),
+        ],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/case")
+        .send()
+        .await
+        .expect_err("request should return http status error");
+    match error {
+        Error::HttpStatus {
+            status, headers, ..
+        } => {
+            assert_eq!(status, 503);
+            assert_eq!(
+                headers
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+                Some("3")
+            );
+            assert_eq!(
+                headers
+                    .get("x-amz-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("req-123")
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_error_code_contract_status_and_body_limit() {
@@ -188,6 +234,161 @@ fn blocking_error_code_contract_status_and_body_limit() {
         ErrorCode::ResponseBodyTooLarge,
         "response_body_too_large",
     );
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_http_status_error_carries_response_headers() {
+    use reqx::blocking::Client;
+    use reqx::prelude::RetryPolicy;
+
+    let server = OneShotServer::start(
+        503,
+        vec![
+            ("retry-after".to_owned(), "3".to_owned()),
+            ("x-amz-request-id".to_owned(), "req-123".to_owned()),
+        ],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/case")
+        .send()
+        .expect_err("request should return http status error");
+    match error {
+        Error::HttpStatus {
+            status, headers, ..
+        } => {
+            assert_eq!(status, 503);
+            assert_eq!(
+                headers
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+                Some("3")
+            );
+            assert_eq!(
+                headers
+                    .get("x-amz-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("req-123")
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_send_with_status_returns_response_for_non_success() {
+    use reqx::prelude::{Client, RetryPolicy};
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send_with_status()
+        .await
+        .expect("non-success should be returned as response");
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(response.text_lossy(), "unavailable");
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_send_with_status_returns_response_for_non_success() {
+    use reqx::blocking::Client;
+    use reqx::prelude::RetryPolicy;
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send_with_status()
+        .expect("non-success should be returned as response");
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(response.text_lossy(), "unavailable");
+}
+
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_send_stream_with_status_returns_stream_for_non_success() {
+    use reqx::prelude::{Client, RetryPolicy};
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/case")
+        .send_stream_with_status()
+        .await
+        .expect("non-success should be returned as stream");
+    assert_eq!(stream.status().as_u16(), 503);
+    let response = stream
+        .into_response_limited(1024)
+        .await
+        .expect("stream should be readable");
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(response.text_lossy(), "unavailable");
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_send_stream_with_status_returns_stream_for_non_success() {
+    use reqx::blocking::Client;
+    use reqx::prelude::RetryPolicy;
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/case")
+        .send_stream_with_status()
+        .expect("non-success should be returned as stream");
+    assert_eq!(stream.status().as_u16(), 503);
+    let response = stream
+        .into_response_limited(1024)
+        .expect("stream should be readable");
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(response.text_lossy(), "unavailable");
 }
 
 #[cfg(all(feature = "_async", feature = "_blocking"))]

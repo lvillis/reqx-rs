@@ -106,7 +106,7 @@ pub(crate) use crate::http::response;
 pub use crate::client::{Client, ClientBuilder};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::ClientMetricsSnapshot;
-pub use crate::policy::{RedirectPolicy, RequestContext, RequestInterceptor};
+pub use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestContext, RequestInterceptor};
 pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
@@ -140,9 +140,9 @@ pub mod prelude {
     pub use crate::blocking;
     pub use crate::{
         AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
-        CircuitBreakerPolicy, ClientMetricsSnapshot, Error, ErrorCode, PartChecksumAlgorithm,
-        PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy,
-        RedirectPolicy, RequestContext, RequestInterceptor, Response, Result,
+        CircuitBreakerPolicy, ClientMetricsSnapshot, Error, ErrorCode, HttpStatusPolicy,
+        PartChecksumAlgorithm, PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
+        RateLimitPolicy, RedirectPolicy, RequestContext, RequestInterceptor, Response, Result,
         ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
         RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,

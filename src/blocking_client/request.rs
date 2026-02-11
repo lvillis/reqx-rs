@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
-use crate::policy::RedirectPolicy;
+use crate::policy::{HttpStatusPolicy, RedirectPolicy};
 use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
@@ -28,6 +28,7 @@ pub struct RequestBuilder<'a> {
     max_response_body_bytes: Option<usize>,
     retry_policy: Option<RetryPolicy>,
     redirect_policy: Option<RedirectPolicy>,
+    http_status_policy: Option<HttpStatusPolicy>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -44,6 +45,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: None,
             retry_policy: None,
             redirect_policy: None,
+            http_status_policy: None,
         }
     }
 
@@ -184,6 +186,11 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    pub fn http_status_policy(mut self, http_status_policy: HttpStatusPolicy) -> Self {
+        self.http_status_policy = Some(http_status_policy);
+        self
+    }
+
     pub fn send(self) -> crate::Result<Response> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
@@ -192,6 +199,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
+            http_status_policy: self.http_status_policy,
         };
         self.client.send_request(
             self.method,
@@ -210,6 +218,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
+            http_status_policy: self.http_status_policy,
         };
         self.client.send_request_stream(
             self.method,
@@ -245,5 +254,14 @@ impl<'a> RequestBuilder<'a> {
     {
         let response = self.send()?;
         response.json()
+    }
+
+    pub fn send_with_status(self) -> crate::Result<Response> {
+        self.http_status_policy(HttpStatusPolicy::Response).send()
+    }
+
+    pub fn send_stream_with_status(self) -> crate::Result<BlockingResponseStream> {
+        self.http_status_policy(HttpStatusPolicy::Response)
+            .send_stream()
     }
 }

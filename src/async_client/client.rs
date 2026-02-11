@@ -35,7 +35,7 @@ use crate::error::{Error, TimeoutPhase};
 use crate::limiters::{RequestLimiters, RequestPermits};
 use crate::metrics::{ClientMetrics, ClientMetricsSnapshot};
 use crate::otel::OtelTelemetry;
-use crate::policy::{RedirectPolicy, RequestContext, RequestInterceptor};
+use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestContext, RequestInterceptor};
 #[cfg(any(
     feature = "async-tls-native",
     feature = "async-tls-rustls-ring",
@@ -818,6 +818,7 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) max_response_body_bytes: Option<usize>,
     pub(crate) redirect_policy: Option<RedirectPolicy>,
+    pub(crate) http_status_policy: Option<HttpStatusPolicy>,
 }
 
 pub struct ClientBuilder {
@@ -1719,6 +1720,9 @@ impl Client {
         let redirect_policy = execution_options
             .redirect_policy
             .unwrap_or(self.redirect_policy);
+        let http_status_policy = execution_options
+            .http_status_policy
+            .unwrap_or(HttpStatusPolicy::Error);
         let mut max_attempts = if self
             .retry_eligibility
             .supports_retry(&method, &merged_headers)
@@ -1966,6 +1970,61 @@ impl Client {
             }
 
             if !status.is_success() {
+                self.run_response_interceptors(&context, status, &response_headers);
+                self.observe_server_throttle(
+                    status,
+                    &response_headers,
+                    rate_limit_host.as_deref(),
+                    retry_policy.backoff_for_retry(attempt),
+                );
+                let retry_decision = RetryDecision {
+                    attempt,
+                    max_attempts,
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
+                    status: Some(status),
+                    transport_error_kind: None,
+                    timeout_phase: None,
+                    response_body_read_error: false,
+                };
+                let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
+                    .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
+                let retry_error = Error::HttpStatus {
+                    status: status.as_u16(),
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
+                    headers: Box::new(response_headers.clone()),
+                    body: String::new(),
+                };
+                if self
+                    .schedule_retry(
+                        RetryContext {
+                            context: &context,
+                            retry_policy: &retry_policy,
+                            total_timeout,
+                            request_started_at,
+                            method: &current_method,
+                            redacted_uri: &current_redacted_uri,
+                            max_attempts,
+                        },
+                        &retry_decision,
+                        retry_delay,
+                        &mut attempt,
+                        &retry_error,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                if matches!(http_status_policy, HttpStatusPolicy::Response) {
+                    return Ok(ResponseStream::new(
+                        status,
+                        response_headers,
+                        response.into_body(),
+                        current_method.clone(),
+                        current_redacted_uri.clone(),
+                    ));
+                }
                 let response_body = match self
                     .read_response_body_with_retry(
                         response.into_body(),
@@ -1995,52 +2054,13 @@ impl Client {
                     &current_redacted_uri,
                     &context,
                 )?;
-                self.run_response_interceptors(&context, status, &response_headers);
-
                 let error = Error::HttpStatus {
                     status: status.as_u16(),
                     method: current_method.clone(),
                     uri: current_redacted_uri.clone(),
+                    headers: Box::new(response_headers.clone()),
                     body: truncate_body(&response_body),
                 };
-                self.observe_server_throttle(
-                    status,
-                    &response_headers,
-                    rate_limit_host.as_deref(),
-                    retry_policy.backoff_for_retry(attempt),
-                );
-                let retry_decision = RetryDecision {
-                    attempt,
-                    max_attempts,
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    status: Some(status),
-                    transport_error_kind: None,
-                    timeout_phase: None,
-                    response_body_read_error: false,
-                };
-                let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
-                    .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
-                if self
-                    .schedule_retry(
-                        RetryContext {
-                            context: &context,
-                            retry_policy: &retry_policy,
-                            total_timeout,
-                            request_started_at,
-                            method: &current_method,
-                            redacted_uri: &current_redacted_uri,
-                            max_attempts,
-                        },
-                        &retry_decision,
-                        retry_delay,
-                        &mut attempt,
-                        &error,
-                    )
-                    .await?
-                {
-                    continue;
-                }
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
@@ -2103,6 +2123,9 @@ impl Client {
         let redirect_policy = execution_options
             .redirect_policy
             .unwrap_or(self.redirect_policy);
+        let http_status_policy = execution_options
+            .http_status_policy
+            .unwrap_or(HttpStatusPolicy::Error);
         let mut max_attempts = if self
             .retry_eligibility
             .supports_retry(&method, &merged_headers)
@@ -2389,12 +2412,6 @@ impl Client {
             self.run_response_interceptors(&context, status, &response_headers);
 
             if !status.is_success() {
-                let error = Error::HttpStatus {
-                    status: status.as_u16(),
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    body: truncate_body(&response_body),
-                };
                 self.observe_server_throttle(
                     status,
                     &response_headers,
@@ -2413,6 +2430,13 @@ impl Client {
                 };
                 let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
                     .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
+                let retry_error = Error::HttpStatus {
+                    status: status.as_u16(),
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
+                    headers: Box::new(response_headers.clone()),
+                    body: String::new(),
+                };
                 if self
                     .schedule_retry(
                         RetryContext {
@@ -2427,12 +2451,22 @@ impl Client {
                         &retry_decision,
                         retry_delay,
                         &mut attempt,
-                        &error,
+                        &retry_error,
                     )
                     .await?
                 {
                     continue;
                 }
+                if matches!(http_status_policy, HttpStatusPolicy::Response) {
+                    return Ok(Response::new(status, response_headers, response_body));
+                }
+                let error = Error::HttpStatus {
+                    status: status.as_u16(),
+                    method: current_method.clone(),
+                    uri: current_redacted_uri.clone(),
+                    headers: Box::new(response_headers.clone()),
+                    body: truncate_body(&response_body),
+                };
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
