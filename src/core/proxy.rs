@@ -177,10 +177,15 @@ pub(crate) fn normalize_tunnel_target_uri(dst: Uri) -> Uri {
         return dst;
     }
 
-    let default_port = match dst.scheme_str() {
-        Some("https") => 443,
-        Some("http") => 80,
-        _ => return dst,
+    let Some(scheme) = dst.scheme_str() else {
+        return dst;
+    };
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        return dst;
     };
     let Some(host) = dst.host() else {
         return dst;

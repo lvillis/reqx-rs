@@ -14,8 +14,9 @@ use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
 use crate::util::{
-    append_query_pairs, bounded_retry_delay, ensure_accept_encoding_async, join_base_path,
-    parse_retry_after, redact_uri_for_logs, resolve_uri,
+    append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
+    join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
+    same_origin,
 };
 use crate::{AdvancedConfig, ClientProfile, StatusPolicy};
 
@@ -86,6 +87,55 @@ fn normalize_tunnel_target_uri_keeps_explicit_port() {
         normalized.to_string(),
         "https://api.example.com:9443/v1/users"
     );
+}
+
+#[test]
+fn normalize_tunnel_target_uri_handles_uppercase_scheme() {
+    let uri: http::Uri = "HTTPS://api.example.com/v1/users"
+        .parse()
+        .expect("uri should parse");
+    let normalized = normalize_tunnel_target_uri(uri);
+    assert_eq!(normalized.host(), Some("api.example.com"));
+    assert_eq!(normalized.port_u16(), Some(443));
+    assert!(
+        normalized
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    );
+}
+
+#[test]
+fn default_port_handles_uppercase_scheme() {
+    let https: http::Uri = "HTTPS://api.example.com/path"
+        .parse()
+        .expect("uri should parse");
+    let http: http::Uri = "HTTP://api.example.com/path"
+        .parse()
+        .expect("uri should parse");
+    assert_eq!(default_port(&https), Some(443));
+    assert_eq!(default_port(&http), Some(80));
+}
+
+#[test]
+fn rate_limit_bucket_key_uses_default_port_for_uppercase_scheme() {
+    let uri: http::Uri = "HTTPS://api.example.com/path"
+        .parse()
+        .expect("uri should parse");
+    assert_eq!(
+        rate_limit_bucket_key(&uri).as_deref(),
+        Some("api.example.com:443")
+    );
+}
+
+#[test]
+fn same_origin_handles_uppercase_scheme() {
+    let left: http::Uri = "HTTPS://api.example.com/path"
+        .parse()
+        .expect("left uri should parse");
+    let right: http::Uri = "https://api.example.com:443/other"
+        .parse()
+        .expect("right uri should parse");
+    assert!(same_origin(&left, &right));
 }
 
 #[test]

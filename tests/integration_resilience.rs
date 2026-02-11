@@ -667,6 +667,77 @@ async fn max_in_flight_per_host_limits_each_host_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_per_host_distinguishes_same_host_different_ports() {
+    let server_a = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok-a".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let server_b = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok-b".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+
+    let client = Client::builder(format!("http://{}", server_a.authority()))
+        .max_in_flight_per_host(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+    let server_b_url = format!("http://{}/host-b", server_b.authority());
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for idx in 0..4 {
+        let cloned = client.clone();
+        let path = if idx % 2 == 0 {
+            "/host-a".to_owned()
+        } else {
+            server_b_url.clone()
+        };
+        tasks.push(tokio::spawn(async move {
+            cloned
+                .get(path)
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+        }));
+    }
+
+    for task in tasks {
+        let status = task
+            .await
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(220),
+        "per-authority requests should still serialize per target: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(460),
+        "requests to different ports should not share one per-host limiter: {elapsed:?}"
+    );
+
+    assert_eq!(server_a.served_count(), 2);
+    assert_eq!(server_b.served_count(), 2);
+    assert_eq!(server_a.max_active(), 1);
+    assert_eq!(server_b.max_active(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn max_in_flight_per_host_applies_to_redirect_target_host() {
     let target = CountingServer::start(
         4,

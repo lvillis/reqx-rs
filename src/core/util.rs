@@ -353,10 +353,15 @@ pub(crate) fn redirect_location(headers: &HeaderMap) -> Option<String> {
 }
 
 pub(crate) fn default_port(uri: &Uri) -> Option<u16> {
-    uri.port_u16().or_else(|| match uri.scheme_str() {
-        Some("https") => Some(443),
-        Some("http") => Some(80),
-        _ => None,
+    uri.port_u16().or_else(|| {
+        let scheme = uri.scheme_str()?;
+        if scheme.eq_ignore_ascii_case("https") {
+            return Some(443);
+        }
+        if scheme.eq_ignore_ascii_case("http") {
+            return Some(80);
+        }
+        None
     })
 }
 

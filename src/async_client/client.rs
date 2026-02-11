@@ -1976,8 +1976,8 @@ impl Client {
             let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
-            let host = current_uri.host().map(|item| item.to_ascii_lowercase());
-            let _host_permit = match self.acquire_host_request_permit(host.as_deref()).await {
+            let host_key = rate_limit_bucket_key(&current_uri);
+            let _host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {
                 Ok(permit) => permit,
                 Err(error) => {
                     self.run_error_interceptors(&context, &error);
@@ -2406,8 +2406,8 @@ impl Client {
             let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
-            let host = current_uri.host().map(|item| item.to_ascii_lowercase());
-            let _host_permit = match self.acquire_host_request_permit(host.as_deref()).await {
+            let host_key = rate_limit_bucket_key(&current_uri);
+            let _host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {
                 Ok(permit) => permit,
                 Err(error) => {
                     self.run_error_interceptors(&context, &error);
