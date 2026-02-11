@@ -110,6 +110,43 @@ fn assert_error_contract(error: &Error, expected: ErrorCode, expected_code: &str
     assert_eq!(error.code().as_str(), expected_code);
 }
 
+#[test]
+fn error_display_does_not_include_response_body_payloads() {
+    let secret = "token=super-secret-value";
+    let status_error = Error::HttpStatus {
+        status: 503,
+        method: http::Method::GET,
+        uri: "https://example.com/private".to_owned(),
+        headers: Box::new(http::HeaderMap::new()),
+        body: secret.to_owned(),
+    };
+    let status_text = status_error.to_string();
+    assert!(
+        !status_text.contains(secret),
+        "http status display should not leak response body"
+    );
+    match status_error {
+        Error::HttpStatus { body, .. } => assert_eq!(body, secret),
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let source = serde_json::from_slice::<serde_json::Value>(b"{not-json")
+        .expect_err("invalid json should produce a decode error");
+    let decode_error = Error::DeserializeJson {
+        source,
+        body: secret.to_owned(),
+    };
+    let decode_text = decode_error.to_string();
+    assert!(
+        !decode_text.contains(secret),
+        "json decode display should not leak response body"
+    );
+    match decode_error {
+        Error::DeserializeJson { body, .. } => assert_eq!(body, secret),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
 #[derive(Clone)]
 struct CountingObserver {
     started: Arc<AtomicUsize>,

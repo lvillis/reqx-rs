@@ -195,7 +195,7 @@ pub enum Error {
         method: Method,
         uri: String,
     },
-    #[error("http status error {status} for {method} {uri}: {body}")]
+    #[error("http status error {status} for {method} {uri}")]
     HttpStatus {
         status: u16,
         method: Method,
@@ -203,7 +203,7 @@ pub enum Error {
         headers: Box<HeaderMap>,
         body: String,
     },
-    #[error("failed to decode response json: {source}; body={body}")]
+    #[error("failed to decode response json: {source}")]
     DeserializeJson {
         #[source]
         source: serde_json::Error,
