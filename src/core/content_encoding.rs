@@ -3,6 +3,7 @@ use std::io::{self, Read};
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_ENCODING;
+use http::{Method, StatusCode};
 
 #[derive(Debug)]
 pub(crate) enum DecodeContentEncodingError {
@@ -38,6 +39,26 @@ fn read_to_end_limited<R: Read>(
     }
 
     Ok(decoded)
+}
+
+pub(crate) fn should_decode_content_encoded_body(
+    method: &Method,
+    status: StatusCode,
+    body_len: usize,
+) -> bool {
+    if body_len == 0 {
+        return false;
+    }
+    if *method == Method::HEAD {
+        return false;
+    }
+    if status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+    {
+        return false;
+    }
+    true
 }
 
 pub(crate) fn decode_content_encoded_body_limited(

@@ -62,6 +62,7 @@ mod stream {
         DecodeContentEncodingError, ReadBodyError, decode_content_encoded_body_limited,
         read_all_body_limited,
     };
+    use crate::content_encoding::should_decode_content_encoded_body;
     use crate::error::Error;
     use crate::response::Response;
 
@@ -238,9 +239,14 @@ mod stream {
             let body = read_all_body_limited(body, max_bytes)
                 .await
                 .map_err(|error| map_read_body_error(error, &method, &uri, max_bytes))?;
-            let body = decode_content_encoded_body_limited(body, &headers, max_bytes)
-                .map_err(|error| map_decode_body_error(error, &method, &uri, max_bytes))?;
-            if headers.contains_key(super::CONTENT_ENCODING) {
+            let should_decode = should_decode_content_encoded_body(&method, status, body.len());
+            let body = if should_decode {
+                decode_content_encoded_body_limited(body, &headers, max_bytes)
+                    .map_err(|error| map_decode_body_error(error, &method, &uri, max_bytes))?
+            } else {
+                body
+            };
+            if should_decode && headers.contains_key(super::CONTENT_ENCODING) {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }
@@ -272,6 +278,7 @@ mod blocking_stream {
 
     use crate::content_encoding::{
         DecodeContentEncodingError, decode_content_encoded_body_limited,
+        should_decode_content_encoded_body,
     };
     use crate::error::{Error, TimeoutPhase};
     use crate::response::Response;
@@ -502,9 +509,14 @@ mod blocking_stream {
                 collected.extend_from_slice(&chunk[..read]);
             }
             let body = Bytes::from(collected);
-            let body = decode_content_encoded_body_limited(body, &headers, max_bytes)
-                .map_err(|error| map_decode_error(error, &method, &uri, max_bytes))?;
-            if headers.contains_key(super::CONTENT_ENCODING) {
+            let should_decode = should_decode_content_encoded_body(&method, status, body.len());
+            let body = if should_decode {
+                decode_content_encoded_body_limited(body, &headers, max_bytes)
+                    .map_err(|error| map_decode_error(error, &method, &uri, max_bytes))?
+            } else {
+                body
+            };
+            if should_decode && headers.contains_key(super::CONTENT_ENCODING) {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }

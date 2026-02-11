@@ -32,6 +32,7 @@ use crate::body::{
     read_all_body_limited,
 };
 use crate::config::{AdvancedConfig, ClientProfile};
+use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::execution::{
     effective_status_policy, http_status_error, select_base_url, status_retry_decision,
@@ -1487,10 +1488,14 @@ impl Client {
         body: Bytes,
         headers: &HeaderMap,
         max_response_body_bytes: usize,
-        method: &Method,
-        redacted_uri: &str,
+        status: http::StatusCode,
         context: &RequestContext,
     ) -> Result<Bytes, Error> {
+        let method = context.method();
+        let redacted_uri = context.uri();
+        if !should_decode_content_encoded_body(method, status, body.len()) {
+            return Ok(body);
+        }
         self.body_codec
             .decode_response_body_limited(
                 body,
@@ -1727,7 +1732,7 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_async(&mut merged_headers);
+        ensure_accept_encoding_async(&method, &mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
@@ -1787,7 +1792,7 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_async(&mut merged_headers);
+        ensure_accept_encoding_async(&method, &mut merged_headers);
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
@@ -2194,8 +2199,7 @@ impl Client {
                     response_body,
                     &response_headers,
                     max_response_body_bytes,
-                    &current_method,
-                    &current_redacted_uri,
+                    status,
                     &context,
                 )?;
                 let error = http_status_error(
@@ -2538,15 +2542,16 @@ impl Client {
                 Some(body) => body,
                 None => continue,
             };
+            let should_decode_response_body =
+                should_decode_content_encoded_body(&current_method, status, response_body.len());
             let response_body = self.decode_response_body_limited(
                 response_body,
                 &response_headers,
                 max_response_body_bytes,
-                &current_method,
-                &current_redacted_uri,
+                status,
                 &context,
             )?;
-            if response_headers.contains_key(CONTENT_ENCODING) {
+            if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
                 remove_content_encoding_headers(&mut response_headers);
             }
 

@@ -7,6 +7,7 @@ use flate2::write::GzEncoder;
 
 use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::client::Client;
+use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
 use crate::response::Response;
@@ -676,13 +677,52 @@ fn no_proxy_rule_matches_domain_and_subdomain() {
 #[test]
 fn ensure_accept_encoding_sets_default_when_absent() {
     let mut headers = http::HeaderMap::new();
-    ensure_accept_encoding_async(&mut headers);
+    ensure_accept_encoding_async(&http::Method::GET, &mut headers);
     assert_eq!(
         headers
             .get(http::header::ACCEPT_ENCODING)
             .and_then(|value| value.to_str().ok()),
         Some("gzip, br, deflate, zstd")
     );
+}
+
+#[test]
+fn ensure_accept_encoding_skips_default_for_head() {
+    let mut headers = http::HeaderMap::new();
+    ensure_accept_encoding_async(&http::Method::HEAD, &mut headers);
+    assert!(
+        headers.get(http::header::ACCEPT_ENCODING).is_none(),
+        "HEAD should not auto-negotiate content-encoding"
+    );
+}
+
+#[test]
+fn should_decode_content_encoded_body_only_when_body_semantics_allow() {
+    assert!(!should_decode_content_encoded_body(
+        &http::Method::HEAD,
+        http::StatusCode::OK,
+        32
+    ));
+    assert!(!should_decode_content_encoded_body(
+        &http::Method::GET,
+        http::StatusCode::NO_CONTENT,
+        32
+    ));
+    assert!(!should_decode_content_encoded_body(
+        &http::Method::GET,
+        http::StatusCode::NOT_MODIFIED,
+        32
+    ));
+    assert!(!should_decode_content_encoded_body(
+        &http::Method::GET,
+        http::StatusCode::OK,
+        0
+    ));
+    assert!(should_decode_content_encoded_body(
+        &http::Method::GET,
+        http::StatusCode::OK,
+        32
+    ));
 }
 
 #[test]

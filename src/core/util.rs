@@ -28,20 +28,23 @@ pub(crate) fn merge_headers(default_headers: &HeaderMap, request_headers: &Heade
     merged
 }
 
-fn ensure_accept_encoding(headers: &mut HeaderMap, value: &'static str) {
+fn ensure_accept_encoding(method: &Method, headers: &mut HeaderMap, value: &'static str) {
+    if *method == Method::HEAD {
+        return;
+    }
     if !headers.contains_key(ACCEPT_ENCODING) {
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(value));
     }
 }
 
 #[cfg(feature = "_async")]
-pub(crate) fn ensure_accept_encoding_async(headers: &mut HeaderMap) {
-    ensure_accept_encoding(headers, "gzip, br, deflate, zstd");
+pub(crate) fn ensure_accept_encoding_async(method: &Method, headers: &mut HeaderMap) {
+    ensure_accept_encoding(method, headers, "gzip, br, deflate, zstd");
 }
 
 #[cfg(feature = "_blocking")]
-pub(crate) fn ensure_accept_encoding_blocking(headers: &mut HeaderMap) {
-    ensure_accept_encoding(headers, "gzip, br, deflate, zstd");
+pub(crate) fn ensure_accept_encoding_blocking(method: &Method, headers: &mut HeaderMap) {
+    ensure_accept_encoding(method, headers, "gzip, br, deflate, zstd");
 }
 
 fn invalid_base_url_error(base_url: &str) -> Error {

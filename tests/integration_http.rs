@@ -602,6 +602,86 @@ async fn decodes_gzip_response_and_sets_accept_encoding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_empty_body_with_content_encoding_is_not_decoded() {
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "zstd")],
+        Vec::<u8>::new(),
+        Duration::ZERO,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .request(http::Method::HEAD, "/head-empty")
+        .send()
+        .await
+        .expect("head response should not attempt to decode empty body");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.body().is_empty());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("zstd")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(
+        requests[0].headers.get("accept-encoding"),
+        None,
+        "HEAD should not auto inject Accept-Encoding"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_stream_into_response_with_content_encoding_empty_body_succeeds() {
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "zstd")],
+        Vec::<u8>::new(),
+        Duration::ZERO,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .request(http::Method::HEAD, "/head-stream-empty")
+        .send_stream()
+        .await
+        .expect("head stream should succeed")
+        .into_response_limited(1024)
+        .await
+        .expect("empty head stream should not decode");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.body().is_empty());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("zstd")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(requests[0].headers.get("accept-encoding"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decoded_gzip_response_still_respects_max_body_limit() {
     let expanded = vec![b'a'; 16 * 1024];
     let body = gzip_bytes(&expanded);

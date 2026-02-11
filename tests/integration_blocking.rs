@@ -334,6 +334,76 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
 }
 
 #[test]
+fn blocking_head_empty_body_with_content_encoding_is_not_decoded() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "zstd")],
+        Vec::<u8>::new(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .request(http::Method::HEAD, "/v1/head-empty")
+        .send()
+        .expect("head response should not attempt to decode empty body");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.body().is_empty());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("zstd")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(requests[0].headers.get("accept-encoding"), None);
+}
+
+#[test]
+fn blocking_head_stream_into_response_with_content_encoding_empty_body_succeeds() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain"), ("Content-Encoding", "zstd")],
+        Vec::<u8>::new(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .request(http::Method::HEAD, "/v1/head-stream-empty")
+        .send_stream()
+        .expect("head stream should succeed")
+        .into_response_limited(1024)
+        .expect("empty head stream should not decode");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.body().is_empty());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("zstd")
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(requests[0].headers.get("accept-encoding"), None);
+}
+
+#[test]
 fn blocking_retries_idempotent_post_then_succeeds() {
     let server = MockServer::start(vec![
         MockResponse::new(
