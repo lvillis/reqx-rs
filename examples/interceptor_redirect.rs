@@ -1,13 +1,12 @@
 use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
-use reqx::prelude::{
-    Client, Error, RedirectPolicy, RequestContext, RequestInterceptor, RetryPolicy,
-};
+use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
+use reqx::{Interceptor, RequestContext};
 
 struct TraceInterceptor;
 
-impl RequestInterceptor for TraceInterceptor {
+impl Interceptor for TraceInterceptor {
     fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
         headers.insert(
             HeaderName::from_static("x-sdk-trace"),

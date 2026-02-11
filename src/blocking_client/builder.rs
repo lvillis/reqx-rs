@@ -7,7 +7,7 @@ use http::{HeaderMap, Uri};
 use crate::error::Error;
 use crate::metrics::ClientMetrics;
 use crate::otel::OtelTelemetry;
-use crate::policy::{RedirectPolicy, RequestInterceptor};
+use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
@@ -18,6 +18,9 @@ use crate::retry::{
 };
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{parse_header_name, parse_header_value, validate_base_url};
+use crate::{AdvancedConfig, ClientProfile};
+use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer};
+use crate::{PolicyBackoffSource, PrimaryEndpointSelector, StandardBodyCodec, SystemClock};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
 use super::{
@@ -50,12 +53,18 @@ impl ClientBuilder {
             per_host_rate_limit_policy: None,
             server_throttle_scope: ServerThrottleScope::Auto,
             redirect_policy: RedirectPolicy::none(),
+            default_status_policy: StatusPolicy::Error,
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
+            endpoint_selector: Arc::new(PrimaryEndpointSelector),
+            body_codec: Arc::new(StandardBodyCodec),
+            clock: Arc::new(SystemClock),
+            backoff_source: Arc::new(PolicyBackoffSource),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             metrics_enabled: false,
             otel_enabled: false,
             interceptors: Vec::new(),
+            observers: Vec::new(),
         }
     }
 
@@ -191,9 +200,62 @@ impl ClientBuilder {
         self
     }
 
+    pub fn default_status_policy(mut self, default_status_policy: StatusPolicy) -> Self {
+        self.default_status_policy = default_status_policy;
+        self
+    }
+
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
         self
+    }
+
+    pub fn endpoint_selector_arc(mut self, endpoint_selector: Arc<dyn EndpointSelector>) -> Self {
+        self.endpoint_selector = endpoint_selector;
+        self
+    }
+
+    pub fn endpoint_selector<S>(self, endpoint_selector: S) -> Self
+    where
+        S: EndpointSelector + 'static,
+    {
+        self.endpoint_selector_arc(Arc::new(endpoint_selector))
+    }
+
+    pub fn body_codec_arc(mut self, body_codec: Arc<dyn BodyCodec>) -> Self {
+        self.body_codec = body_codec;
+        self
+    }
+
+    pub fn body_codec<C>(self, body_codec: C) -> Self
+    where
+        C: BodyCodec + 'static,
+    {
+        self.body_codec_arc(Arc::new(body_codec))
+    }
+
+    pub fn clock_arc(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn clock<C>(self, clock: C) -> Self
+    where
+        C: Clock + 'static,
+    {
+        self.clock_arc(Arc::new(clock))
+    }
+
+    pub fn backoff_source_arc(mut self, backoff_source: Arc<dyn BackoffSource>) -> Self {
+        self.backoff_source = backoff_source;
+        self
+    }
+
+    pub fn backoff_source<B>(self, backoff_source: B) -> Self
+    where
+        B: BackoffSource + 'static,
+    {
+        self.backoff_source_arc(Arc::new(backoff_source))
     }
 
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
@@ -273,16 +335,61 @@ impl ClientBuilder {
         self
     }
 
-    pub fn interceptor_arc(mut self, interceptor: Arc<dyn RequestInterceptor>) -> Self {
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
     pub fn interceptor<I>(self, interceptor: I) -> Self
     where
-        I: RequestInterceptor + 'static,
+        I: Interceptor + 'static,
     {
         self.interceptor_arc(Arc::new(interceptor))
+    }
+
+    pub fn observer_arc(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    pub fn observer<O>(self, observer: O) -> Self
+    where
+        O: Observer + 'static,
+    {
+        self.observer_arc(Arc::new(observer))
+    }
+
+    pub fn profile(mut self, profile: ClientProfile) -> Self {
+        let defaults = profile.defaults();
+        self.request_timeout = defaults.request_timeout;
+        self.total_timeout = defaults.total_timeout;
+        self.retry_policy = defaults.retry_policy;
+        self.max_response_body_bytes = defaults.max_response_body_bytes;
+        self.redirect_policy = defaults.redirect_policy;
+        self.default_status_policy = defaults.status_policy;
+        self
+    }
+
+    pub fn advanced(mut self, config: AdvancedConfig) -> Self {
+        if let Some(request_timeout) = config.request_timeout {
+            self.request_timeout = request_timeout.max(Duration::from_millis(1));
+        }
+        if let Some(total_timeout) = config.total_timeout {
+            self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        }
+        if let Some(max_response_body_bytes) = config.max_response_body_bytes {
+            self.max_response_body_bytes = max_response_body_bytes.max(1);
+        }
+        if let Some(connect_timeout) = config.connect_timeout {
+            self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
+        }
+        if let Some(redirect_policy) = config.redirect_policy {
+            self.redirect_policy = redirect_policy;
+        }
+        if let Some(default_status_policy) = config.default_status_policy {
+            self.default_status_policy = default_status_policy;
+        }
+        self
     }
 
     pub fn build(self) -> crate::Result<Client> {
@@ -358,15 +465,21 @@ impl ClientBuilder {
             .map(Arc::new),
             server_throttle_scope: self.server_throttle_scope,
             redirect_policy: self.redirect_policy,
+            default_status_policy: self.default_status_policy,
             tls_backend: self.tls_backend,
             transport: TransportAgents {
                 direct,
                 proxy: proxied,
             },
             proxy_config,
+            endpoint_selector: self.endpoint_selector,
+            body_codec: self.body_codec,
+            clock: self.clock,
+            backoff_source: self.backoff_source,
             connect_timeout: self.connect_timeout,
             metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
+            observers: self.observers,
         })
     }
 }

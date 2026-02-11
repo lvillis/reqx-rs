@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::Client;
-use reqx::prelude::{
-    CircuitBreakerPolicy, Error, RateLimitPolicy, RedirectPolicy, RequestContext,
-    RequestInterceptor, RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase,
-    TlsRootStore,
+use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
+use reqx::{
+    CircuitBreakerPolicy, Interceptor, RateLimitPolicy, RequestContext, RetryBudgetPolicy,
+    ServerThrottleScope, TimeoutPhase,
 };
 use serde_json::Value;
 
@@ -1024,7 +1024,7 @@ struct BlockingHeaderInterceptor {
     error_hits: Arc<AtomicUsize>,
 }
 
-impl RequestInterceptor for BlockingHeaderInterceptor {
+impl Interceptor for BlockingHeaderInterceptor {
     fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
         self.request_hits.fetch_add(1, Ordering::SeqCst);
         headers.insert(

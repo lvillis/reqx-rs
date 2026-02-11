@@ -16,6 +16,7 @@ use crate::util::{
     append_query_pairs, bounded_retry_delay, ensure_accept_encoding_async, join_base_path,
     parse_retry_after, redact_uri_for_logs, resolve_uri,
 };
+use crate::{AdvancedConfig, ClientProfile, StatusPolicy};
 
 #[test]
 fn join_base_path_handles_slashes() {
@@ -540,6 +541,22 @@ fn build_rejects_base_url_with_surrounding_whitespace() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn client_profile_and_advanced_config_compose() {
+    let client = Client::builder("https://api.example.com")
+        .profile(ClientProfile::LowLatency)
+        .advanced(
+            AdvancedConfig::default()
+                .with_request_timeout(Duration::from_secs(4))
+                .with_total_timeout(Duration::from_secs(9))
+                .with_max_response_body_bytes(16 * 1024)
+                .with_default_status_policy(StatusPolicy::Response),
+        )
+        .build()
+        .expect("client should build with profile and advanced config");
+    assert_eq!(client.default_status_policy(), StatusPolicy::Response);
 }
 
 #[test]

@@ -166,6 +166,10 @@ name = "request_overrides"
 required-features = ["_async"]
 
 [[example]]
+name = "profile_and_observer"
+required-features = ["_async"]
+
+[[example]]
 name = "resilience_controls"
 required-features = ["_async"]
 

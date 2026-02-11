@@ -2,8 +2,10 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqx::prelude::{Error, ErrorCode};
 
@@ -108,6 +110,27 @@ fn assert_error_contract(error: &Error, expected: ErrorCode, expected_code: &str
     assert_eq!(error.code().as_str(), expected_code);
 }
 
+#[derive(Clone)]
+struct CountingObserver {
+    started: Arc<AtomicUsize>,
+    retries: Arc<AtomicUsize>,
+}
+
+impl reqx::Observer for CountingObserver {
+    fn on_request_start(&self, _context: &reqx::RequestContext) {
+        self.started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_retry_scheduled(
+        &self,
+        _context: &reqx::RequestContext,
+        _decision: &reqx::RetryDecision,
+        _delay: Duration,
+    ) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(feature = "_async")]
 async fn async_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize) -> Error {
     use reqx::prelude::{Client, RetryPolicy};
@@ -200,6 +223,12 @@ async fn async_http_status_error_carries_response_headers() {
         .send()
         .await
         .expect_err("request should return http status error");
+    assert_eq!(error.status_code(), Some(503));
+    assert_eq!(error.request_id(), Some("req-123"));
+    assert_eq!(
+        error.retry_after(SystemTime::UNIX_EPOCH),
+        Some(Duration::from_secs(3))
+    );
     match error {
         Error::HttpStatus {
             status, headers, ..
@@ -260,6 +289,12 @@ fn blocking_http_status_error_carries_response_headers() {
         .get("/case")
         .send()
         .expect_err("request should return http status error");
+    assert_eq!(error.status_code(), Some(503));
+    assert_eq!(error.request_id(), Some("req-123"));
+    assert_eq!(
+        error.retry_after(SystemTime::UNIX_EPOCH),
+        Some(Duration::from_secs(3))
+    );
     match error {
         Error::HttpStatus {
             status, headers, ..
@@ -307,6 +342,31 @@ async fn async_send_with_status_returns_response_for_non_success() {
     assert_eq!(response.text_lossy(), "unavailable");
 }
 
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_client_default_status_policy_response_returns_non_success() {
+    use reqx::StatusPolicy;
+    use reqx::prelude::{Client, RetryPolicy};
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .default_status_policy(StatusPolicy::Response)
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send()
+        .await
+        .expect("non-success should be returned as response by default");
+    assert_eq!(response.status().as_u16(), 503);
+}
+
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_send_with_status_returns_response_for_non_success() {
@@ -330,6 +390,31 @@ fn blocking_send_with_status_returns_response_for_non_success() {
         .expect("non-success should be returned as response");
     assert_eq!(response.status().as_u16(), 503);
     assert_eq!(response.text_lossy(), "unavailable");
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_client_default_status_policy_response_returns_non_success() {
+    use reqx::StatusPolicy;
+    use reqx::blocking::Client;
+    use reqx::prelude::RetryPolicy;
+
+    let server = OneShotServer::start(
+        503,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"unavailable".to_vec(),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .default_status_policy(StatusPolicy::Response)
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send()
+        .expect("non-success should be returned as response by default");
+    assert_eq!(response.status().as_u16(), 503);
 }
 
 #[cfg(feature = "_async")]
@@ -362,6 +447,64 @@ async fn async_send_stream_with_status_returns_stream_for_non_success() {
     assert_eq!(response.text_lossy(), "unavailable");
 }
 
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_endpoint_selector_can_override_base_url() {
+    use reqx::RoundRobinEndpointSelector;
+    use reqx::prelude::Client;
+
+    let server = OneShotServer::start(
+        200,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"ok".to_vec(),
+    );
+    let selector = RoundRobinEndpointSelector::new([server.base_url.clone()]);
+    let client = Client::builder("http://invalid.local")
+        .endpoint_selector(selector)
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send()
+        .await
+        .expect("request should use selector endpoint");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+}
+
+#[cfg(feature = "_async")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_observer_receives_request_start_event() {
+    use reqx::prelude::{Client, RetryPolicy};
+
+    let server = OneShotServer::start(
+        200,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"ok".to_vec(),
+    );
+    let started = Arc::new(AtomicUsize::new(0));
+    let retries = Arc::new(AtomicUsize::new(0));
+    let observer = CountingObserver {
+        started: Arc::clone(&started),
+        retries: Arc::clone(&retries),
+    };
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    assert_eq!(retries.load(Ordering::Relaxed), 0);
+}
+
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_send_stream_with_status_returns_stream_for_non_success() {
@@ -389,6 +532,60 @@ fn blocking_send_stream_with_status_returns_stream_for_non_success() {
         .expect("stream should be readable");
     assert_eq!(response.status().as_u16(), 503);
     assert_eq!(response.text_lossy(), "unavailable");
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_endpoint_selector_can_override_base_url() {
+    use reqx::RoundRobinEndpointSelector;
+    use reqx::blocking::Client;
+
+    let server = OneShotServer::start(
+        200,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"ok".to_vec(),
+    );
+    let selector = RoundRobinEndpointSelector::new([server.base_url.clone()]);
+    let client = Client::builder("http://invalid.local")
+        .endpoint_selector(selector)
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/case")
+        .send()
+        .expect("request should use selector endpoint");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_observer_receives_request_start_event() {
+    use reqx::blocking::Client;
+    use reqx::prelude::RetryPolicy;
+
+    let server = OneShotServer::start(
+        200,
+        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        b"ok".to_vec(),
+    );
+    let started = Arc::new(AtomicUsize::new(0));
+    let retries = Arc::new(AtomicUsize::new(0));
+    let observer = CountingObserver {
+        started: Arc::clone(&started),
+        retries: Arc::clone(&retries),
+    };
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let response = client.get("/case").send().expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    assert_eq!(retries.load(Ordering::Relaxed), 0);
 }
 
 #[cfg(all(feature = "_async", feature = "_blocking"))]

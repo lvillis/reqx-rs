@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use reqx::prelude::{Client, Error, RetryPolicy, TimeoutPhase};
+use reqx::TimeoutPhase;
+use reqx::prelude::{Client, Error, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

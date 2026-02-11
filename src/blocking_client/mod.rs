@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Uri};
 
+use crate::extensions::{BackoffSource, BodyCodec, Clock, EndpointSelector};
 use crate::metrics::ClientMetrics;
-use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestInterceptor};
+use crate::observe::Observer;
+use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
@@ -140,7 +142,7 @@ struct RequestExecutionOptions {
     retry_policy: Option<RetryPolicy>,
     max_response_body_bytes: Option<usize>,
     redirect_policy: Option<RedirectPolicy>,
-    http_status_policy: Option<HttpStatusPolicy>,
+    status_policy: Option<StatusPolicy>,
 }
 
 enum RequestBody {
@@ -170,12 +172,18 @@ pub struct ClientBuilder {
     per_host_rate_limit_policy: Option<RateLimitPolicy>,
     server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
+    default_status_policy: StatusPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
+    endpoint_selector: Arc<dyn EndpointSelector>,
+    body_codec: Arc<dyn BodyCodec>,
+    clock: Arc<dyn Clock>,
+    backoff_source: Arc<dyn BackoffSource>,
     client_name: String,
     metrics_enabled: bool,
     otel_enabled: bool,
-    interceptors: Vec<Arc<dyn RequestInterceptor>>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    observers: Vec<Arc<dyn Observer>>,
 }
 
 pub struct Client {
@@ -192,10 +200,16 @@ pub struct Client {
     rate_limiter: Option<Arc<RateLimiter>>,
     server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
+    default_status_policy: StatusPolicy,
     tls_backend: TlsBackend,
     transport: transport::TransportAgents,
     proxy_config: Option<ProxyConfig>,
+    endpoint_selector: Arc<dyn EndpointSelector>,
+    body_codec: Arc<dyn BodyCodec>,
+    clock: Arc<dyn Clock>,
+    backoff_source: Arc<dyn BackoffSource>,
     connect_timeout: Duration,
     metrics: ClientMetrics,
-    interceptors: Vec<Arc<dyn RequestInterceptor>>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    observers: Vec<Arc<dyn Observer>>,
 }

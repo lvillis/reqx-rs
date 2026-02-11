@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use reqx::prelude::{Client, RetryClassifier, RetryDecision, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
+use reqx::{RetryClassifier, RetryDecision};
 
 struct RetryOn429Only;
 

@@ -15,6 +15,15 @@
 
 It focuses on SDK transport concerns: retries, timeout phases, idempotency, proxy routing, structured errors, and metrics.
 
+## For SDK Authors
+
+- Start with a profile: `ClientProfile::StandardSdk`, `ClientProfile::LowLatency`, or `ClientProfile::HighThroughput`.
+- Fine-tune with `AdvancedConfig` only when required.
+- Keep strict behavior with `StatusPolicy::Error` (default), or opt into response-first mode with
+  `StatusPolicy::Response`.
+- For multi-endpoint SDKs, plug in an `EndpointSelector` (for example `RoundRobinEndpointSelector`).
+- Hook transport events through `Observer` for retries and server-throttle telemetry.
+
 ## Install
 
 ```bash
@@ -125,9 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Core Capabilities
 
 - global defaults + per-request overrides
+- profile presets (`ClientProfile`) + explicit overrides (`AdvancedConfig`)
 - idempotency-aware retries
 - retry budget + circuit breaker + adaptive concurrency controls
 - global/per-host rate limiting with `429 Retry-After` backpressure
+- request-level and client-level status handling (`StatusPolicy`)
 - bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
 - separate connect timeout (`connect_timeout(...)`)
@@ -136,10 +147,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - explicit buffered conversion (`send()`, `into_response_limited`, `into_json_limited`) decodes
   `gzip`, `br`, `deflate`, `zstd` for both async and blocking
 - proxy support with auth and `no_proxy`
-- interceptor hooks for SDK concerns (`RequestInterceptor`)
+- interceptor hooks for SDK concerns (`Interceptor`)
 - response body size limit
 - structured error variants + machine error codes
+- stable status-error metadata helpers: `status_code()`, `response_headers()`, `retry_after()`, `request_id()`
 - metrics snapshot for retries, latency, status and error buckets
+- observer hooks (`Observer`) for request-start, retry scheduling, and server throttling
 
 ## Examples
 
@@ -147,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `cargo run --example basic_json`
 - `cargo run --example request_helpers`
 - `cargo run --example request_overrides`
+- `cargo run --example profile_and_observer`
 - `cargo run --example error_handling`
 - `cargo run --example metrics_snapshot`
 - `cargo run --example streaming`
@@ -159,6 +173,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `cargo run --example custom_ca_mtls`
 - `cargo run --example interceptor_redirect`
 - `cargo run --example blocking_basic --no-default-features -F blocking-tls-rustls-ring`
+
+## Release Checklist
+
+- `just ci`
+- `just feature-matrix`
+- `just docsrs-check`
+- `just release-check`
 
 ## Error Model
 

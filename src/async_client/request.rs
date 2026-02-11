@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::body::{RequestBody, stream_req_body};
 use crate::client::{Client, RequestExecutionOptions};
-use crate::policy::{HttpStatusPolicy, RedirectPolicy};
+use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
 
@@ -30,7 +30,7 @@ pub struct RequestBuilder<'a> {
     max_response_body_bytes: Option<usize>,
     retry_policy: Option<RetryPolicy>,
     redirect_policy: Option<RedirectPolicy>,
-    http_status_policy: Option<HttpStatusPolicy>,
+    status_policy: Option<StatusPolicy>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -47,7 +47,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: None,
             retry_policy: None,
             redirect_policy: None,
-            http_status_policy: None,
+            status_policy: None,
         }
     }
 
@@ -196,9 +196,17 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn http_status_policy(mut self, http_status_policy: HttpStatusPolicy) -> Self {
-        self.http_status_policy = Some(http_status_policy);
+    pub fn status_policy(mut self, status_policy: StatusPolicy) -> Self {
+        self.status_policy = Some(status_policy);
         self
+    }
+
+    pub fn response_mode(self) -> Self {
+        self.status_policy(StatusPolicy::Response)
+    }
+
+    pub fn strict_mode(self) -> Self {
+        self.status_policy(StatusPolicy::Error)
     }
 
     pub async fn send(self) -> crate::Result<crate::response::Response> {
@@ -209,7 +217,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
-            http_status_policy: self.http_status_policy,
+            status_policy: self.status_policy,
         };
         self.client
             .send_request(
@@ -230,7 +238,7 @@ impl<'a> RequestBuilder<'a> {
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
-            http_status_policy: self.http_status_policy,
+            status_policy: self.status_policy,
         };
         self.client
             .send_request_stream(
@@ -273,13 +281,11 @@ impl<'a> RequestBuilder<'a> {
     }
 
     pub async fn send_with_status(self) -> crate::Result<crate::response::Response> {
-        self.http_status_policy(HttpStatusPolicy::Response)
-            .send()
-            .await
+        self.status_policy(StatusPolicy::Response).send().await
     }
 
     pub async fn send_stream_with_status(self) -> crate::Result<crate::response::ResponseStream> {
-        self.http_status_policy(HttpStatusPolicy::Response)
+        self.status_policy(StatusPolicy::Response)
             .send_stream()
             .await
     }

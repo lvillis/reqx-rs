@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-use reqx::prelude::{
-    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Client, RetryBudgetPolicy, RetryPolicy,
-    TimeoutPhase, TransportErrorKind,
+use reqx::prelude::{Client, RetryPolicy};
+use reqx::{
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy, TimeoutPhase,
+    TransportErrorKind,
 };
 
 #[tokio::main]

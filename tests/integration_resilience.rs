@@ -9,10 +9,8 @@ use std::time::{Duration, Instant};
 
 use http::Uri;
 use http_body_util::BodyExt;
-use reqx::prelude::{
-    CircuitBreakerPolicy, Client, Error, RetryBudgetPolicy, RetryClassifier, RetryDecision,
-    RetryPolicy,
-};
+use reqx::prelude::{Client, Error, RetryPolicy};
+use reqx::{CircuitBreakerPolicy, RetryBudgetPolicy, RetryClassifier, RetryDecision};
 use tokio::io::sink;
 
 #[derive(Clone)]

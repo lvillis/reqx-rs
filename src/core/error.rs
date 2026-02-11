@@ -1,4 +1,7 @@
 use http::{HeaderMap, Method};
+use std::time::{Duration, SystemTime};
+
+use crate::util::parse_retry_after;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -298,5 +301,33 @@ impl Error {
             Self::RedirectLimitExceeded { .. } => ErrorCode::RedirectLimitExceeded,
             Self::RedirectBodyNotReplayable { .. } => ErrorCode::RedirectBodyNotReplayable,
         }
+    }
+
+    pub const fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::HttpStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    pub const fn response_headers(&self) -> Option<&HeaderMap> {
+        match self {
+            Self::HttpStatus { headers, .. } => Some(headers),
+            _ => None,
+        }
+    }
+
+    pub fn retry_after(&self, now: SystemTime) -> Option<Duration> {
+        let headers = self.response_headers()?;
+        parse_retry_after(headers, now)
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        let headers = self.response_headers()?;
+        headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-amz-request-id"))
+            .or_else(|| headers.get("x-amz-id-2"))
+            .and_then(|value| value.to_str().ok())
     }
 }

@@ -13,10 +13,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
-use reqx::prelude::{
-    Client, Error, RateLimitPolicy, RedirectPolicy, RequestContext, RequestInterceptor,
-    RetryPolicy, ServerThrottleScope, TimeoutPhase,
-};
+use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
+use reqx::{Interceptor, RateLimitPolicy, RequestContext, ServerThrottleScope, TimeoutPhase};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -1335,7 +1333,7 @@ struct HeaderInjectingInterceptor {
     error_hits: Arc<AtomicUsize>,
 }
 
-impl RequestInterceptor for HeaderInjectingInterceptor {
+impl Interceptor for HeaderInjectingInterceptor {
     fn on_request(&self, _context: &RequestContext, headers: &mut http::HeaderMap) {
         self.request_hits.fetch_add(1, Ordering::SeqCst);
         headers.insert(

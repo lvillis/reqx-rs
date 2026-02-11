@@ -43,13 +43,13 @@ impl Default for RedirectPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HttpStatusPolicy {
+pub enum StatusPolicy {
     #[default]
     Error,
     Response,
 }
 
-impl HttpStatusPolicy {
+impl StatusPolicy {
     pub const fn error() -> Self {
         Self::Error
     }
@@ -110,7 +110,7 @@ impl RequestContext {
     }
 }
 
-pub trait RequestInterceptor: Send + Sync {
+pub trait Interceptor: Send + Sync {
     fn on_request(&self, _context: &RequestContext, _headers: &mut HeaderMap) {}
 
     fn on_response(&self, _context: &RequestContext, _status: StatusCode, _headers: &HeaderMap) {}

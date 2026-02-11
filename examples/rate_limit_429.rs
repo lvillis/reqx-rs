@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use reqx::prelude::{Client, RateLimitPolicy, RetryPolicy};
+use reqx::RateLimitPolicy;
+use reqx::prelude::{Client, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

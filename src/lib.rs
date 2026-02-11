@@ -92,9 +92,13 @@ pub(crate) use crate::async_client::client;
 pub(crate) use crate::async_client::limiters;
 #[cfg(feature = "_async")]
 pub(crate) use crate::async_client::request;
+pub(crate) use crate::core::config;
 pub(crate) use crate::core::content_encoding;
 pub(crate) use crate::core::error;
+pub(crate) use crate::core::execution;
+pub(crate) use crate::core::extensions;
 pub(crate) use crate::core::metrics;
+pub(crate) use crate::core::observe;
 pub(crate) use crate::core::otel;
 pub(crate) use crate::core::policy;
 pub(crate) use crate::core::proxy;
@@ -104,9 +108,15 @@ pub(crate) use crate::http::response;
 
 #[cfg(feature = "_async")]
 pub use crate::client::{Client, ClientBuilder};
+pub use crate::config::{AdvancedConfig, ClientProfile};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
-pub use crate::metrics::ClientMetricsSnapshot;
-pub use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestContext, RequestInterceptor};
+pub use crate::extensions::{
+    BackoffSource, BodyCodec, Clock, EndpointSelector, PolicyBackoffSource,
+    PrimaryEndpointSelector, RoundRobinEndpointSelector, StandardBodyCodec, SystemClock,
+};
+pub use crate::metrics::MetricsSnapshot;
+pub use crate::observe::Observer;
+pub use crate::policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy};
 pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
@@ -136,20 +146,35 @@ pub mod blocking {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub mod prelude {
-    #[cfg(feature = "_blocking")]
-    pub use crate::blocking;
-    pub use crate::{
-        AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
-        CircuitBreakerPolicy, ClientMetricsSnapshot, Error, ErrorCode, HttpStatusPolicy,
-        PartChecksumAlgorithm, PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
-        RateLimitPolicy, RedirectPolicy, RequestContext, RequestInterceptor, Response, Result,
-        ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
-        ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
-        RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
-        TlsRootStore, TransportErrorKind, UploadedPart,
-    };
-    #[cfg(feature = "_async")]
-    pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader, Client, ResponseStream};
+    pub mod sdk {
+        #[cfg(feature = "_blocking")]
+        pub use crate::blocking;
+        #[cfg(feature = "_async")]
+        pub use crate::{Client, ResponseStream};
+        pub use crate::{
+            Error, ErrorCode, RedirectPolicy, Response, Result, RetryPolicy, StatusPolicy,
+            TlsBackend, TlsRootStore,
+        };
+    }
+
+    pub mod advanced {
+        pub use crate::{
+            AdaptiveConcurrencyPolicy, AdvancedConfig, BackoffSource,
+            BlockingResumableUploadBackend, BlockingResumableUploader, BodyCodec,
+            CircuitBreakerPolicy, ClientProfile, Clock, EndpointSelector, Interceptor,
+            MetricsSnapshot, Observer, PartChecksumAlgorithm, PermissiveRetryEligibility,
+            PolicyBackoffSource, PrimaryEndpointSelector, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
+            RateLimitPolicy, RequestContext, ResumableUploadCheckpoint, ResumableUploadError,
+            ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
+            RetryDecision, RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope,
+            StandardBodyCodec, StrictRetryEligibility, SystemClock, TimeoutPhase,
+            TransportErrorKind, UploadedPart,
+        };
+        #[cfg(feature = "_async")]
+        pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader};
+    }
+
+    pub use sdk::*;
 }
 
 #[cfg(all(test, feature = "_async"))]

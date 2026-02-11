@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue};
@@ -28,14 +28,24 @@ use tracing::{debug, info_span, warn};
 use hyper_rustls::HttpsConnectorBuilder;
 
 use crate::body::{
-    DecodeContentEncodingError, ReadBodyError, ReqBody, RequestBody, buffered_req_body,
-    build_http_request, decode_content_encoded_body_limited, empty_req_body, read_all_body_limited,
+    ReadBodyError, ReqBody, RequestBody, buffered_req_body, build_http_request, empty_req_body,
+    read_all_body_limited,
 };
+use crate::config::{AdvancedConfig, ClientProfile};
 use crate::error::{Error, TimeoutPhase};
+use crate::execution::{
+    effective_status_policy, http_status_error, select_base_url, status_retry_decision,
+    status_retry_delay,
+};
+use crate::extensions::{
+    BackoffSource, BodyCodec, Clock, EndpointSelector, PolicyBackoffSource,
+    PrimaryEndpointSelector, StandardBodyCodec, SystemClock,
+};
 use crate::limiters::{RequestLimiters, RequestPermits};
-use crate::metrics::{ClientMetrics, ClientMetricsSnapshot};
+use crate::metrics::{ClientMetrics, MetricsSnapshot};
+use crate::observe::Observer;
 use crate::otel::OtelTelemetry;
-use crate::policy::{HttpStatusPolicy, RedirectPolicy, RequestContext, RequestInterceptor};
+use crate::policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy};
 #[cfg(any(
     feature = "async-tls-native",
     feature = "async-tls-rustls-ring",
@@ -61,7 +71,7 @@ use crate::tls::{
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, is_redirect_status, lock_unpoisoned, merge_headers,
-    parse_header_name, parse_header_value, parse_retry_after, phase_timeout, rate_limit_bucket_key,
+    parse_header_name, parse_header_value, phase_timeout, rate_limit_bucket_key,
     redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, resolve_uri,
     same_origin, sanitize_headers_for_redirect, truncate_body, validate_base_url,
 };
@@ -402,39 +412,6 @@ struct ReadBodyRetryContext<'a> {
     retry_policy: &'a RetryPolicy,
     max_attempts: usize,
     attempt: &'a mut usize,
-}
-
-fn decode_content_encoding_error(
-    encoding: String,
-    message: String,
-    method: &Method,
-    uri: &str,
-) -> Error {
-    Error::DecodeContentEncoding {
-        encoding,
-        message,
-        method: method.clone(),
-        uri: uri.to_owned(),
-    }
-}
-
-fn decode_response_body_error(
-    error: DecodeContentEncodingError,
-    max_bytes: usize,
-    method: &Method,
-    uri: &str,
-) -> Error {
-    match error {
-        DecodeContentEncodingError::Decode { encoding, message } => {
-            decode_content_encoding_error(encoding, message, method, uri)
-        }
-        DecodeContentEncodingError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
-            limit_bytes: max_bytes,
-            actual_bytes,
-            method: method.clone(),
-            uri: uri.to_owned(),
-        },
-    }
 }
 
 fn remove_content_encoding_headers(headers: &mut HeaderMap) {
@@ -818,7 +795,7 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) retry_policy: Option<RetryPolicy>,
     pub(crate) max_response_body_bytes: Option<usize>,
     pub(crate) redirect_policy: Option<RedirectPolicy>,
-    pub(crate) http_status_policy: Option<HttpStatusPolicy>,
+    pub(crate) status_policy: Option<StatusPolicy>,
 }
 
 pub struct ClientBuilder {
@@ -843,14 +820,20 @@ pub struct ClientBuilder {
     per_host_rate_limit_policy: Option<RateLimitPolicy>,
     server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
+    default_status_policy: StatusPolicy,
     tls_backend: TlsBackend,
     tls_options: TlsOptions,
+    endpoint_selector: Arc<dyn EndpointSelector>,
+    body_codec: Arc<dyn BodyCodec>,
+    clock: Arc<dyn Clock>,
+    backoff_source: Arc<dyn BackoffSource>,
     client_name: String,
     max_in_flight: Option<usize>,
     max_in_flight_per_host: Option<usize>,
     metrics_enabled: bool,
     otel_enabled: bool,
-    interceptors: Vec<Arc<dyn RequestInterceptor>>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    observers: Vec<Arc<dyn Observer>>,
 }
 
 impl ClientBuilder {
@@ -877,14 +860,20 @@ impl ClientBuilder {
             per_host_rate_limit_policy: None,
             server_throttle_scope: ServerThrottleScope::Auto,
             redirect_policy: RedirectPolicy::none(),
+            default_status_policy: StatusPolicy::Error,
             tls_backend: default_tls_backend(),
             tls_options: TlsOptions::default(),
+            endpoint_selector: Arc::new(PrimaryEndpointSelector),
+            body_codec: Arc::new(StandardBodyCodec),
+            clock: Arc::new(SystemClock),
+            backoff_source: Arc::new(PolicyBackoffSource),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             max_in_flight: None,
             max_in_flight_per_host: None,
             metrics_enabled: false,
             otel_enabled: false,
             interceptors: Vec::new(),
+            observers: Vec::new(),
         }
     }
 
@@ -1020,9 +1009,62 @@ impl ClientBuilder {
         self
     }
 
+    pub fn default_status_policy(mut self, default_status_policy: StatusPolicy) -> Self {
+        self.default_status_policy = default_status_policy;
+        self
+    }
+
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
         self
+    }
+
+    pub fn endpoint_selector_arc(mut self, endpoint_selector: Arc<dyn EndpointSelector>) -> Self {
+        self.endpoint_selector = endpoint_selector;
+        self
+    }
+
+    pub fn endpoint_selector<S>(self, endpoint_selector: S) -> Self
+    where
+        S: EndpointSelector + 'static,
+    {
+        self.endpoint_selector_arc(Arc::new(endpoint_selector))
+    }
+
+    pub fn body_codec_arc(mut self, body_codec: Arc<dyn BodyCodec>) -> Self {
+        self.body_codec = body_codec;
+        self
+    }
+
+    pub fn body_codec<C>(self, body_codec: C) -> Self
+    where
+        C: BodyCodec + 'static,
+    {
+        self.body_codec_arc(Arc::new(body_codec))
+    }
+
+    pub fn clock_arc(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn clock<C>(self, clock: C) -> Self
+    where
+        C: Clock + 'static,
+    {
+        self.clock_arc(Arc::new(clock))
+    }
+
+    pub fn backoff_source_arc(mut self, backoff_source: Arc<dyn BackoffSource>) -> Self {
+        self.backoff_source = backoff_source;
+        self
+    }
+
+    pub fn backoff_source<B>(self, backoff_source: B) -> Self
+    where
+        B: BackoffSource + 'static,
+    {
+        self.backoff_source_arc(Arc::new(backoff_source))
     }
 
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
@@ -1112,16 +1154,61 @@ impl ClientBuilder {
         self
     }
 
-    pub fn interceptor_arc(mut self, interceptor: Arc<dyn RequestInterceptor>) -> Self {
+    pub fn interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
     pub fn interceptor<I>(self, interceptor: I) -> Self
     where
-        I: RequestInterceptor + 'static,
+        I: Interceptor + 'static,
     {
         self.interceptor_arc(Arc::new(interceptor))
+    }
+
+    pub fn observer_arc(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    pub fn observer<O>(self, observer: O) -> Self
+    where
+        O: Observer + 'static,
+    {
+        self.observer_arc(Arc::new(observer))
+    }
+
+    pub fn profile(mut self, profile: ClientProfile) -> Self {
+        let defaults = profile.defaults();
+        self.request_timeout = defaults.request_timeout;
+        self.total_timeout = defaults.total_timeout;
+        self.retry_policy = defaults.retry_policy;
+        self.max_response_body_bytes = defaults.max_response_body_bytes;
+        self.redirect_policy = defaults.redirect_policy;
+        self.default_status_policy = defaults.status_policy;
+        self
+    }
+
+    pub fn advanced(mut self, config: AdvancedConfig) -> Self {
+        if let Some(request_timeout) = config.request_timeout {
+            self.request_timeout = request_timeout.max(Duration::from_millis(1));
+        }
+        if let Some(total_timeout) = config.total_timeout {
+            self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        }
+        if let Some(max_response_body_bytes) = config.max_response_body_bytes {
+            self.max_response_body_bytes = max_response_body_bytes.max(1);
+        }
+        if let Some(connect_timeout) = config.connect_timeout {
+            self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
+        }
+        if let Some(redirect_policy) = config.redirect_policy {
+            self.redirect_policy = redirect_policy;
+        }
+        if let Some(default_status_policy) = config.default_status_policy {
+            self.default_status_policy = default_status_policy;
+        }
+        self
     }
 
     pub fn build(self) -> crate::Result<Client> {
@@ -1171,12 +1258,18 @@ impl ClientBuilder {
             .map(Arc::new),
             server_throttle_scope: self.server_throttle_scope,
             redirect_policy: self.redirect_policy,
+            default_status_policy: self.default_status_policy,
             client_name: self.client_name,
             tls_backend: self.tls_backend,
             transport,
+            endpoint_selector: self.endpoint_selector,
+            body_codec: self.body_codec,
+            clock: self.clock,
+            backoff_source: self.backoff_source,
             request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
             metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
+            observers: self.observers,
         })
     }
 }
@@ -1196,12 +1289,18 @@ pub struct Client {
     rate_limiter: Option<Arc<RateLimiter>>,
     server_throttle_scope: ServerThrottleScope,
     redirect_policy: RedirectPolicy,
+    default_status_policy: StatusPolicy,
     client_name: String,
     tls_backend: TlsBackend,
     transport: TransportClient,
+    endpoint_selector: Arc<dyn EndpointSelector>,
+    body_codec: Arc<dyn BodyCodec>,
+    clock: Arc<dyn Clock>,
+    backoff_source: Arc<dyn BackoffSource>,
     request_limiters: Option<RequestLimiters>,
     metrics: ClientMetrics,
-    interceptors: Vec<Arc<dyn RequestInterceptor>>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
+    observers: Vec<Arc<dyn Observer>>,
 }
 
 impl Client {
@@ -1233,12 +1332,16 @@ impl Client {
         self.request(Method::DELETE, path)
     }
 
-    pub fn metrics_snapshot(&self) -> ClientMetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
     }
 
     pub fn tls_backend(&self) -> TlsBackend {
         self.tls_backend
+    }
+
+    pub fn default_status_policy(&self) -> StatusPolicy {
+        self.default_status_policy
     }
 
     fn run_request_interceptors(&self, context: &RequestContext, headers: &mut HeaderMap) {
@@ -1261,6 +1364,29 @@ impl Client {
     fn run_error_interceptors(&self, context: &RequestContext, error: &Error) {
         for interceptor in &self.interceptors {
             interceptor.on_error(context, error);
+        }
+    }
+
+    fn run_request_start_observers(&self, context: &RequestContext) {
+        for observer in &self.observers {
+            observer.on_request_start(context);
+        }
+    }
+
+    fn run_retry_observers(
+        &self,
+        context: &RequestContext,
+        decision: &RetryDecision,
+        delay: Duration,
+    ) {
+        for observer in &self.observers {
+            observer.on_retry_scheduled(context, decision, delay);
+        }
+    }
+
+    fn run_server_throttle_observers(&self, context: &RequestContext, delay: Duration) {
+        for observer in &self.observers {
+            observer.on_server_throttle(context, self.server_throttle_scope, delay);
         }
     }
 
@@ -1334,6 +1460,7 @@ impl Client {
 
     fn observe_server_throttle(
         &self,
+        context: &RequestContext,
         status: http::StatusCode,
         headers: &HeaderMap,
         host: Option<&str>,
@@ -1345,14 +1472,14 @@ impl Client {
         let Some(rate_limiter) = &self.rate_limiter else {
             return;
         };
-        let throttle_delay =
-            parse_retry_after(headers, SystemTime::now()).unwrap_or(fallback_delay);
+        let throttle_delay = status_retry_delay(self.clock.as_ref(), headers, fallback_delay);
         rate_limiter.observe_server_throttle(
             host,
             throttle_delay,
             self.server_throttle_scope,
             server_throttle_scope_from_headers(headers),
         );
+        self.run_server_throttle_observers(context, throttle_delay);
     }
 
     fn decode_response_body_limited(
@@ -1364,18 +1491,15 @@ impl Client {
         redacted_uri: &str,
         context: &RequestContext,
     ) -> Result<Bytes, Error> {
-        decode_content_encoded_body_limited(body, headers, max_response_body_bytes).map_err(
-            |error| {
-                let error = decode_response_body_error(
-                    error,
-                    max_response_body_bytes,
-                    method,
-                    redacted_uri,
-                );
-                self.run_error_interceptors(context, &error);
-                error
-            },
-        )
+        self.body_codec
+            .decode_response_body_limited(
+                body,
+                headers,
+                max_response_body_bytes,
+                method,
+                redacted_uri,
+            )
+            .inspect_err(|error| self.run_error_interceptors(context, error))
     }
 
     async fn schedule_retry(
@@ -1433,6 +1557,7 @@ impl Client {
         }
 
         self.metrics.record_retry();
+        self.run_retry_observers(context, retry_decision, retry_delay);
         if !retry_delay.is_zero() {
             sleep(retry_delay).await;
         }
@@ -1497,7 +1622,8 @@ impl Client {
                             max_attempts,
                         },
                         &retry_decision,
-                        retry_policy.backoff_for_retry(*attempt),
+                        self.backoff_source
+                            .backoff_for_retry(retry_policy, *attempt),
                         attempt,
                         &error,
                     )
@@ -1547,7 +1673,8 @@ impl Client {
                             max_attempts,
                         },
                         &retry_decision,
-                        retry_policy.backoff_for_retry(*attempt),
+                        self.backoff_source
+                            .backoff_for_retry(retry_policy, *attempt),
                         attempt,
                         &error,
                     )
@@ -1591,7 +1718,13 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<Response, Error> {
-        let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
+        let base_url = select_base_url(
+            self.endpoint_selector.as_ref(),
+            &method,
+            &path,
+            &self.base_url,
+        )?;
+        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
         ensure_accept_encoding_async(&mut merged_headers);
@@ -1645,7 +1778,13 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<ResponseStream, Error> {
-        let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
+        let base_url = select_base_url(
+            self.endpoint_selector.as_ref(),
+            &method,
+            &path,
+            &self.base_url,
+        )?;
+        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
         ensure_accept_encoding_async(&mut merged_headers);
@@ -1720,9 +1859,8 @@ impl Client {
         let redirect_policy = execution_options
             .redirect_policy
             .unwrap_or(self.redirect_policy);
-        let http_status_policy = execution_options
-            .http_status_policy
-            .unwrap_or(HttpStatusPolicy::Error);
+        let status_policy =
+            effective_status_policy(execution_options.status_policy, self.default_status_policy);
         let mut max_attempts = if self
             .retry_eligibility
             .supports_retry(&method, &merged_headers)
@@ -1757,6 +1895,7 @@ impl Client {
                 max_attempts,
                 redirect_count,
             );
+            self.run_request_start_observers(&context);
             debug!("sending stream request");
             let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self
@@ -1839,7 +1978,8 @@ impl Client {
                                 max_attempts,
                             },
                             &retry_decision,
-                            retry_policy.backoff_for_retry(attempt),
+                            self.backoff_source
+                                .backoff_for_retry(&retry_policy, attempt),
                             &mut attempt,
                             &error,
                         )
@@ -1879,7 +2019,8 @@ impl Client {
                                 max_attempts,
                             },
                             &retry_decision,
-                            retry_policy.backoff_for_retry(attempt),
+                            self.backoff_source
+                                .backoff_for_retry(&retry_policy, attempt),
                             &mut attempt,
                             &error,
                         )
@@ -1972,30 +2113,33 @@ impl Client {
             if !status.is_success() {
                 self.run_response_interceptors(&context, status, &response_headers);
                 self.observe_server_throttle(
+                    &context,
                     status,
                     &response_headers,
                     rate_limit_host.as_deref(),
-                    retry_policy.backoff_for_retry(attempt),
+                    self.backoff_source
+                        .backoff_for_retry(&retry_policy, attempt),
                 );
-                let retry_decision = RetryDecision {
+                let retry_decision = status_retry_decision(
                     attempt,
                     max_attempts,
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    status: Some(status),
-                    transport_error_kind: None,
-                    timeout_phase: None,
-                    response_body_read_error: false,
-                };
-                let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
-                    .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
-                let retry_error = Error::HttpStatus {
-                    status: status.as_u16(),
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    headers: Box::new(response_headers.clone()),
-                    body: String::new(),
-                };
+                    &current_method,
+                    &current_redacted_uri,
+                    status,
+                );
+                let retry_delay = status_retry_delay(
+                    self.clock.as_ref(),
+                    &response_headers,
+                    self.backoff_source
+                        .backoff_for_retry(&retry_policy, attempt),
+                );
+                let retry_error = http_status_error(
+                    status,
+                    &current_method,
+                    &current_redacted_uri,
+                    &response_headers,
+                    String::new(),
+                );
                 if self
                     .schedule_retry(
                         RetryContext {
@@ -2016,7 +2160,7 @@ impl Client {
                 {
                     continue;
                 }
-                if matches!(http_status_policy, HttpStatusPolicy::Response) {
+                if matches!(status_policy, StatusPolicy::Response) {
                     return Ok(ResponseStream::new(
                         status,
                         response_headers,
@@ -2054,13 +2198,13 @@ impl Client {
                     &current_redacted_uri,
                     &context,
                 )?;
-                let error = Error::HttpStatus {
-                    status: status.as_u16(),
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    headers: Box::new(response_headers.clone()),
-                    body: truncate_body(&response_body),
-                };
+                let error = http_status_error(
+                    status,
+                    &current_method,
+                    &current_redacted_uri,
+                    &response_headers,
+                    truncate_body(&response_body),
+                );
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
@@ -2123,9 +2267,8 @@ impl Client {
         let redirect_policy = execution_options
             .redirect_policy
             .unwrap_or(self.redirect_policy);
-        let http_status_policy = execution_options
-            .http_status_policy
-            .unwrap_or(HttpStatusPolicy::Error);
+        let status_policy =
+            effective_status_policy(execution_options.status_policy, self.default_status_policy);
         let mut max_attempts = if self
             .retry_eligibility
             .supports_retry(&method, &merged_headers)
@@ -2161,6 +2304,7 @@ impl Client {
                 max_attempts,
                 redirect_count,
             );
+            self.run_request_start_observers(&context);
 
             debug!("sending request");
             let rate_limit_host = rate_limit_bucket_key(&current_uri);
@@ -2242,7 +2386,8 @@ impl Client {
                                 max_attempts,
                             },
                             &retry_decision,
-                            retry_policy.backoff_for_retry(attempt),
+                            self.backoff_source
+                                .backoff_for_retry(&retry_policy, attempt),
                             &mut attempt,
                             &error,
                         )
@@ -2282,7 +2427,8 @@ impl Client {
                                 max_attempts,
                             },
                             &retry_decision,
-                            retry_policy.backoff_for_retry(attempt),
+                            self.backoff_source
+                                .backoff_for_retry(&retry_policy, attempt),
                             &mut attempt,
                             &error,
                         )
@@ -2413,30 +2559,33 @@ impl Client {
 
             if !status.is_success() {
                 self.observe_server_throttle(
+                    &context,
                     status,
                     &response_headers,
                     rate_limit_host.as_deref(),
-                    retry_policy.backoff_for_retry(attempt),
+                    self.backoff_source
+                        .backoff_for_retry(&retry_policy, attempt),
                 );
-                let retry_decision = RetryDecision {
+                let retry_decision = status_retry_decision(
                     attempt,
                     max_attempts,
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    status: Some(status),
-                    transport_error_kind: None,
-                    timeout_phase: None,
-                    response_body_read_error: false,
-                };
-                let retry_delay = parse_retry_after(&response_headers, SystemTime::now())
-                    .unwrap_or_else(|| retry_policy.backoff_for_retry(attempt));
-                let retry_error = Error::HttpStatus {
-                    status: status.as_u16(),
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    headers: Box::new(response_headers.clone()),
-                    body: String::new(),
-                };
+                    &current_method,
+                    &current_redacted_uri,
+                    status,
+                );
+                let retry_delay = status_retry_delay(
+                    self.clock.as_ref(),
+                    &response_headers,
+                    self.backoff_source
+                        .backoff_for_retry(&retry_policy, attempt),
+                );
+                let retry_error = http_status_error(
+                    status,
+                    &current_method,
+                    &current_redacted_uri,
+                    &response_headers,
+                    String::new(),
+                );
                 if self
                     .schedule_retry(
                         RetryContext {
@@ -2457,16 +2606,16 @@ impl Client {
                 {
                     continue;
                 }
-                if matches!(http_status_policy, HttpStatusPolicy::Response) {
+                if matches!(status_policy, StatusPolicy::Response) {
                     return Ok(Response::new(status, response_headers, response_body));
                 }
-                let error = Error::HttpStatus {
-                    status: status.as_u16(),
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.clone(),
-                    headers: Box::new(response_headers.clone()),
-                    body: truncate_body(&response_body),
-                };
+                let error = http_status_error(
+                    status,
+                    &current_method,
+                    &current_redacted_uri,
+                    &response_headers,
+                    truncate_body(&response_body),
+                );
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
