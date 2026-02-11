@@ -7,9 +7,13 @@ use http::{HeaderMap, Uri};
 
 use crate::error::TransportErrorKind;
 use crate::proxy::ProxyConfig;
-use crate::tls::{
-    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
-};
+use crate::tls::{TlsBackend, TlsOptions};
+#[cfg(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs",
+    feature = "blocking-tls-native"
+))]
+use crate::tls::{TlsClientIdentity, TlsRootCertificate, TlsRootStore, tls_config_error};
 
 #[cfg(feature = "blocking-tls-rustls-aws-lc-rs")]
 use std::sync::Arc;
@@ -27,6 +31,12 @@ const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsAwsLcRs;
     feature = "blocking-tls-native"
 ))]
 const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::NativeTls;
+#[cfg(not(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs",
+    feature = "blocking-tls-native"
+)))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsRing;
 
 pub(super) fn default_tls_backend() -> TlsBackend {
     DEFAULT_TLS_BACKEND
@@ -182,18 +192,11 @@ fn build_sync_tls_config(
     Ok(tls_config_builder.build())
 }
 
-#[cfg(not(any(
+#[cfg(any(
     feature = "blocking-tls-rustls-ring",
     feature = "blocking-tls-rustls-aws-lc-rs",
     feature = "blocking-tls-native"
-)))]
-fn build_sync_tls_config(
-    _backend: TlsBackend,
-    _tls_options: &TlsOptions,
-) -> crate::Result<ureq::tls::TlsConfig> {
-    unreachable!("sync client is not compiled without sync TLS features")
-}
-
+))]
 pub(super) fn make_agent(
     tls_backend: TlsBackend,
     tls_options: &TlsOptions,
@@ -214,6 +217,25 @@ pub(super) fn make_agent(
         .proxy(proxy)
         .build();
     Ok(config.new_agent())
+}
+
+#[cfg(not(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs",
+    feature = "blocking-tls-native"
+)))]
+pub(super) fn make_agent(
+    tls_backend: TlsBackend,
+    _tls_options: &TlsOptions,
+    _client_name: &str,
+    _pool_idle_timeout: Duration,
+    _pool_max_idle_per_host: usize,
+    _pool_max_idle_connections: usize,
+    _proxy: Option<ureq::Proxy>,
+) -> crate::Result<ureq::Agent> {
+    Err(crate::error::Error::TlsBackendUnavailable {
+        backend: tls_backend.as_str(),
+    })
 }
 
 #[derive(Clone)]

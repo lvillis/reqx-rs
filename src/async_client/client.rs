@@ -66,9 +66,13 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
 };
-use crate::tls::{
-    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, tls_config_error,
-};
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs",
+    feature = "async-tls-native"
+))]
+use crate::tls::tls_config_error;
+use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, is_redirect_status, lock_unpoisoned, merge_headers,
@@ -97,6 +101,12 @@ const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsAwsLcRs;
     feature = "async-tls-native"
 ))]
 const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::NativeTls;
+#[cfg(not(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs",
+    feature = "async-tls-native"
+)))]
+const DEFAULT_TLS_BACKEND: TlsBackend = TlsBackend::RustlsRing;
 
 fn default_tls_backend() -> TlsBackend {
     DEFAULT_TLS_BACKEND
@@ -362,27 +372,32 @@ impl TransportClient {
         &self,
         request: Request<ReqBody>,
     ) -> Result<HttpResponse<Incoming>, hyper_util::client::legacy::Error> {
+        #[cfg(any(
+            feature = "async-tls-native",
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs"
+        ))]
+        {
+            match self {
+                #[cfg(any(
+                    feature = "async-tls-rustls-ring",
+                    feature = "async-tls-rustls-aws-lc-rs"
+                ))]
+                Self::Rustls(client) => client.request(request).await,
+                #[cfg(feature = "async-tls-native")]
+                Self::Native(client) => client.request(request).await,
+            }
+        }
         #[cfg(not(any(
             feature = "async-tls-native",
             feature = "async-tls-rustls-ring",
             feature = "async-tls-rustls-aws-lc-rs"
         )))]
-        let _ = &request;
-
-        match self {
-            #[cfg(any(
-                feature = "async-tls-rustls-ring",
-                feature = "async-tls-rustls-aws-lc-rs"
-            ))]
-            Self::Rustls(client) => client.request(request).await,
-            #[cfg(feature = "async-tls-native")]
-            Self::Native(client) => client.request(request).await,
-            #[cfg(not(any(
-                feature = "async-tls-native",
-                feature = "async-tls-rustls-ring",
-                feature = "async-tls-rustls-aws-lc-rs"
-            )))]
-            _ => unreachable!("no TLS transport backend is compiled"),
+        {
+            let _ = request;
+            match self {
+                _ => unreachable!("no TLS transport backend is compiled"),
+            }
         }
     }
 }
