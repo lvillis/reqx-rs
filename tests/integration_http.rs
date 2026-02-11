@@ -217,6 +217,121 @@ impl Drop for SplitBodyServer {
     }
 }
 
+#[derive(Clone)]
+struct SplitBodyResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    body_delay: Duration,
+}
+
+impl SplitBodyResponse {
+    fn new(
+        status: u16,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+        body: impl Into<Vec<u8>>,
+        body_delay: Duration,
+    ) -> Self {
+        Self {
+            status,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            body: body.into(),
+            body_delay,
+        }
+    }
+}
+
+struct SplitBodySequenceServer {
+    base_url: String,
+    served: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SplitBodySequenceServer {
+    fn start(responses: Vec<SplitBodyResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind split body sequence server");
+        let address = listener
+            .local_addr()
+            .expect("read split body sequence server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set split body sequence listener nonblocking");
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_clone = Arc::clone(&served);
+
+        let join = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut accepted = 0usize;
+            let mut workers = Vec::new();
+            while accepted < responses.len() && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let response = responses[accepted].clone();
+                        let served = Arc::clone(&served_clone);
+                        accepted += 1;
+                        workers.push(thread::spawn(move || {
+                            let _ = read_request(&mut stream);
+                            served.fetch_add(1, Ordering::SeqCst);
+
+                            let mut head = format!(
+                                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                response.status,
+                                status_text(response.status),
+                                response.body.len()
+                            );
+                            for (name, value) in &response.headers {
+                                head.push_str(name);
+                                head.push_str(": ");
+                                head.push_str(value);
+                                head.push_str("\r\n");
+                            }
+                            head.push_str("\r\n");
+
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.flush();
+                            if !response.body_delay.is_zero() {
+                                thread::sleep(response.body_delay);
+                            }
+                            let _ = stream.write_all(&response.body);
+                            let _ = stream.flush();
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+
+        Self {
+            base_url: format!("http://{address}"),
+            served,
+            join: Some(join),
+        }
+    }
+
+    fn served_count(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SplitBodySequenceServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
 
@@ -1000,6 +1115,49 @@ async fn response_body_timeout_reports_phase_and_metrics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_retries_on_non_success_response_body_timeout() {
+    let server = SplitBodySequenceServer::start(vec![
+        SplitBodyResponse::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::from_millis(320),
+        ),
+        SplitBodyResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+            Duration::ZERO,
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(120))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-timeout-then-retry")
+        .send_stream()
+        .await
+        .expect("stream request should succeed after retry");
+    let response = stream
+        .into_response_limited(1024)
+        .await
+        .expect("stream response should decode");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decode_content_encoding_error_is_classified() {
     let server = MockServer::start(vec![MockResponse::new_bytes(
         200,
@@ -1242,4 +1400,44 @@ async fn interceptor_can_mutate_headers_and_observe_lifecycle() {
     assert_eq!(request_hits.load(Ordering::SeqCst), 1);
     assert_eq!(response_hits.load(Ordering::SeqCst), 1);
     assert_eq!(error_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_on_error_is_invoked_for_decode_failure() {
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Encoding", "x-custom")],
+        b"abc".to_vec(),
+        Duration::ZERO,
+    )]);
+
+    let request_hits = Arc::new(AtomicUsize::new(0));
+    let response_hits = Arc::new(AtomicUsize::new(0));
+    let error_hits = Arc::new(AtomicUsize::new(0));
+    let interceptor = Arc::new(HeaderInjectingInterceptor {
+        request_hits: Arc::clone(&request_hits),
+        response_hits: Arc::clone(&response_hits),
+        error_hits: Arc::clone(&error_hits),
+    });
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .interceptor_arc(interceptor)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/decode-fail")
+        .send()
+        .await
+        .expect_err("unknown content-encoding should fail");
+    match error {
+        Error::DecodeContentEncoding { encoding, .. } => assert_eq!(encoding, "x-custom"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    assert_eq!(request_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(error_hits.load(Ordering::SeqCst), 1);
 }

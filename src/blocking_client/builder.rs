@@ -5,7 +5,7 @@ use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
 use crate::error::Error;
-use crate::metrics::HttpClientMetrics;
+use crate::metrics::ClientMetrics;
 use crate::otel::OtelTelemetry;
 use crate::policy::{RedirectPolicy, RequestInterceptor};
 use crate::proxy::{NoProxyRule, ProxyConfig};
@@ -365,7 +365,7 @@ impl ClientBuilder {
             },
             proxy_config,
             connect_timeout: self.connect_timeout,
-            metrics: HttpClientMetrics::with_options(self.metrics_enabled, otel),
+            metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
         })
     }

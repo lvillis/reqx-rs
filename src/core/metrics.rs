@@ -37,13 +37,13 @@ pub struct ClientMetricsSnapshot {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct HttpClientMetrics {
-    inner: Option<Arc<HttpClientMetricsInner>>,
+pub(crate) struct ClientMetrics {
+    inner: Option<Arc<ClientMetricsInner>>,
     otel: OtelTelemetry,
 }
 
 #[derive(Debug, Default)]
-struct HttpClientMetricsInner {
+struct ClientMetricsInner {
     requests_started: AtomicU64,
     requests_succeeded: AtomicU64,
     requests_failed: AtomicU64,
@@ -63,13 +63,13 @@ struct HttpClientMetricsInner {
 }
 
 pub(crate) struct InFlightGuard {
-    inner: Option<Arc<HttpClientMetricsInner>>,
+    inner: Option<Arc<ClientMetricsInner>>,
 }
 
-impl HttpClientMetrics {
+impl ClientMetrics {
     pub(crate) fn with_options(metrics_enabled: bool, otel: OtelTelemetry) -> Self {
         Self {
-            inner: metrics_enabled.then(|| Arc::new(HttpClientMetricsInner::default())),
+            inner: metrics_enabled.then(|| Arc::new(ClientMetricsInner::default())),
             otel,
         }
     }

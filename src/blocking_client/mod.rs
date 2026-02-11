@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Uri};
 
-use crate::metrics::HttpClientMetrics;
+use crate::metrics::ClientMetrics;
 use crate::policy::{RedirectPolicy, RequestInterceptor};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
@@ -195,6 +195,6 @@ pub struct Client {
     transport: transport::TransportAgents,
     proxy_config: Option<ProxyConfig>,
     connect_timeout: Duration,
-    metrics: HttpClientMetrics,
+    metrics: ClientMetrics,
     interceptors: Vec<Arc<dyn RequestInterceptor>>,
 }
