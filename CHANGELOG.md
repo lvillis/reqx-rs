@@ -1,8 +1,17 @@
+## [0.1.12] - 2026-02-11
+
+### 🐛 Bug Fixes
+
+- Align content-decoding with HTTP body semantics
 ## [0.1.11] - 2026-02-11
 
 ### 🐛 Bug Fixes
 
 - Redact response bodies from error display messages
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.11
 ## [0.1.10] - 2026-02-11
 
 ### 🚀 Features
