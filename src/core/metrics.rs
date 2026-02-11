@@ -9,10 +9,10 @@ use http::Method;
 use crate::error::{Error, TimeoutPhase};
 use crate::otel::{OtelRequestSpan, OtelTelemetry};
 #[cfg(feature = "_blocking")]
-use crate::response::BlockingHttpResponseStream;
-use crate::response::HttpResponse;
+use crate::response::BlockingResponseStream;
+use crate::response::Response;
 #[cfg(feature = "_async")]
-use crate::response::HttpResponseStream;
+use crate::response::ResponseStream;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Debug)]
@@ -127,7 +127,7 @@ impl HttpClientMetrics {
 
     pub(crate) fn record_request_completed(
         &self,
-        result: &Result<HttpResponse, Error>,
+        result: &Result<Response, Error>,
         latency: Duration,
     ) {
         match result {
@@ -151,7 +151,7 @@ impl HttpClientMetrics {
     #[cfg(feature = "_async")]
     pub(crate) fn record_request_completed_stream(
         &self,
-        result: &Result<HttpResponseStream, Error>,
+        result: &Result<ResponseStream, Error>,
         latency: Duration,
     ) {
         match result {
@@ -174,7 +174,7 @@ impl HttpClientMetrics {
     #[cfg(feature = "_blocking")]
     pub(crate) fn record_request_completed_blocking_stream(
         &self,
-        result: &Result<BlockingHttpResponseStream, Error>,
+        result: &Result<BlockingResponseStream, Error>,
         latency: Duration,
     ) {
         match result {

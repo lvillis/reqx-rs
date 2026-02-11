@@ -9,15 +9,15 @@ use serde::de::DeserializeOwned;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::policy::RedirectPolicy;
-use crate::response::{BlockingHttpResponseStream, HttpResponse};
+use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
 
-use super::{HttpClient, RequestBody, RequestExecutionOptions};
+use super::{Client, RequestBody, RequestExecutionOptions};
 
 #[doc(hidden)]
 pub struct RequestBuilder<'a> {
-    client: &'a HttpClient,
+    client: &'a Client,
     method: Method,
     path: String,
     query_pairs: Vec<(String, String)>,
@@ -31,7 +31,7 @@ pub struct RequestBuilder<'a> {
 }
 
 impl<'a> RequestBuilder<'a> {
-    pub(crate) fn new(client: &'a HttpClient, method: Method, path: String) -> Self {
+    pub(crate) fn new(client: &'a Client, method: Method, path: String) -> Self {
         Self {
             client,
             method,
@@ -184,7 +184,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn send(self) -> crate::Result<HttpResponse> {
+    pub fn send(self) -> crate::Result<Response> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,
@@ -202,7 +202,7 @@ impl<'a> RequestBuilder<'a> {
         )
     }
 
-    pub fn send_stream(self) -> crate::Result<BlockingHttpResponseStream> {
+    pub fn send_stream(self) -> crate::Result<BlockingResponseStream> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,

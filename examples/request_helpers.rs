@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ struct LoginForm<'a> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-request-helpers")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())

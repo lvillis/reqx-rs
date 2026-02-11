@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, TlsBackend, TlsRootStore};
+use reqx::prelude::{Client, TlsBackend, TlsRootStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_cert_chain_pem = std::fs::read("certs/client-cert-chain.pem")?;
     let client_key_pem = std::fs::read("certs/client-key.pem")?;
 
-    let client = HttpClient::builder("https://minio.internal.example.com")
+    let client = Client::builder("https://minio.internal.example.com")
         .client_name("reqx-example-custom-ca-mtls")
         .request_timeout(Duration::from_secs(5))
         .tls_backend(TlsBackend::RustlsRing)
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If you use native-tls and PKCS#12 identity:
     //
     // let identity_p12 = std::fs::read("certs/client-identity.p12")?;
-    // let client = HttpClient::builder("https://minio.internal.example.com")
+    // let client = Client::builder("https://minio.internal.example.com")
     //     .tls_backend(TlsBackend::NativeTls)
     //     .tls_root_ca_pem(std::fs::read("certs/ca.pem")?)
     //     .tls_client_identity_pkcs12(identity_p12, "changeit")

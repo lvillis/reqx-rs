@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use reqx::prelude::{Error, HttpClient, RetryPolicy, TimeoutPhase};
+use reqx::prelude::{Client, Error, RetryPolicy, TimeoutPhase};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-overrides")
         .request_timeout(Duration::from_secs(2))
         .total_timeout(Duration::from_secs(8))

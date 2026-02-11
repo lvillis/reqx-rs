@@ -9,7 +9,7 @@ use crate::error::{Error, TimeoutPhase};
 use crate::metrics::HttpClientMetricsSnapshot;
 use crate::policy::RequestContext;
 use crate::rate_limit::server_throttle_scope_from_headers;
-use crate::response::{BlockingHttpResponseStream, HttpResponse};
+use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
@@ -24,13 +24,13 @@ use super::transport::{
     read_all_body_limited, remove_content_encoding_headers, wrapped_ureq_error,
 };
 use super::{
-    AdaptiveConcurrencyPermit, HttpClient, HttpClientBuilder, RequestBody, RequestBuilder,
+    AdaptiveConcurrencyPermit, Client, ClientBuilder, RequestBody, RequestBuilder,
     RequestExecutionOptions,
 };
 
-impl HttpClient {
-    pub fn builder(base_url: impl Into<String>) -> HttpClientBuilder {
-        HttpClientBuilder::new(base_url)
+impl Client {
+    pub fn builder(base_url: impl Into<String>) -> ClientBuilder {
+        ClientBuilder::new(base_url)
     }
 
     pub fn request(&self, method: Method, path: impl Into<String>) -> RequestBuilder<'_> {
@@ -293,7 +293,7 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, Error> {
+    ) -> Result<Response, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
@@ -337,7 +337,7 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<BlockingHttpResponseStream, Error> {
+    ) -> Result<BlockingResponseStream, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
@@ -382,7 +382,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<BlockingHttpResponseStream, Error> {
+    ) -> Result<BlockingResponseStream, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -826,7 +826,7 @@ impl HttpClient {
                 adaptive_guard.mark_success();
             }
             self.record_successful_request_for_resilience();
-            return Ok(BlockingHttpResponseStream::new(
+            return Ok(BlockingResponseStream::new(
                 status,
                 response_headers,
                 response.into_body(),
@@ -856,7 +856,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, Error> {
+    ) -> Result<Response, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -1291,7 +1291,7 @@ impl HttpClient {
                 adaptive_guard.mark_success();
             }
             self.record_successful_request_for_resilience();
-            return Ok(HttpResponse::new(status, response_headers, response_body));
+            return Ok(Response::new(status, response_headers, response_body));
         }
 
         let error = deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);

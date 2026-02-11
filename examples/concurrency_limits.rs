@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-concurrency")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::disabled())

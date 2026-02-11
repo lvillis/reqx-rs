@@ -69,7 +69,7 @@ cargo add reqx --no-default-features -F blocking-tls-native
 ```rust
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -79,7 +79,7 @@ struct CreateItemResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://api.example.com")
+    let client = Client::builder("https://api.example.com")
         .client_name("example-sdk")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(8))
@@ -108,10 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use std::time::Duration;
 
-use reqx::blocking::HttpClient;
+use reqx::blocking::Client;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://api.example.com")
+    let client = Client::builder("https://api.example.com")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(8))
         .build()?;

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures_util::{future::join_all, stream};
 use http::header::{CONTENT_LENGTH, HeaderValue};
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 use tokio::runtime::Runtime;
 
 #[derive(Clone)]
@@ -229,8 +229,8 @@ fn benchmark_runtime() -> Runtime {
         .expect("build benchmark runtime")
 }
 
-fn benchmark_client(base_url: &str) -> HttpClient {
-    HttpClient::builder(base_url)
+fn benchmark_client(base_url: &str) -> Client {
+    Client::builder(base_url)
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .pool_max_idle_per_host(64)

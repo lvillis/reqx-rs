@@ -110,7 +110,7 @@ fn assert_error_contract(error: &Error, expected: ErrorCode, expected_code: &str
 
 #[cfg(feature = "_async")]
 async fn async_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize) -> Error {
-    use reqx::prelude::{HttpClient, RetryPolicy};
+    use reqx::prelude::{Client, RetryPolicy};
 
     let server = OneShotServer::start(
         status,
@@ -120,7 +120,7 @@ async fn async_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: us
         )],
         body,
     );
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .max_response_body_bytes(max_response_body_bytes)
         .retry_policy(RetryPolicy::disabled())
@@ -137,7 +137,7 @@ async fn async_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: us
 
 #[cfg(feature = "_blocking")]
 fn blocking_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize) -> Error {
-    use reqx::blocking::HttpClient;
+    use reqx::blocking::Client;
     use reqx::prelude::RetryPolicy;
 
     let server = OneShotServer::start(
@@ -148,7 +148,7 @@ fn blocking_get_error(status: u16, body: Vec<u8>, max_response_body_bytes: usize
         )],
         body,
     );
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .max_response_body_bytes(max_response_body_bytes)
         .retry_policy(RetryPolicy::disabled())

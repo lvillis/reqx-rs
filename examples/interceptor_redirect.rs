@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
-use reqx::prelude::{
-    Error, HttpClient, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy,
-};
+use reqx::prelude::{Client, Error, HttpInterceptor, RedirectPolicy, RequestContext, RetryPolicy};
 
 struct TraceInterceptor;
 
@@ -43,7 +41,7 @@ impl HttpInterceptor for TraceInterceptor {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .connect_timeout(Duration::from_secs(2))
         .request_timeout(Duration::from_secs(4))
         .total_timeout(Duration::from_secs(8))

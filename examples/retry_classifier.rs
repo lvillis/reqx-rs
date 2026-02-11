@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use reqx::prelude::{HttpClient, RetryClassifier, RetryDecision, RetryPolicy};
+use reqx::prelude::{Client, RetryClassifier, RetryDecision, RetryPolicy};
 
 struct RetryOn429Only;
 
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .jitter_ratio(0.0)
         .retry_classifier(Arc::new(RetryOn429Only));
 
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-retry-classifier")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(retry_policy)

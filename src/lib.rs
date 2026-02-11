@@ -8,7 +8,7 @@
 //! # #[cfg(feature = "_async")]
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::time::Duration;
-//! use reqx::prelude::{HttpClient, RetryPolicy};
+//! use reqx::prelude::{Client, RetryPolicy};
 //! use serde::Deserialize;
 //!
 //! #[derive(Debug, Deserialize)]
@@ -16,7 +16,7 @@
 //!     id: String,
 //! }
 //!
-//!     let client = HttpClient::builder("https://api.example.com")
+//!     let client = Client::builder("https://api.example.com")
 //!         .client_name("my-sdk")
 //!         .request_timeout(Duration::from_secs(3))
 //!         .total_timeout(Duration::from_secs(8))
@@ -102,7 +102,7 @@ pub(crate) use crate::core::util;
 pub(crate) use crate::http::response;
 
 #[cfg(feature = "_async")]
-pub use crate::client::{HttpClient, HttpClientBuilder};
+pub use crate::client::{Client, ClientBuilder};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::metrics::HttpClientMetricsSnapshot;
 pub use crate::policy::{HttpInterceptor, RedirectPolicy, RequestContext};
@@ -110,9 +110,9 @@ pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
 pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
-pub use crate::response::HttpResponse;
+pub use crate::response::Response;
 #[cfg(feature = "_async")]
-pub use crate::response::HttpResponseStream;
+pub use crate::response::ResponseStream;
 pub use crate::retry::{
     PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
@@ -128,8 +128,8 @@ pub use crate::upload::{
 
 #[cfg(feature = "_blocking")]
 pub mod blocking {
-    pub use crate::blocking_client::{HttpClient, HttpClientBuilder, RequestBuilder};
-    pub use crate::response::BlockingHttpResponseStream as HttpResponseStream;
+    pub use crate::blocking_client::{Client, ClientBuilder, RequestBuilder};
+    pub use crate::response::BlockingResponseStream as ResponseStream;
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -140,17 +140,15 @@ pub mod prelude {
     pub use crate::{
         AdaptiveConcurrencyPolicy, BlockingResumableUploadBackend, BlockingResumableUploader,
         CircuitBreakerPolicy, Error, ErrorCode, HttpClientMetricsSnapshot, HttpInterceptor,
-        HttpResponse, PartChecksumAlgorithm, PermissiveRetryEligibility,
-        RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RedirectPolicy, RequestContext,
-        Result, ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
+        PartChecksumAlgorithm, PermissiveRetryEligibility, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
+        RateLimitPolicy, RedirectPolicy, RequestContext, Response, Result,
+        ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
         ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision, RetryEligibility,
         RetryPolicy, ServerThrottleScope, StrictRetryEligibility, TimeoutPhase, TlsBackend,
         TlsRootStore, TransportErrorKind, UploadedPart,
     };
     #[cfg(feature = "_async")]
-    pub use crate::{
-        AsyncResumableUploadBackend, AsyncResumableUploader, HttpClient, HttpResponseStream,
-    };
+    pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader, Client, ResponseStream};
 }
 
 #[cfg(all(test, feature = "_async"))]

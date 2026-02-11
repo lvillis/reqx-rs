@@ -6,9 +6,9 @@ use std::time::Duration;
     feature = "blocking-tls-native"
 ))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use reqx::blocking::HttpClient;
+    use reqx::blocking::Client;
 
-    let client = HttpClient::builder("https://api.example.com")
+    let client = Client::builder("https://api.example.com")
         .client_name("example-sdk")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(8))

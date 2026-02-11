@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use http::header::{HeaderName, HeaderValue};
-use reqx::blocking::HttpClient;
+use reqx::blocking::Client;
 use reqx::prelude::{
     CircuitBreakerPolicy, Error, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
     RetryBudgetPolicy, RetryPolicy, ServerThrottleScope, TimeoutPhase, TlsRootStore,
@@ -306,7 +306,7 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
         br#"{"ok":true}"#.to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .build()
         .expect("client should build");
@@ -353,7 +353,7 @@ fn blocking_retries_idempotent_post_then_succeeds() {
         .max_backoff(Duration::from_millis(5))
         .jitter_ratio(0.0);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .retry_policy(retry_policy)
         .request_timeout(Duration::from_secs(1))
         .build()
@@ -379,7 +379,7 @@ fn blocking_global_rate_limit_applies_between_requests() {
         MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-2".to_vec()),
     ]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -415,7 +415,7 @@ fn blocking_retry_after_429_backpressures_following_request() {
         MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
     ]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -461,7 +461,7 @@ fn blocking_retry_after_429_auto_scope_throttles_same_host_only() {
     )]);
     let host_b_url = format!("{}/other-host", server_b.base_url);
 
-    let client = HttpClient::builder(server_a.base_url.clone())
+    let client = Client::builder(server_a.base_url.clone())
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -523,7 +523,7 @@ fn blocking_retry_after_429_global_scope_backpressures_other_hosts() {
     )]);
     let host_b_url = format!("{}/other-host", server_b.base_url);
 
-    let client = HttpClient::builder(server_a.base_url.clone())
+    let client = Client::builder(server_a.base_url.clone())
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -576,7 +576,7 @@ fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
         ),
     ]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .retry_policy(
             RetryPolicy::standard()
                 .max_attempts(5)
@@ -614,7 +614,7 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
         b"{}".to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .retry_policy(RetryPolicy::disabled())
         .circuit_breaker_policy(
             CircuitBreakerPolicy::standard()
@@ -650,7 +650,7 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
 
 #[test]
 fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
-    let result = HttpClient::builder("https://api.example.com")
+    let result = Client::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)
         .build();
     let error = match result {
@@ -668,7 +668,7 @@ fn blocking_tls_root_store_specific_without_roots_returns_tls_config_error() {
 
 #[test]
 fn blocking_build_rejects_invalid_base_url_early() {
-    let result = HttpClient::builder("ftp://api.example.com").build();
+    let result = Client::builder("ftp://api.example.com").build();
     let error = match result {
         Ok(_) => panic!("non-http base url should fail at build time"),
         Err(error) => error,
@@ -684,7 +684,7 @@ fn blocking_build_rejects_invalid_base_url_early() {
 
 #[test]
 fn blocking_build_rejects_base_url_with_query() {
-    let result = HttpClient::builder("https://api.example.com/v1?token=abc").build();
+    let result = Client::builder("https://api.example.com/v1?token=abc").build();
     let error = match result {
         Ok(_) => panic!("base url with query should fail at build time"),
         Err(error) => error,
@@ -700,7 +700,7 @@ fn blocking_build_rejects_base_url_with_query() {
 
 #[test]
 fn blocking_tls_root_store_system_rejects_custom_roots() {
-    let result = HttpClient::builder("https://api.example.com")
+    let result = Client::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::System)
         .tls_root_ca_der([1_u8, 2, 3, 4])
         .build();
@@ -719,7 +719,7 @@ fn blocking_tls_root_store_system_rejects_custom_roots() {
 
 #[test]
 fn blocking_custom_root_ca_requires_specific_root_store() {
-    let result = HttpClient::builder("https://api.example.com")
+    let result = Client::builder("https://api.example.com")
         .tls_root_ca_der([1_u8, 2, 3, 4])
         .build();
     let error = match result {
@@ -743,7 +743,7 @@ fn blocking_response_body_limit_returns_specific_error() {
         b"0123456789".to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .max_response_body_bytes(4)
         .request_timeout(Duration::from_secs(1))
         .build()
@@ -776,7 +776,7 @@ fn blocking_send_stream_downloads_body_and_status() {
         payload.clone(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -804,7 +804,7 @@ fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
         b"0123456789".to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -843,7 +843,7 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
         Duration::from_millis(180),
     );
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(80))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -880,7 +880,7 @@ fn blocking_send_stream_maps_decode_error_consistently() {
         b"not-valid-gzip".to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -918,7 +918,7 @@ fn blocking_download_to_writer_writes_stream_without_buffering() {
         payload.clone(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -941,7 +941,7 @@ fn blocking_download_to_writer_limited_maps_limit_error() {
         b"0123456789".to_vec(),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -979,7 +979,7 @@ fn blocking_redirect_policy_follows_relative_location() {
         ),
     ]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .redirect_policy(RedirectPolicy::limited(3))
@@ -1044,7 +1044,7 @@ fn blocking_interceptor_can_mutate_headers_and_observe_lifecycle() {
         error_hits: Arc::clone(&error_hits),
     });
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .interceptor_arc(interceptor)
         .build()

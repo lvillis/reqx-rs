@@ -3,12 +3,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::stream;
 use http_body_util::BodyExt;
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 use tokio::io::{AsyncWriteExt, sink};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-stream")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::standard().max_attempts(2))

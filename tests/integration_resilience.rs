@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use http::Uri;
 use http_body_util::BodyExt;
 use reqx::prelude::{
-    CircuitBreakerPolicy, Error, HttpClient, RetryBudgetPolicy, RetryClassifier, RetryDecision,
+    CircuitBreakerPolicy, Client, Error, RetryBudgetPolicy, RetryClassifier, RetryDecision,
     RetryPolicy,
 };
 use tokio::io::sink;
@@ -462,7 +462,7 @@ async fn proxy_connect_tunnels_http_request() {
     let proxy = ConnectProxyServer::start(1);
 
     let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
-    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+    let client = Client::builder(format!("http://{}", upstream.authority()))
         .http_proxy(proxy_uri)
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
@@ -498,7 +498,7 @@ async fn proxy_authorization_header_is_forwarded() {
     let proxy = ConnectProxyServer::start(1);
     let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
 
-    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+    let client = Client::builder(format!("http://{}", upstream.authority()))
         .http_proxy(proxy_uri)
         .try_proxy_authorization("Basic dXNlcjpwYXNz")
         .expect("valid proxy authorization header")
@@ -533,7 +533,7 @@ async fn no_proxy_bypasses_proxy_for_matching_host() {
     let proxy = ConnectProxyServer::start(0);
     let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
 
-    let client = HttpClient::builder(format!("http://{}", upstream.authority()))
+    let client = Client::builder(format!("http://{}", upstream.authority()))
         .http_proxy(proxy_uri)
         .no_proxy(["127.0.0.1"])
         .request_timeout(Duration::from_millis(500))
@@ -563,7 +563,7 @@ async fn max_in_flight_enforces_single_active_request() {
             Duration::from_millis(120),
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .max_in_flight(1)
         .request_timeout(Duration::from_millis(800))
         .retry_policy(RetryPolicy::disabled())
@@ -617,7 +617,7 @@ async fn max_in_flight_per_host_limits_each_host_independently() {
         ),
     );
 
-    let client = HttpClient::builder(format!("http://{}", server_a.authority()))
+    let client = Client::builder(format!("http://{}", server_a.authority()))
         .max_in_flight_per_host(1)
         .request_timeout(Duration::from_millis(800))
         .retry_policy(RetryPolicy::disabled())
@@ -680,7 +680,7 @@ async fn total_timeout_interrupts_retry_loop_with_retry_after() {
         ),
     );
 
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .total_timeout(Duration::from_millis(300))
         .retry_policy(
@@ -718,7 +718,7 @@ async fn max_response_body_limit_returns_specific_error() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .max_response_body_bytes(8)
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
@@ -754,7 +754,7 @@ async fn retry_classifier_can_disable_retries() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .retry_policy(
             RetryPolicy::standard()
                 .max_attempts(3)
@@ -790,7 +790,7 @@ async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .allow_non_idempotent_retries(true)
         .retry_policy(
             RetryPolicy::standard()
@@ -827,7 +827,7 @@ async fn retry_budget_exhausted_stops_retry_loop_early() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .retry_policy(
             RetryPolicy::standard()
                 .max_attempts(5)
@@ -869,7 +869,7 @@ async fn circuit_breaker_short_circuits_after_opening() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .retry_policy(RetryPolicy::disabled())
         .circuit_breaker_policy(
             CircuitBreakerPolicy::standard()
@@ -914,7 +914,7 @@ async fn https_path_returns_transport_error_on_non_tls_server() {
         1,
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
     );
-    let client = HttpClient::builder(format!("https://{}", raw_server.authority()))
+    let client = Client::builder(format!("https://{}", raw_server.authority()))
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -948,7 +948,7 @@ async fn send_stream_downloads_body_without_buffered_send_path() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -981,7 +981,7 @@ async fn send_stream_into_response_limited_returns_buffered_response() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -1012,7 +1012,7 @@ async fn send_stream_into_response_limited_enforces_limit_with_consistent_error(
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -1056,7 +1056,7 @@ async fn download_to_writer_transfers_stream_bytes() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -1082,7 +1082,7 @@ async fn download_to_writer_limited_enforces_limit_with_consistent_error() {
             Duration::ZERO,
         ),
     );
-    let client = HttpClient::builder(format!("http://{}", server.authority()))
+    let client = Client::builder(format!("http://{}", server.authority()))
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .build()

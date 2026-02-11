@@ -147,7 +147,7 @@ enum RequestBody {
     Reader(Box<dyn Read + Send + Sync>),
 }
 
-pub struct HttpClientBuilder {
+pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
     request_timeout: Duration,
@@ -177,7 +177,7 @@ pub struct HttpClientBuilder {
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
-pub struct HttpClient {
+pub struct Client {
     base_url: String,
     default_headers: HeaderMap,
     request_timeout: Duration,

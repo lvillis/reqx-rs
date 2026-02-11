@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use reqx::prelude::{
-    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, HttpClient, RetryBudgetPolicy, RetryPolicy,
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Client, RetryBudgetPolicy, RetryPolicy,
     TimeoutPhase, TransportErrorKind,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://api.example.com")
+    let client = Client::builder("https://api.example.com")
         .client_name("resilience-demo")
         .request_timeout(Duration::from_secs(3))
         .total_timeout(Duration::from_secs(10))

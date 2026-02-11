@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use reqx::prelude::{HttpClient, RateLimitPolicy, RetryPolicy};
+use reqx::prelude::{Client, RateLimitPolicy, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::builder("https://api.example.com")
+    let client = Client::builder("https://api.example.com")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(

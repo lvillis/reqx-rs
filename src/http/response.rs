@@ -7,13 +7,13 @@ use crate::error::Error;
 use crate::util::truncate_body;
 
 #[derive(Clone, Debug)]
-pub struct HttpResponse {
+pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
 }
 
-impl HttpResponse {
+impl Response {
     pub(crate) fn new(status: StatusCode, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             status,
@@ -63,7 +63,7 @@ mod stream {
         read_all_body_limited,
     };
     use crate::error::Error;
-    use crate::response::HttpResponse;
+    use crate::response::Response;
 
     fn map_read_body_error(
         error: ReadBodyError,
@@ -109,7 +109,7 @@ mod stream {
     }
 
     #[derive(Debug)]
-    pub struct HttpResponseStream {
+    pub struct ResponseStream {
         status: StatusCode,
         headers: HeaderMap,
         body: Incoming,
@@ -117,7 +117,7 @@ mod stream {
         uri: String,
     }
 
-    impl HttpResponseStream {
+    impl ResponseStream {
         pub(crate) fn new(
             status: StatusCode,
             headers: HeaderMap,
@@ -226,8 +226,8 @@ mod stream {
             Ok(copied)
         }
 
-        pub async fn into_response_limited(self, max_bytes: usize) -> crate::Result<HttpResponse> {
-            let HttpResponseStream {
+        pub async fn into_response_limited(self, max_bytes: usize) -> crate::Result<Response> {
+            let ResponseStream {
                 status,
                 mut headers,
                 body,
@@ -244,7 +244,7 @@ mod stream {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }
-            Ok(HttpResponse::new(status, headers, body))
+            Ok(Response::new(status, headers, body))
         }
 
         pub async fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
@@ -271,7 +271,7 @@ mod blocking_stream {
     use serde::de::DeserializeOwned;
 
     use crate::error::{Error, TimeoutPhase};
-    use crate::response::HttpResponse;
+    use crate::response::Response;
 
     fn map_read_error(
         source: std::io::Error,
@@ -314,7 +314,7 @@ mod blocking_stream {
     }
 
     #[derive(Debug)]
-    pub struct BlockingHttpResponseStream {
+    pub struct BlockingResponseStream {
         status: StatusCode,
         headers: HeaderMap,
         body: ureq::Body,
@@ -323,7 +323,7 @@ mod blocking_stream {
         timeout_ms: u128,
     }
 
-    impl BlockingHttpResponseStream {
+    impl BlockingResponseStream {
         pub(crate) fn new(
             status: StatusCode,
             headers: HeaderMap,
@@ -456,8 +456,8 @@ mod blocking_stream {
             Ok(Bytes::from(collected))
         }
 
-        pub fn into_response_limited(self, max_bytes: usize) -> crate::Result<HttpResponse> {
-            let BlockingHttpResponseStream {
+        pub fn into_response_limited(self, max_bytes: usize) -> crate::Result<Response> {
+            let BlockingResponseStream {
                 status,
                 mut headers,
                 mut body,
@@ -494,7 +494,7 @@ mod blocking_stream {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }
-            Ok(HttpResponse::new(status, headers, body))
+            Ok(Response::new(status, headers, body))
         }
 
         pub fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
@@ -513,6 +513,6 @@ mod blocking_stream {
 }
 
 #[cfg(feature = "_blocking")]
-pub use blocking_stream::BlockingHttpResponseStream;
+pub use blocking_stream::BlockingResponseStream;
 #[cfg(feature = "_async")]
-pub use stream::HttpResponseStream;
+pub use stream::ResponseStream;

@@ -12,14 +12,14 @@ use tokio_util::io::ReaderStream;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::body::{RequestBody, stream_req_body};
-use crate::client::{HttpClient, RequestExecutionOptions};
+use crate::client::{Client, RequestExecutionOptions};
 use crate::policy::RedirectPolicy;
 use crate::retry::RetryPolicy;
 use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
 
 #[doc(hidden)]
 pub struct RequestBuilder<'a> {
-    client: &'a HttpClient,
+    client: &'a Client,
     method: Method,
     path: String,
     query_pairs: Vec<(String, String)>,
@@ -33,7 +33,7 @@ pub struct RequestBuilder<'a> {
 }
 
 impl<'a> RequestBuilder<'a> {
-    pub(crate) fn new(client: &'a HttpClient, method: Method, path: String) -> Self {
+    pub(crate) fn new(client: &'a Client, method: Method, path: String) -> Self {
         Self {
             client,
             method,
@@ -194,7 +194,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub async fn send(self) -> crate::Result<crate::response::HttpResponse> {
+    pub async fn send(self) -> crate::Result<crate::response::Response> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,
@@ -214,7 +214,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
-    pub async fn send_stream(self) -> crate::Result<crate::response::HttpResponseStream> {
+    pub async fn send_stream(self) -> crate::Result<crate::response::ResponseStream> {
         let path = append_query_pairs(&self.path, &self.query_pairs);
         let execution_options = RequestExecutionOptions {
             request_timeout: self.timeout,

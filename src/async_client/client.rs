@@ -2,14 +2,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue};
-use http::{HeaderMap, Method, Request, Response, Uri};
+use http::{HeaderMap, Method, Request, Response as HttpResponse, Uri};
 use hyper::body::Incoming;
 #[cfg(any(
     feature = "async-tls-native",
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
-use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::Client as HyperClient;
 #[cfg(any(
     feature = "async-tls-native",
     feature = "async-tls-rustls-ring",
@@ -49,7 +49,7 @@ use crate::request::RequestBuilder;
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
-use crate::response::{HttpResponse, HttpResponseStream};
+use crate::response::{Response, ResponseStream};
 use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
@@ -333,12 +333,12 @@ type RustlsHttpsConnector = hyper_rustls::HttpsConnector<ProxyConnector>;
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
-type RustlsHyperClient = Client<RustlsHttpsConnector, ReqBody>;
+type RustlsHyperClient = HyperClient<RustlsHttpsConnector, ReqBody>;
 
 #[cfg(feature = "async-tls-native")]
 type NativeHttpsConnector = hyper_tls::HttpsConnector<ProxyConnector>;
 #[cfg(feature = "async-tls-native")]
-type NativeHyperClient = Client<NativeHttpsConnector, ReqBody>;
+type NativeHyperClient = HyperClient<NativeHttpsConnector, ReqBody>;
 
 #[derive(Clone)]
 enum TransportClient {
@@ -355,7 +355,7 @@ impl TransportClient {
     async fn request(
         &self,
         request: Request<ReqBody>,
-    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+    ) -> Result<HttpResponse<Incoming>, hyper_util::client::legacy::Error> {
         #[cfg(not(any(
             feature = "async-tls-native",
             feature = "async-tls-rustls-ring",
@@ -445,7 +445,7 @@ fn build_rustls_ring_transport(
         .enable_http1()
         .enable_http2()
         .wrap_connector(connector);
-    let transport = Client::builder(TokioExecutor::new())
+    let transport = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(pool_idle_timeout)
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .http2_only(http2_only)
@@ -488,7 +488,7 @@ fn build_rustls_aws_lc_rs_transport(
         .enable_http1()
         .enable_http2()
         .wrap_connector(connector);
-    let transport = Client::builder(TokioExecutor::new())
+    let transport = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(pool_idle_timeout)
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .http2_only(http2_only)
@@ -632,7 +632,7 @@ fn build_native_tls_transport(
     } else {
         hyper_tls::HttpsConnector::new_with_connector(connector)
     };
-    let transport = Client::builder(TokioExecutor::new())
+    let transport = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(pool_idle_timeout)
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .http2_only(http2_only)
@@ -802,7 +802,7 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) redirect_policy: Option<RedirectPolicy>,
 }
 
-pub struct HttpClientBuilder {
+pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
     request_timeout: Duration,
@@ -834,7 +834,7 @@ pub struct HttpClientBuilder {
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
-impl HttpClientBuilder {
+impl ClientBuilder {
     pub(crate) fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
@@ -1105,7 +1105,7 @@ impl HttpClientBuilder {
         self.interceptor_arc(Arc::new(interceptor))
     }
 
-    pub fn build(self) -> crate::Result<HttpClient> {
+    pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
 
         let proxy_config = self.http_proxy.map(|uri| ProxyConfig {
@@ -1128,7 +1128,7 @@ impl HttpClientBuilder {
             OtelTelemetry::disabled()
         };
 
-        Ok(HttpClient {
+        Ok(Client {
             base_url: self.base_url,
             default_headers: self.default_headers,
             request_timeout: self.request_timeout,
@@ -1163,7 +1163,7 @@ impl HttpClientBuilder {
 }
 
 #[derive(Clone)]
-pub struct HttpClient {
+pub struct Client {
     base_url: String,
     default_headers: HeaderMap,
     request_timeout: Duration,
@@ -1185,9 +1185,9 @@ pub struct HttpClient {
     interceptors: Vec<Arc<dyn HttpInterceptor>>,
 }
 
-impl HttpClient {
-    pub fn builder(base_url: impl Into<String>) -> HttpClientBuilder {
-        HttpClientBuilder::new(base_url)
+impl Client {
+    pub fn builder(base_url: impl Into<String>) -> ClientBuilder {
+        ClientBuilder::new(base_url)
     }
 
     pub fn request(&self, method: Method, path: impl Into<String>) -> RequestBuilder<'_> {
@@ -1350,7 +1350,7 @@ impl HttpClient {
         &self,
         transport_timeout: Duration,
         request: Request<ReqBody>,
-    ) -> Result<Response<Incoming>, TransportRequestError> {
+    ) -> Result<HttpResponse<Incoming>, TransportRequestError> {
         match timeout(transport_timeout, self.transport.request(request)).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(source)) => Err(TransportRequestError::Transport(source)),
@@ -1365,7 +1365,7 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, Error> {
+    ) -> Result<Response, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
@@ -1419,7 +1419,7 @@ impl HttpClient {
         headers: HeaderMap,
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponseStream, Error> {
+    ) -> Result<ResponseStream, Error> {
         let (uri_text, uri) = resolve_uri(&self.base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
@@ -1474,7 +1474,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponseStream, Error> {
+    ) -> Result<ResponseStream, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -1878,7 +1878,7 @@ impl HttpClient {
             }
             self.record_successful_request_for_resilience();
 
-            return Ok(HttpResponseStream::new(
+            return Ok(ResponseStream::new(
                 status,
                 response_headers,
                 response.into_body(),
@@ -1907,7 +1907,7 @@ impl HttpClient {
         merged_headers: HeaderMap,
         body: RequestBody,
         execution_options: RequestExecutionOptions,
-    ) -> Result<HttpResponse, Error> {
+    ) -> Result<Response, Error> {
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -2415,7 +2415,7 @@ impl HttpClient {
                 adaptive_guard.mark_success();
             }
             self.record_successful_request_for_resilience();
-            return Ok(HttpResponse::new(status, response_headers, response_body));
+            return Ok(Response::new(status, response_headers, response_body));
         }
 
         let error = deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);

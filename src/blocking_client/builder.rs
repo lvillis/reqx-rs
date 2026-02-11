@@ -21,12 +21,12 @@ use crate::util::{parse_header_name, parse_header_value, validate_base_url};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
 use super::{
-    AdaptiveConcurrencyController, DEFAULT_CLIENT_NAME, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_MAX_RESPONSE_BODY_BYTES, DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_MAX_IDLE_CONNECTIONS,
-    DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT, HttpClient, HttpClientBuilder,
+    AdaptiveConcurrencyController, Client, ClientBuilder, DEFAULT_CLIENT_NAME,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_RESPONSE_BODY_BYTES, DEFAULT_POOL_IDLE_TIMEOUT,
+    DEFAULT_POOL_MAX_IDLE_CONNECTIONS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT,
 };
 
-impl HttpClientBuilder {
+impl ClientBuilder {
     pub(crate) fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
@@ -285,7 +285,7 @@ impl HttpClientBuilder {
         self.interceptor_arc(Arc::new(interceptor))
     }
 
-    pub fn build(self) -> crate::Result<HttpClient> {
+    pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
 
         if !backend_is_available(self.tls_backend) {
@@ -334,7 +334,7 @@ impl HttpClientBuilder {
             OtelTelemetry::disabled()
         };
 
-        Ok(HttpClient {
+        Ok(Client {
             base_url: self.base_url,
             default_headers: self.default_headers,
             request_timeout: self.request_timeout,

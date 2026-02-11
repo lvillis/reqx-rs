@@ -14,8 +14,8 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{
-    Error, HttpClient, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext,
-    RetryPolicy, ServerThrottleScope, TimeoutPhase,
+    Client, Error, HttpInterceptor, RateLimitPolicy, RedirectPolicy, RequestContext, RetryPolicy,
+    ServerThrottleScope, TimeoutPhase,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -339,7 +339,7 @@ async fn retries_post_with_idempotency_key_then_succeeds() {
         ),
     ]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(
             RetryPolicy::standard()
@@ -389,7 +389,7 @@ async fn post_without_idempotency_key_does_not_retry() {
         Duration::ZERO,
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(
             RetryPolicy::standard()
@@ -427,7 +427,7 @@ async fn request_timeout_reports_transport_phase() {
         Duration::from_millis(120),
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
@@ -464,7 +464,7 @@ async fn decodes_gzip_response_and_sets_accept_encoding() {
         Duration::ZERO,
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -499,7 +499,7 @@ async fn decoded_gzip_response_still_respects_max_body_limit() {
         Duration::ZERO,
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .max_response_body_bytes(512)
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
@@ -536,7 +536,7 @@ async fn stream_into_response_limited_respects_decode_limit() {
         Duration::ZERO,
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -580,7 +580,7 @@ async fn query_helpers_append_encoded_query_pairs() {
         Duration::ZERO,
     )]);
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -632,7 +632,7 @@ async fn form_helper_sets_content_type_and_encoded_body() {
         "ok",
         Duration::ZERO,
     )]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -675,7 +675,7 @@ async fn body_stream_uploads_chunked_data_with_declared_length() {
         "ok",
         Duration::ZERO,
     )]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -706,7 +706,7 @@ async fn global_rate_limit_applies_between_parallel_requests() {
         MockResponse::new(200, Vec::<(String, String)>::new(), "ok-1", Duration::ZERO),
         MockResponse::new(200, Vec::<(String, String)>::new(), "ok-2", Duration::ZERO),
     ]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -739,7 +739,7 @@ async fn retry_after_429_backpressures_following_request() {
         MockResponse::new(429, vec![("Retry-After", "1")], "busy", Duration::ZERO),
         MockResponse::new(200, Vec::<(String, String)>::new(), "ok", Duration::ZERO),
     ]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(400))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -789,7 +789,7 @@ async fn retry_after_429_auto_scope_throttles_same_host_only() {
 
     let host_b_url = format!("{}/other-host", server_b.base_url);
 
-    let client = HttpClient::builder(server_a.base_url.clone())
+    let client = Client::builder(server_a.base_url.clone())
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -856,7 +856,7 @@ async fn retry_after_429_global_scope_backpressures_other_hosts() {
     )]);
     let host_b_url = format!("{}/other-host", server_b.base_url);
 
-    let client = HttpClient::builder(server_a.base_url.clone())
+    let client = Client::builder(server_a.base_url.clone())
         .request_timeout(Duration::from_secs(2))
         .retry_policy(RetryPolicy::disabled())
         .global_rate_limit_policy(
@@ -904,7 +904,7 @@ async fn response_body_timeout_reports_phase_and_metrics() {
         br#"{"ok":true}"#.to_vec(),
         Duration::from_millis(120),
     );
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
@@ -942,7 +942,7 @@ async fn decode_content_encoding_error_is_classified() {
         b"abc".to_vec(),
         Duration::ZERO,
     )]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(200))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
@@ -987,7 +987,7 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
             Duration::ZERO,
         ),
     ]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
@@ -1048,7 +1048,7 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
         r#"{"ok":true}"#,
         Duration::ZERO,
     )]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .build()
@@ -1086,7 +1086,7 @@ async fn redirect_policy_follows_relative_location() {
             Duration::ZERO,
         ),
     ]);
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .redirect_policy(RedirectPolicy::limited(3))
@@ -1153,7 +1153,7 @@ async fn interceptor_can_mutate_headers_and_observe_lifecycle() {
         error_hits: Arc::clone(&error_hits),
     });
 
-    let client = HttpClient::builder(server.base_url.clone())
+    let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(300))
         .retry_policy(RetryPolicy::disabled())
         .interceptor_arc(interceptor)

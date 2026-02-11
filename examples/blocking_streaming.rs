@@ -8,10 +8,10 @@ use std::time::Duration;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Cursor;
 
-    use reqx::blocking::HttpClient;
+    use reqx::blocking::Client;
     use reqx::prelude::RetryPolicy;
 
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-blocking-stream")
         .request_timeout(Duration::from_secs(5))
         .retry_policy(RetryPolicy::standard().max_attempts(2))

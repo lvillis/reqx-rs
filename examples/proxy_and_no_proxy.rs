@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use http::Uri;
-use reqx::prelude::{HttpClient, RetryPolicy};
+use reqx::prelude::{Client, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_uri: Uri = "http://proxy.example.com:8080".parse()?;
 
-    let client = HttpClient::builder("https://postman-echo.com")
+    let client = Client::builder("https://postman-echo.com")
         .client_name("reqx-example-proxy")
         .request_timeout(Duration::from_secs(3))
         .retry_policy(RetryPolicy::disabled())
