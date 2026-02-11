@@ -34,6 +34,8 @@ impl ClientBuilder {
         Self {
             base_url: base_url.into(),
             default_headers: HeaderMap::new(),
+            buffered_auto_accept_encoding: true,
+            stream_auto_accept_encoding: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             total_timeout: None,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
@@ -140,6 +142,22 @@ impl ClientBuilder {
 
     pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.default_headers.insert(name, value);
+        self
+    }
+
+    pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.buffered_auto_accept_encoding = enabled;
+        self.stream_auto_accept_encoding = enabled;
+        self
+    }
+
+    pub fn buffered_auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.buffered_auto_accept_encoding = enabled;
+        self
+    }
+
+    pub fn stream_auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.stream_auto_accept_encoding = enabled;
         self
     }
 
@@ -444,6 +462,8 @@ impl ClientBuilder {
         Ok(Client {
             base_url: self.base_url,
             default_headers: self.default_headers,
+            buffered_auto_accept_encoding: self.buffered_auto_accept_encoding,
+            stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,
             total_timeout: self.total_timeout,
             max_response_body_bytes: self.max_response_body_bytes,

@@ -143,6 +143,7 @@ struct RequestExecutionOptions {
     max_response_body_bytes: Option<usize>,
     redirect_policy: Option<RedirectPolicy>,
     status_policy: Option<StatusPolicy>,
+    auto_accept_encoding: Option<bool>,
 }
 
 enum RequestBody {
@@ -153,6 +154,8 @@ enum RequestBody {
 pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
+    buffered_auto_accept_encoding: bool,
+    stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
     max_response_body_bytes: usize,
@@ -189,6 +192,8 @@ pub struct ClientBuilder {
 pub struct Client {
     base_url: String,
     default_headers: HeaderMap,
+    buffered_auto_accept_encoding: bool,
+    stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
     max_response_body_bytes: usize,

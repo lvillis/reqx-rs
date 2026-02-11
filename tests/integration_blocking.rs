@@ -334,6 +334,32 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
 }
 
 #[test]
+fn blocking_buffered_request_accept_encoding_can_be_disabled_per_request() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        br#"{"ok":true}"#.to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .get("/v1/no-auto-accept-encoding")
+        .auto_accept_encoding(false)
+        .send_json()
+        .expect("request should succeed");
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers.get("accept-encoding"), None);
+}
+
+#[test]
 fn blocking_head_empty_body_with_content_encoding_is_not_decoded() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -997,6 +1023,73 @@ fn blocking_send_stream_keeps_raw_bytes_and_decode_is_explicit() {
         }
         other => panic!("unexpected error: {other}"),
     }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].headers.get("accept-encoding"), None);
+    assert_eq!(requests[1].headers.get("accept-encoding"), None);
+}
+
+#[test]
+fn blocking_send_stream_accept_encoding_can_be_opted_in_per_request() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let _ = client
+        .get("/v1/stream-opt-in")
+        .auto_accept_encoding(true)
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("accept-encoding")
+            .map(String::as_str),
+        Some("gzip, br, deflate, zstd")
+    );
+}
+
+#[test]
+fn blocking_stream_auto_accept_encoding_can_be_enabled_at_client_level() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .stream_auto_accept_encoding(true)
+        .build()
+        .expect("client should build");
+
+    let _ = client
+        .get("/v1/stream-client-opt-in")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("accept-encoding")
+            .map(String::as_str),
+        Some("gzip, br, deflate, zstd")
+    );
 }
 
 #[test]

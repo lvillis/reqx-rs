@@ -539,7 +539,12 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_blocking(&method, &mut merged_headers);
+        let auto_accept_encoding = execution_options
+            .auto_accept_encoding
+            .unwrap_or(self.buffered_auto_accept_encoding);
+        if auto_accept_encoding {
+            ensure_accept_encoding_blocking(&method, &mut merged_headers);
+        }
 
         let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
         let otel_span = self
@@ -589,7 +594,12 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_blocking(&method, &mut merged_headers);
+        let auto_accept_encoding = execution_options
+            .auto_accept_encoding
+            .unwrap_or(self.stream_auto_accept_encoding);
+        if auto_accept_encoding {
+            ensure_accept_encoding_blocking(&method, &mut merged_headers);
+        }
 
         let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
         let otel_span = self

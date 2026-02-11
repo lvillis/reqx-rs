@@ -29,6 +29,7 @@ pub struct RequestBuilder<'a> {
     retry_policy: Option<RetryPolicy>,
     redirect_policy: Option<RedirectPolicy>,
     status_policy: Option<StatusPolicy>,
+    auto_accept_encoding: Option<bool>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -46,6 +47,7 @@ impl<'a> RequestBuilder<'a> {
             retry_policy: None,
             redirect_policy: None,
             status_policy: None,
+            auto_accept_encoding: None,
         }
     }
 
@@ -191,6 +193,11 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.auto_accept_encoding = Some(enabled);
+        self
+    }
+
     pub fn response_mode(self) -> Self {
         self.status_policy(StatusPolicy::Response)
     }
@@ -208,6 +215,7 @@ impl<'a> RequestBuilder<'a> {
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
             status_policy: self.status_policy,
+            auto_accept_encoding: self.auto_accept_encoding,
         };
         self.client.send_request(
             self.method,
@@ -227,6 +235,7 @@ impl<'a> RequestBuilder<'a> {
             retry_policy: self.retry_policy,
             redirect_policy: self.redirect_policy,
             status_policy: self.status_policy,
+            auto_accept_encoding: self.auto_accept_encoding,
         };
         self.client.send_request_stream(
             self.method,

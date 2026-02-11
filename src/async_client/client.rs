@@ -797,11 +797,14 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) max_response_body_bytes: Option<usize>,
     pub(crate) redirect_policy: Option<RedirectPolicy>,
     pub(crate) status_policy: Option<StatusPolicy>,
+    pub(crate) auto_accept_encoding: Option<bool>,
 }
 
 pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
+    buffered_auto_accept_encoding: bool,
+    stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
     max_response_body_bytes: usize,
@@ -842,6 +845,8 @@ impl ClientBuilder {
         Self {
             base_url: base_url.into(),
             default_headers: HeaderMap::new(),
+            buffered_auto_accept_encoding: true,
+            stream_auto_accept_encoding: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             total_timeout: None,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
@@ -950,6 +955,22 @@ impl ClientBuilder {
 
     pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.default_headers.insert(name, value);
+        self
+    }
+
+    pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.buffered_auto_accept_encoding = enabled;
+        self.stream_auto_accept_encoding = enabled;
+        self
+    }
+
+    pub fn buffered_auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.buffered_auto_accept_encoding = enabled;
+        self
+    }
+
+    pub fn stream_auto_accept_encoding(mut self, enabled: bool) -> Self {
+        self.stream_auto_accept_encoding = enabled;
         self
     }
 
@@ -1238,6 +1259,8 @@ impl ClientBuilder {
         Ok(Client {
             base_url: self.base_url,
             default_headers: self.default_headers,
+            buffered_auto_accept_encoding: self.buffered_auto_accept_encoding,
+            stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,
             total_timeout: self.total_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
@@ -1279,6 +1302,8 @@ impl ClientBuilder {
 pub struct Client {
     base_url: String,
     default_headers: HeaderMap,
+    buffered_auto_accept_encoding: bool,
+    stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
     max_response_body_bytes: usize,
@@ -1732,7 +1757,12 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_async(&method, &mut merged_headers);
+        let auto_accept_encoding = execution_options
+            .auto_accept_encoding
+            .unwrap_or(self.buffered_auto_accept_encoding);
+        if auto_accept_encoding {
+            ensure_accept_encoding_async(&method, &mut merged_headers);
+        }
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
@@ -1792,7 +1822,12 @@ impl Client {
         let (uri_text, uri) = resolve_uri(&base_url, &path)?;
         let redacted_uri_text = redact_uri_for_logs(&uri_text);
         let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        ensure_accept_encoding_async(&method, &mut merged_headers);
+        let auto_accept_encoding = execution_options
+            .auto_accept_encoding
+            .unwrap_or(self.stream_auto_accept_encoding);
+        if auto_accept_encoding {
+            ensure_accept_encoding_async(&method, &mut merged_headers);
+        }
         let body = body.unwrap_or_else(RequestBody::empty);
         let otel_span = self
             .metrics
