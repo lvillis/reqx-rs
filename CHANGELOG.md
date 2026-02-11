@@ -1,8 +1,17 @@
+## [0.1.9] - 2026-02-11
+
+### 🚜 Refactor
+
+- Standardize public API names to Client/Response
 ## [0.1.8] - 2026-02-10
 
 ### 🚜 Refactor
 
 - Standardize public and internal naming conventions
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.8
 ## [0.1.7] - 2026-02-10
 
 ### 🐛 Bug Fixes
