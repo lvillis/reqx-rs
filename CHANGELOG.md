@@ -1,8 +1,26 @@
+## [0.1.10] - 2026-02-11
+
+### 🚀 Features
+
+- Add response-first status policy and preserve non-2xx headers
+
+### 🐛 Bug Fixes
+
+- *(api)* Align retry semantics and decode error hooks
+
+### 🚜 Refactor
+
+- Align stream semantics and unify decode/retry paths
+- Polish transport API contracts, naming, and resilience flows
 ## [0.1.9] - 2026-02-11
 
 ### 🚜 Refactor
 
 - Standardize public API names to Client/Response
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.9
 ## [0.1.8] - 2026-02-10
 
 ### 🚜 Refactor
