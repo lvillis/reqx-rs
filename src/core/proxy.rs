@@ -22,6 +22,7 @@ use tower_service::Service;
 use url::Url;
 
 use crate::error::Error;
+use crate::util::default_port;
 
 #[cfg(feature = "_async")]
 pub(crate) type BoxConnectError = Box<dyn StdError + Send + Sync>;
@@ -36,20 +37,24 @@ pub(crate) struct ProxyConfig {
 #[derive(Clone, Debug)]
 pub(crate) enum NoProxyRule {
     Any,
-    Domain(String),
+    Domain { host: String, port: Option<u16> },
 }
 
 impl NoProxyRule {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let mut candidate = text.trim().to_owned();
+        let mut port = None;
         if candidate.is_empty() {
             return None;
         }
         if candidate == "*" {
             return Some(Self::Any);
         }
-        if let Ok(url) = Url::parse(&candidate) {
-            candidate = url.host_str().unwrap_or_default().to_owned();
+        if let Ok(url) = Url::parse(&candidate)
+            && let Some(host) = url.host_str()
+        {
+            candidate = host.to_owned();
+            port = url.port();
         }
         candidate = candidate.trim_start_matches('.').to_owned();
         if candidate.is_empty() {
@@ -59,34 +64,48 @@ impl NoProxyRule {
             let end = stripped.find(']')?;
             let host = &stripped[..end];
             let suffix = &stripped[end + 1..];
-            let has_valid_port_suffix = suffix.is_empty()
-                || (suffix.starts_with(':')
-                    && suffix.len() > 1
-                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit()));
-            if !has_valid_port_suffix {
+            if suffix.is_empty() {
+                port = None;
+            } else if let Some(raw_port) = suffix.strip_prefix(':') {
+                port = Some(raw_port.parse::<u16>().ok()?);
+            } else {
                 return None;
             }
             candidate = host.to_owned();
         } else if candidate.matches(':').count() == 1 {
-            let (host, port) = candidate.rsplit_once(':')?;
-            if host.is_empty() || port.is_empty() {
+            let (host, raw_port) = candidate.rsplit_once(':')?;
+            if host.is_empty() {
                 return None;
             }
-            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
+            port = Some(raw_port.parse::<u16>().ok()?);
             candidate = host.to_owned();
         }
         if candidate.is_empty() {
             return None;
         }
-        Some(Self::Domain(candidate.to_ascii_lowercase()))
+        Some(Self::Domain {
+            host: candidate.to_ascii_lowercase(),
+            port,
+        })
     }
 
-    pub(crate) fn matches(&self, host: &str) -> bool {
+    pub(crate) fn matches(&self, host: &str, port: Option<u16>) -> bool {
         match self {
             Self::Any => true,
-            Self::Domain(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+            Self::Domain {
+                host: domain,
+                port: rule_port,
+            } => {
+                let host_matches = host == domain || host.ends_with(&format!(".{domain}"));
+                if !host_matches {
+                    return false;
+                }
+
+                match rule_port {
+                    Some(rule_port) => port == Some(*rule_port),
+                    None => true,
+                }
+            }
         }
     }
 }
@@ -96,7 +115,10 @@ pub(crate) fn should_bypass_proxy_uri(no_proxy_rules: &[NoProxyRule], uri: &Uri)
         return false;
     };
     let normalized = host.to_ascii_lowercase();
-    no_proxy_rules.iter().any(|rule| rule.matches(&normalized))
+    let port = uri.port_u16().or_else(|| default_port(uri));
+    no_proxy_rules
+        .iter()
+        .any(|rule| rule.matches(&normalized, port))
 }
 
 pub(crate) fn parse_no_proxy_rule(rule: &str) -> crate::Result<NoProxyRule> {

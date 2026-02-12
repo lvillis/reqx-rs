@@ -218,11 +218,15 @@ fn build_rustls_root_store(
     tls_backend: TlsBackend,
     tls_options: &TlsOptions,
 ) -> crate::Result<rustls::RootCertStore> {
-    if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
+    if !tls_options.root_certificates.is_empty()
+        && !matches!(
+            tls_options.root_store,
+            TlsRootStore::System | TlsRootStore::Specific
+        )
     {
         return Err(tls_config_error(
             tls_backend,
-            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -255,7 +259,11 @@ fn build_rustls_root_store(
         system_added = added;
     }
 
-    let custom_added = if tls_options.root_store == TlsRootStore::Specific {
+    let custom_added = if matches!(
+        tls_options.root_store,
+        TlsRootStore::System | TlsRootStore::Specific
+    ) && !tls_options.root_certificates.is_empty()
+    {
         add_custom_rustls_root_certificates(tls_backend, tls_options, &mut root_store)?
     } else {
         0
@@ -551,11 +559,15 @@ fn build_native_tls_connector(
 ) -> crate::Result<hyper_tls::native_tls::TlsConnector> {
     let mut connector_builder = hyper_tls::native_tls::TlsConnector::builder();
 
-    if !tls_options.root_certificates.is_empty() && tls_options.root_store != TlsRootStore::Specific
+    if !tls_options.root_certificates.is_empty()
+        && !matches!(
+            tls_options.root_store,
+            TlsRootStore::System | TlsRootStore::Specific
+        )
     {
         return Err(tls_config_error(
             TlsBackend::NativeTls,
-            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -1984,7 +1996,7 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let _global_permit = match self.acquire_global_request_permit().await {
+        let global_permit = match self.acquire_global_request_permit().await {
             Ok(permit) => permit,
             Err(error) => {
                 self.metrics
@@ -1995,16 +2007,27 @@ impl Client {
             }
         };
 
-        let result = self
-            .send_request_stream_with_retry(
-                method,
-                uri,
-                redacted_uri_text,
-                merged_headers,
-                body,
-                execution_options,
+        let result = match self
+            .send_request_with_retry_mode(
+                RetryRequestInput {
+                    method,
+                    uri,
+                    redacted_uri_text,
+                    merged_headers,
+                    body,
+                    execution_options,
+                },
+                ResponseMode::Stream,
+                Some(global_permit),
             )
-            .await;
+            .await
+        {
+            Ok(RetryResponse::Stream(response)) => Ok(response),
+            Ok(RetryResponse::Buffered(_)) => {
+                unreachable!("stream mode returned buffered response")
+            }
+            Err(error) => Err(error),
+        };
         self.metrics
             .record_request_completed_stream(&result, request_started_at.elapsed());
         match &result {
@@ -2016,34 +2039,6 @@ impl Client {
                 .finish_otel_request_span_error(otel_span, error),
         }
         result
-    }
-
-    async fn send_request_stream_with_retry(
-        &self,
-        method: Method,
-        uri: Uri,
-        redacted_uri_text: String,
-        merged_headers: HeaderMap,
-        body: RequestBody,
-        execution_options: RequestExecutionOptions,
-    ) -> Result<ResponseStream, Error> {
-        match self
-            .send_request_with_retry_mode(
-                RetryRequestInput {
-                    method,
-                    uri,
-                    redacted_uri_text,
-                    merged_headers,
-                    body,
-                    execution_options,
-                },
-                ResponseMode::Stream,
-            )
-            .await?
-        {
-            RetryResponse::Stream(response) => Ok(response),
-            RetryResponse::Buffered(_) => unreachable!("stream mode returned buffered response"),
-        }
     }
 
     async fn send_request_with_retry(
@@ -2066,6 +2061,7 @@ impl Client {
                     execution_options,
                 },
                 ResponseMode::Buffered,
+                None,
             )
             .await?
         {
@@ -2078,6 +2074,7 @@ impl Client {
         &self,
         input: RetryRequestInput,
         response_mode: ResponseMode,
+        stream_global_permit: Option<GlobalRequestPermit>,
     ) -> Result<RetryResponse, Error> {
         let RetryRequestInput {
             method,
@@ -2125,6 +2122,7 @@ impl Client {
         let mut current_uri = uri;
         let mut current_redacted_uri = redacted_uri_text;
         let mut current_headers = merged_headers;
+        let mut stream_global_permit = stream_global_permit;
 
         while attempt <= max_attempts {
             let span = if matches!(response_mode, ResponseMode::Stream) {
@@ -2193,7 +2191,7 @@ impl Client {
             self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
             self.run_request_interceptors(&context, &mut attempt_headers);
             let host_key = rate_limit_bucket_key(&current_uri);
-            let _host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {
+            let host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {
                 Ok(permit) => permit,
                 Err(error) => {
                     self.run_error_interceptors(&context, &error);
@@ -2400,6 +2398,8 @@ impl Client {
                         response.into_body(),
                         current_method.clone(),
                         current_redacted_uri.clone(),
+                        stream_global_permit.take(),
+                        Some(host_permit),
                     )));
                 }
 
@@ -2468,6 +2468,8 @@ impl Client {
                         response.into_body(),
                         current_method.clone(),
                         current_redacted_uri.clone(),
+                        stream_global_permit.take(),
+                        Some(host_permit),
                     )));
                 }
             }

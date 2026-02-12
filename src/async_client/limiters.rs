@@ -23,10 +23,12 @@ struct PerHostLimiterEntry {
     last_used_at: Instant,
 }
 
+#[derive(Debug)]
 pub(crate) struct GlobalRequestPermit {
     pub(crate) _permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug)]
 pub(crate) struct HostRequestPermit {
     pub(crate) _permit: Option<OwnedSemaphorePermit>,
 }

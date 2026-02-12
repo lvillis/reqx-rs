@@ -9,7 +9,7 @@ use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limite
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
-use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri};
+use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
@@ -670,16 +670,17 @@ fn tls_root_store_specific_without_roots_returns_tls_config_error() {
 }
 
 #[test]
-fn custom_root_ca_requires_specific_root_store() {
+fn custom_root_ca_requires_explicit_root_store() {
     let result = Client::builder("https://api.example.com")
         .tls_root_ca_der([1_u8, 2, 3, 4])
         .build();
     let error = match result {
-        Ok(_) => panic!("custom root ca should require specific root store"),
+        Ok(_) => panic!("custom root ca should require an explicit root store"),
         Err(error) => error,
     };
     match error {
         Error::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::System"));
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),
@@ -761,23 +762,45 @@ fn native_tls_webpki_root_store_is_rejected() {
 #[test]
 fn no_proxy_rule_matches_domain_and_subdomain() {
     let rule = NoProxyRule::parse(".example.com").expect("valid rule");
-    assert!(rule.matches("example.com"));
-    assert!(rule.matches("api.example.com"));
-    assert!(!rule.matches("another.com"));
+    assert!(rule.matches("example.com", None));
+    assert!(rule.matches("api.example.com", None));
+    assert!(!rule.matches("another.com", None));
 }
 
 #[test]
 fn no_proxy_rule_parses_bracketed_ipv6_with_port() {
     let rule = NoProxyRule::parse("[::1]:8080").expect("valid ipv6 rule");
-    assert!(rule.matches("::1"));
-    assert!(!rule.matches("::2"));
+    assert!(rule.matches("::1", Some(8080)));
+    assert!(!rule.matches("::1", Some(8081)));
+    assert!(!rule.matches("::2", Some(8080)));
 }
 
 #[test]
 fn no_proxy_rule_keeps_plain_ipv6_without_port() {
     let rule = NoProxyRule::parse("2001:db8::1").expect("valid ipv6 rule");
-    assert!(rule.matches("2001:db8::1"));
-    assert!(!rule.matches("2001:db8::2"));
+    assert!(rule.matches("2001:db8::1", None));
+    assert!(!rule.matches("2001:db8::2", None));
+}
+
+#[test]
+fn no_proxy_rule_with_port_requires_matching_port() {
+    let rule = NoProxyRule::parse("api.example.com:8443").expect("valid host:port rule");
+    assert!(rule.matches("api.example.com", Some(8443)));
+    assert!(!rule.matches("api.example.com", Some(443)));
+    assert!(!rule.matches("api.example.com", None));
+}
+
+#[test]
+fn no_proxy_bypass_uses_default_uri_port_when_missing() {
+    let rules = vec![NoProxyRule::parse("api.example.com:443").expect("valid host:port rule")];
+    let https_uri: http::Uri = "https://api.example.com/v1"
+        .parse()
+        .expect("uri should parse");
+    let http_uri: http::Uri = "http://api.example.com/v1"
+        .parse()
+        .expect("uri should parse");
+    assert!(should_bypass_proxy_uri(&rules, &https_uri));
+    assert!(!should_bypass_proxy_uri(&rules, &http_uri));
 }
 
 #[test]

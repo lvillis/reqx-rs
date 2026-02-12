@@ -954,36 +954,36 @@ fn blocking_build_rejects_base_url_with_query() {
 }
 
 #[test]
-fn blocking_tls_root_store_system_rejects_custom_roots() {
-    let result = Client::builder("https://api.example.com")
-        .tls_root_store(TlsRootStore::System)
-        .tls_root_ca_der([1_u8, 2, 3, 4])
-        .build();
-    let error = match result {
-        Ok(_) => panic!("system root store should reject custom roots"),
-        Err(error) => error,
+fn blocking_tls_root_store_system_accepts_custom_roots() {
+    let custom_der = rustls_native_certs::load_native_certs()
+        .certs
+        .into_iter()
+        .next()
+        .map(|certificate| certificate.as_ref().to_vec());
+    let Some(custom_der) = custom_der else {
+        return;
     };
 
-    match error {
-        Error::TlsConfig { message, .. } => {
-            assert!(message.contains("TlsRootStore::Specific"));
-        }
-        other => panic!("unexpected error: {other}"),
-    }
+    let result = Client::builder("https://api.example.com")
+        .tls_root_store(TlsRootStore::System)
+        .tls_root_ca_der(custom_der)
+        .build();
+    result.expect("system root store should allow appending custom roots");
 }
 
 #[test]
-fn blocking_custom_root_ca_requires_specific_root_store() {
+fn blocking_custom_root_ca_requires_explicit_root_store() {
     let result = Client::builder("https://api.example.com")
         .tls_root_ca_der([1_u8, 2, 3, 4])
         .build();
     let error = match result {
-        Ok(_) => panic!("custom root ca should require specific root store"),
+        Ok(_) => panic!("custom root ca should require an explicit root store"),
         Err(error) => error,
     };
 
     match error {
         Error::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::System"));
             assert!(message.contains("TlsRootStore::Specific"));
         }
         other => panic!("unexpected error: {other}"),

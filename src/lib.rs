@@ -157,6 +157,8 @@ pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Ret
 pub use crate::response::Response;
 #[cfg(feature = "_async")]
 pub use crate::response::ResponseStream;
+#[cfg(feature = "_async")]
+pub use crate::response::StreamBody;
 pub use crate::retry::{
     PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,

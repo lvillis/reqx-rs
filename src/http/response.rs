@@ -51,10 +51,13 @@ impl Response {
 
 #[cfg(feature = "_async")]
 mod stream {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
     use http_body_util::BodyExt;
-    use hyper::body::Incoming;
+    use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -64,6 +67,7 @@ mod stream {
     };
     use crate::content_encoding::should_decode_content_encoded_body;
     use crate::error::Error;
+    use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
     use crate::response::Response;
 
     fn map_read_body_error(
@@ -110,12 +114,55 @@ mod stream {
     }
 
     #[derive(Debug)]
+    pub struct StreamBody {
+        inner: Incoming,
+        _global_permit: Option<GlobalRequestPermit>,
+        _host_permit: Option<HostRequestPermit>,
+    }
+
+    impl StreamBody {
+        pub(crate) fn new(
+            inner: Incoming,
+            global_permit: Option<GlobalRequestPermit>,
+            host_permit: Option<HostRequestPermit>,
+        ) -> Self {
+            Self {
+                inner,
+                _global_permit: global_permit,
+                _host_permit: host_permit,
+            }
+        }
+    }
+
+    impl HyperBody for StreamBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Pin::new(&mut self.inner).poll_frame(cx)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.inner.is_end_stream()
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            self.inner.size_hint()
+        }
+    }
+
+    #[derive(Debug)]
     pub struct ResponseStream {
         status: StatusCode,
         headers: HeaderMap,
         body: Incoming,
         method: http::Method,
         uri: String,
+        _global_permit: Option<GlobalRequestPermit>,
+        _host_permit: Option<HostRequestPermit>,
     }
 
     impl ResponseStream {
@@ -125,6 +172,8 @@ mod stream {
             body: Incoming,
             method: http::Method,
             uri: String,
+            global_permit: Option<GlobalRequestPermit>,
+            host_permit: Option<HostRequestPermit>,
         ) -> Self {
             Self {
                 status,
@@ -132,6 +181,8 @@ mod stream {
                 body,
                 method,
                 uri,
+                _global_permit: global_permit,
+                _host_permit: host_permit,
             }
         }
 
@@ -151,8 +202,8 @@ mod stream {
             &self.uri
         }
 
-        pub fn into_body(self) -> Incoming {
-            self.body
+        pub fn into_body(self) -> StreamBody {
+            StreamBody::new(self.body, self._global_permit, self._host_permit)
         }
 
         pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
@@ -234,6 +285,8 @@ mod stream {
                 body,
                 method,
                 uri,
+                _global_permit: _,
+                _host_permit: _,
             } = self;
             let max_bytes = max_bytes.max(1);
             let body = read_all_body_limited(body, max_bytes)
@@ -541,4 +594,4 @@ mod blocking_stream {
 #[cfg(feature = "_blocking")]
 pub use blocking_stream::BlockingResponseStream;
 #[cfg(feature = "_async")]
-pub use stream::ResponseStream;
+pub use stream::{ResponseStream, StreamBody};

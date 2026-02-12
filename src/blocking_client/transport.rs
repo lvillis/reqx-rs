@@ -93,6 +93,31 @@ fn parse_pem_certificates(
     feature = "blocking-tls-rustls-aws-lc-rs",
     feature = "blocking-tls-native"
 ))]
+fn load_system_root_certificates(
+    backend: TlsBackend,
+) -> crate::Result<Vec<ureq::tls::Certificate<'static>>> {
+    let loaded = rustls_native_certs::load_native_certs();
+    let mut certificates = Vec::new();
+
+    for certificate in loaded.certs {
+        certificates.push(ureq::tls::Certificate::from_der(certificate.as_ref()).to_owned());
+    }
+
+    if certificates.is_empty() && !loaded.errors.is_empty() {
+        return Err(tls_config_error(
+            backend,
+            "failed to load system root certificates",
+        ));
+    }
+
+    Ok(certificates)
+}
+
+#[cfg(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs",
+    feature = "blocking-tls-native"
+))]
 fn build_sync_tls_config(
     backend: TlsBackend,
     tls_options: &TlsOptions,
@@ -116,10 +141,15 @@ fn build_sync_tls_config(
         }
     }
 
-    if !roots.is_empty() && tls_options.root_store != TlsRootStore::Specific {
+    if !roots.is_empty()
+        && !matches!(
+            tls_options.root_store,
+            TlsRootStore::System | TlsRootStore::Specific
+        )
+    {
         return Err(tls_config_error(
             backend,
-            "custom root CAs require tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -129,8 +159,21 @@ fn build_sync_tls_config(
             tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
         }
         TlsRootStore::System => {
-            tls_config_builder =
-                tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
+            if roots.is_empty() {
+                tls_config_builder =
+                    tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
+            } else {
+                let mut combined_roots = load_system_root_certificates(backend)?;
+                combined_roots.extend(roots);
+                if combined_roots.is_empty() {
+                    return Err(tls_config_error(
+                        backend,
+                        "failed to load system root certificates",
+                    ));
+                }
+                tls_config_builder = tls_config_builder
+                    .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
+            }
         }
         TlsRootStore::Specific => {
             if roots.is_empty() {

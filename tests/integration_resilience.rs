@@ -641,6 +641,59 @@ async fn max_in_flight_enforces_single_active_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_stream_holds_permit_until_stream_is_dropped() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let first_stream = client
+        .get("/stream-hold")
+        .send_stream()
+        .await
+        .expect("first stream request should succeed");
+
+    let started = Instant::now();
+    let cloned = client.clone();
+    let second = tokio::spawn(async move {
+        cloned
+            .get("/stream-after-drop")
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    });
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !second.is_finished(),
+        "second request should remain queued while first stream is alive"
+    );
+
+    drop(first_stream);
+
+    let status = second
+        .await
+        .expect("join spawned request")
+        .expect("second request should succeed");
+    assert_eq!(status, 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(120),
+        "second request should wait until stream drop before acquiring permit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn max_in_flight_per_host_limits_each_host_independently() {
     let server_a = CountingServer::start(
         2,
