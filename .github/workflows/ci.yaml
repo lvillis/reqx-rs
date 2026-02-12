@@ -40,6 +40,9 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install nightly toolchain for docsrs-check
+        run: rustup toolchain install nightly --profile minimal
+
       - name: Run CI checks
         run: just ci
 

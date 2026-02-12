@@ -48,12 +48,23 @@ impl NoProxyRule {
             candidate = url.host_str().unwrap_or_default().to_owned();
         }
         candidate = candidate.trim_start_matches('.').to_owned();
-        if candidate.starts_with('[')
-            && let Some(end) = candidate.find(']')
-        {
-            candidate = candidate[1..end].to_owned();
+        if candidate.is_empty() {
+            return None;
         }
-        if let Some((host, port)) = candidate.rsplit_once(':')
+        if let Some(stripped) = candidate.strip_prefix('[') {
+            let end = stripped.find(']')?;
+            let host = &stripped[..end];
+            let suffix = &stripped[end + 1..];
+            let has_valid_port_suffix = suffix.is_empty()
+                || (suffix.starts_with(':')
+                    && suffix.len() > 1
+                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit()));
+            if !has_valid_port_suffix {
+                return None;
+            }
+            candidate = host.to_owned();
+        } else if candidate.matches(':').count() == 1
+            && let Some((host, port)) = candidate.rsplit_once(':')
             && !port.is_empty()
             && port.bytes().all(|byte| byte.is_ascii_digit())
             && !host.is_empty()

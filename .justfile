@@ -74,7 +74,7 @@ private-guard:
       exit 1; \
     fi
 
-ci: private-guard fmt-check check-all examples-all clippy test
+ci: private-guard fmt-check check-all examples-all clippy docsrs-check test
 
 package:
     cargo package

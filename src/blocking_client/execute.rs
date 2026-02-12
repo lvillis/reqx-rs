@@ -415,6 +415,36 @@ impl Client {
         }
     }
 
+    fn read_decoded_response_body_with_retry(
+        &self,
+        response: &mut ureq::http::Response<ureq::Body>,
+        response_headers: &mut HeaderMap,
+        status: http::StatusCode,
+        retry_context: BodyReadRetryContext<'_>,
+    ) -> Result<Option<Bytes>, Error> {
+        let max_response_body_bytes = retry_context.max_response_body_bytes;
+        let context = retry_context.context;
+        let response_body = match self.read_response_body_with_retry(response, retry_context)? {
+            Some(body) => body,
+            None => return Ok(None),
+        };
+        let should_decode_response_body =
+            should_decode_content_encoded_body(context.method(), status, response_body.len());
+        let response_body = self.decode_response_body_limited(
+            response_body,
+            response_headers,
+            max_response_body_bytes,
+            status,
+            context,
+        )?;
+        if should_decode_response_body
+            && response_headers.contains_key(http::header::CONTENT_ENCODING)
+        {
+            remove_content_encoding_headers(response_headers);
+        }
+        Ok(Some(response_body))
+    }
+
     fn select_agent(&self, uri: &Uri) -> (&ureq::Agent, bool) {
         if let Some(proxy_config) = &self.proxy_config
             && !is_proxy_bypassed(proxy_config, uri)
@@ -927,8 +957,10 @@ impl Client {
                         transport_timeout.as_millis(),
                     ));
                 }
-                let response_body = match self.read_response_body_with_retry(
+                let response_body = match self.read_decoded_response_body_with_retry(
                     &mut response,
+                    &mut response_headers,
+                    status,
                     BodyReadRetryContext {
                         context: &context,
                         max_response_body_bytes,
@@ -945,23 +977,6 @@ impl Client {
                     Some(body) => body,
                     None => continue,
                 };
-                let should_decode_response_body = should_decode_content_encoded_body(
-                    &current_method,
-                    status,
-                    response_body.len(),
-                );
-                let response_body = self.decode_response_body_limited(
-                    response_body,
-                    &response_headers,
-                    max_response_body_bytes,
-                    status,
-                    &context,
-                )?;
-                if should_decode_response_body
-                    && response_headers.contains_key(http::header::CONTENT_ENCODING)
-                {
-                    remove_content_encoding_headers(&mut response_headers);
-                }
                 let error = http_status_error(
                     status,
                     &current_method,
@@ -1243,8 +1258,10 @@ impl Client {
                 continue;
             }
 
-            let response_body = match self.read_response_body_with_retry(
+            let response_body = match self.read_decoded_response_body_with_retry(
                 &mut response,
+                &mut response_headers,
+                status,
                 BodyReadRetryContext {
                     context: &context,
                     max_response_body_bytes,
@@ -1261,20 +1278,6 @@ impl Client {
                 Some(body) => body,
                 None => continue,
             };
-            let should_decode_response_body =
-                should_decode_content_encoded_body(&current_method, status, response_body.len());
-            let response_body = self.decode_response_body_limited(
-                response_body,
-                &response_headers,
-                max_response_body_bytes,
-                status,
-                &context,
-            )?;
-            if should_decode_response_body
-                && response_headers.contains_key(http::header::CONTENT_ENCODING)
-            {
-                remove_content_encoding_headers(&mut response_headers);
-            }
             self.run_response_interceptors(&context, status, &response_headers);
 
             if !status.is_success() {

@@ -1733,6 +1733,37 @@ impl Client {
         }
     }
 
+    async fn read_decoded_response_body_with_retry(
+        &self,
+        body: Incoming,
+        response_headers: &mut HeaderMap,
+        status: http::StatusCode,
+        read_context: ReadBodyRetryContext<'_>,
+    ) -> Result<Option<Bytes>, Error> {
+        let max_response_body_bytes = read_context.max_response_body_bytes;
+        let context = read_context.context;
+        let response_body = match self
+            .read_response_body_with_retry(body, read_context)
+            .await?
+        {
+            Some(body) => body,
+            None => return Ok(None),
+        };
+        let should_decode_response_body =
+            should_decode_content_encoded_body(context.method(), status, response_body.len());
+        let response_body = self.decode_response_body_limited(
+            response_body,
+            response_headers,
+            max_response_body_bytes,
+            status,
+            context,
+        )?;
+        if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
+            remove_content_encoding_headers(response_headers);
+        }
+        Ok(Some(response_body))
+    }
+
     async fn acquire_global_request_permit(&self) -> Result<GlobalRequestPermit, Error> {
         match &self.request_limiters {
             Some(limiters) => limiters.acquire_global().await,
@@ -2244,8 +2275,10 @@ impl Client {
                     ));
                 }
                 let response_body = match self
-                    .read_response_body_with_retry(
+                    .read_decoded_response_body_with_retry(
                         response.into_body(),
+                        &mut response_headers,
+                        status,
                         ReadBodyRetryContext {
                             context: &context,
                             max_response_body_bytes,
@@ -2264,21 +2297,6 @@ impl Client {
                     Some(body) => body,
                     None => continue,
                 };
-                let should_decode_response_body = should_decode_content_encoded_body(
-                    &current_method,
-                    status,
-                    response_body.len(),
-                );
-                let response_body = self.decode_response_body_limited(
-                    response_body,
-                    &response_headers,
-                    max_response_body_bytes,
-                    status,
-                    &context,
-                )?;
-                if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
-                    remove_content_encoding_headers(&mut response_headers);
-                }
                 let error = http_status_error(
                     status,
                     &current_method,
@@ -2607,8 +2625,10 @@ impl Client {
                 continue;
             }
             let response_body = match self
-                .read_response_body_with_retry(
+                .read_decoded_response_body_with_retry(
                     response.into_body(),
+                    &mut response_headers,
+                    status,
                     ReadBodyRetryContext {
                         context: &context,
                         max_response_body_bytes,
@@ -2627,18 +2647,6 @@ impl Client {
                 Some(body) => body,
                 None => continue,
             };
-            let should_decode_response_body =
-                should_decode_content_encoded_body(&current_method, status, response_body.len());
-            let response_body = self.decode_response_body_limited(
-                response_body,
-                &response_headers,
-                max_response_body_bytes,
-                status,
-                &context,
-            )?;
-            if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
-                remove_content_encoding_headers(&mut response_headers);
-            }
 
             debug!(
                 status = status.as_u16(),

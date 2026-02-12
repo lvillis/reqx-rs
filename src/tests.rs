@@ -725,6 +725,20 @@ fn no_proxy_rule_matches_domain_and_subdomain() {
 }
 
 #[test]
+fn no_proxy_rule_parses_bracketed_ipv6_with_port() {
+    let rule = NoProxyRule::parse("[::1]:8080").expect("valid ipv6 rule");
+    assert!(rule.matches("::1"));
+    assert!(!rule.matches("::2"));
+}
+
+#[test]
+fn no_proxy_rule_keeps_plain_ipv6_without_port() {
+    let rule = NoProxyRule::parse("2001:db8::1").expect("valid ipv6 rule");
+    assert!(rule.matches("2001:db8::1"));
+    assert!(!rule.matches("2001:db8::2"));
+}
+
+#[test]
 fn ensure_accept_encoding_sets_default_when_absent() {
     let mut headers = http::HeaderMap::new();
     ensure_accept_encoding_async(&http::Method::GET, &mut headers);
