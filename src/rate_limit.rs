@@ -176,18 +176,19 @@ impl TokenBucket {
         }
     }
 
-    fn consume_if_available(&mut self, now: Instant) -> bool {
+    fn can_consume_now(&mut self, now: Instant) -> bool {
         self.refill(now);
         if let Some(throttle_until) = self.throttle_until
             && now < throttle_until
         {
             return false;
         }
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            return true;
-        }
-        false
+        self.tokens >= 1.0
+    }
+
+    fn consume_ready_token(&mut self) {
+        debug_assert!(self.tokens >= 1.0);
+        self.tokens = (self.tokens - 1.0).max(0.0);
     }
 
     fn apply_throttle(&mut self, now: Instant, delay: Duration) {
@@ -241,11 +242,10 @@ impl RateLimiter {
         let mut per_host = lock_unpoisoned(&self.per_host);
         cleanup_stale_per_host_rate_limits(&mut per_host, now);
 
-        let global_wait = global_bucket
+        let global_ready = global_bucket
             .as_mut()
-            .map_or(Duration::ZERO, |bucket| bucket.wait_duration(now));
-
-        let per_host_wait = match (self.per_host_policy, host_key.as_ref()) {
+            .is_none_or(|bucket| bucket.can_consume_now(now));
+        let per_host_ready = match (self.per_host_policy, host_key.as_ref()) {
             (Some(policy), Some(host)) => {
                 let entry = per_host
                     .entry(host.clone())
@@ -254,24 +254,48 @@ impl RateLimiter {
                         last_used_at: now,
                     });
                 entry.last_used_at = now;
-                entry.bucket.wait_duration(now)
+                entry.bucket.can_consume_now(now)
             }
-            _ => Duration::ZERO,
+            _ => true,
         };
 
-        let wait = global_wait.max(per_host_wait);
-        if !wait.is_zero() {
-            return wait;
+        if !global_ready || !per_host_ready {
+            let global_wait = if global_ready {
+                Duration::ZERO
+            } else {
+                global_bucket
+                    .as_mut()
+                    .map_or(Duration::ZERO, |bucket| bucket.wait_duration(now))
+            };
+            let per_host_wait = if per_host_ready {
+                Duration::ZERO
+            } else {
+                match (self.per_host_policy, host_key.as_ref()) {
+                    (Some(policy), Some(host)) => {
+                        let entry =
+                            per_host
+                                .entry(host.clone())
+                                .or_insert_with(|| PerHostRateLimitEntry {
+                                    bucket: TokenBucket::new(policy, now),
+                                    last_used_at: now,
+                                });
+                        entry.last_used_at = now;
+                        entry.bucket.wait_duration(now)
+                    }
+                    _ => Duration::ZERO,
+                }
+            };
+            return global_wait.max(per_host_wait);
         }
 
         if let Some(bucket) = global_bucket.as_mut() {
-            debug_assert!(bucket.consume_if_available(now));
+            bucket.consume_ready_token();
         }
-        if let Some(host) = host_key
-            && let Some(entry) = per_host.get_mut(&host)
+        if let Some(host) = host_key.as_ref()
+            && let Some(entry) = per_host.get_mut(host)
         {
             entry.last_used_at = now;
-            debug_assert!(entry.bucket.consume_if_available(now));
+            entry.bucket.consume_ready_token();
         }
 
         Duration::ZERO

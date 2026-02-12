@@ -169,6 +169,7 @@ pub struct ClientBuilder {
     http_proxy: Option<Uri>,
     proxy_authorization: Option<http::HeaderValue>,
     no_proxy_rules: Vec<NoProxyRule>,
+    invalid_no_proxy_rules: Vec<String>,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
     retry_budget_policy: Option<RetryBudgetPolicy>,

@@ -12,9 +12,11 @@ use std::time::Duration;
 use http::Uri;
 use http::header::HeaderValue;
 #[cfg(feature = "_async")]
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper::rt::{Read as HyperRead, ReadBufCursor, Write as HyperWrite};
 #[cfg(feature = "_async")]
 use hyper_util::client::legacy::connect::proxy::Tunnel;
+#[cfg(feature = "_async")]
+use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 #[cfg(feature = "_async")]
 use tower_service::Service;
 use url::Url;
@@ -66,9 +68,7 @@ impl NoProxyRule {
             }
             candidate = host.to_owned();
         } else if candidate.matches(':').count() == 1 {
-            let Some((host, port)) = candidate.rsplit_once(':') else {
-                return None;
-            };
+            let (host, port) = candidate.rsplit_once(':')?;
             if host.is_empty() || port.is_empty() {
                 return None;
             }
@@ -89,6 +89,14 @@ impl NoProxyRule {
             Self::Domain(domain) => host == domain || host.ends_with(&format!(".{domain}")),
         }
     }
+}
+
+pub(crate) fn should_bypass_proxy_uri(no_proxy_rules: &[NoProxyRule], uri: &Uri) -> bool {
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let normalized = host.to_ascii_lowercase();
+    no_proxy_rules.iter().any(|rule| rule.matches(&normalized))
 }
 
 pub(crate) fn parse_no_proxy_rule(rule: &str) -> crate::Result<NoProxyRule> {
@@ -112,19 +120,94 @@ where
 #[cfg(feature = "_async")]
 struct ProxyRuntime {
     tunnel: Tunnel<HttpConnector>,
+    proxy_uri: Uri,
     no_proxy_rules: Vec<NoProxyRule>,
 }
 
 #[cfg(feature = "_async")]
 impl ProxyRuntime {
     fn should_bypass_proxy(&self, uri: &Uri) -> bool {
-        let Some(host) = uri.host() else {
-            return false;
-        };
-        let normalized = host.to_ascii_lowercase();
-        self.no_proxy_rules
-            .iter()
-            .any(|rule| rule.matches(&normalized))
+        should_bypass_proxy_uri(&self.no_proxy_rules, uri)
+    }
+}
+
+#[cfg(feature = "_async")]
+#[derive(Debug)]
+pub(crate) struct ProxyConnection<T> {
+    inner: T,
+    proxied: bool,
+}
+
+#[cfg(feature = "_async")]
+impl<T> ProxyConnection<T> {
+    fn new(inner: T, proxied: bool) -> Self {
+        Self { inner, proxied }
+    }
+}
+
+#[cfg(feature = "_async")]
+impl<T> HyperRead for ProxyConnection<T>
+where
+    T: HyperRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().inner;
+        Pin::new(inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "_async")]
+impl<T> HyperWrite for ProxyConnection<T>
+where
+    T: HyperWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let inner = &mut self.get_mut().inner;
+        Pin::new(inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().inner;
+        Pin::new(inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().inner;
+        Pin::new(inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let inner = &mut self.get_mut().inner;
+        Pin::new(inner).poll_write_vectored(cx, bufs)
+    }
+}
+
+#[cfg(feature = "_async")]
+impl<T> Connection for ProxyConnection<T>
+where
+    T: Connection,
+{
+    fn connected(&self) -> Connected {
+        self.inner.connected().proxy(self.proxied)
     }
 }
 
@@ -142,12 +225,13 @@ impl ProxyConnector {
         direct.enforce_http(false);
         direct.set_connect_timeout(Some(connect_timeout));
         let proxy = proxy_config.map(|config| {
-            let mut tunnel = Tunnel::new(config.uri, direct.clone());
+            let mut tunnel = Tunnel::new(config.uri.clone(), direct.clone());
             if let Some(authorization) = config.authorization {
                 tunnel = tunnel.with_auth(authorization);
             }
             ProxyRuntime {
                 tunnel,
+                proxy_uri: config.uri,
                 no_proxy_rules: config.no_proxy_rules,
             }
         });
@@ -157,7 +241,7 @@ impl ProxyConnector {
 
 #[cfg(feature = "_async")]
 impl Service<Uri> for ProxyConnector {
-    type Response = <HttpConnector as Service<Uri>>::Response;
+    type Response = ProxyConnection<<HttpConnector as Service<Uri>>::Response>;
     type Error = BoxConnectError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -191,17 +275,40 @@ impl Service<Uri> for ProxyConnector {
         if let Some(proxy) = &mut self.proxy {
             if proxy.should_bypass_proxy(&dst) {
                 let connecting = self.direct.call(dst);
-                return Box::pin(
-                    async move { connecting.await.map_err(|error| Box::new(error) as _) },
-                );
+                return Box::pin(async move {
+                    connecting
+                        .await
+                        .map(|connection| ProxyConnection::new(connection, false))
+                        .map_err(|error| Box::new(error) as _)
+                });
             }
-            let tunnel_target = normalize_tunnel_target_uri(dst);
-            let connecting = proxy.tunnel.call(tunnel_target);
-            return Box::pin(async move { connecting.await.map_err(|error| Box::new(error) as _) });
+            let scheme = dst.scheme_str().unwrap_or_default();
+            if scheme.eq_ignore_ascii_case("https") {
+                let tunnel_target = normalize_tunnel_target_uri(dst);
+                let connecting = proxy.tunnel.call(tunnel_target);
+                return Box::pin(async move {
+                    connecting
+                        .await
+                        .map(|connection| ProxyConnection::new(connection, false))
+                        .map_err(|error| Box::new(error) as _)
+                });
+            }
+            let connecting = self.direct.call(proxy.proxy_uri.clone());
+            return Box::pin(async move {
+                connecting
+                    .await
+                    .map(|connection| ProxyConnection::new(connection, true))
+                    .map_err(|error| Box::new(error) as _)
+            });
         }
 
         let connecting = self.direct.call(dst);
-        Box::pin(async move { connecting.await.map_err(|error| Box::new(error) as _) })
+        Box::pin(async move {
+            connecting
+                .await
+                .map(|connection| ProxyConnection::new(connection, false))
+                .map_err(|error| Box::new(error) as _)
+        })
     }
 }
 

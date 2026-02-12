@@ -251,12 +251,13 @@ impl Drop for CountingServer {
 struct ConnectProxyServer {
     uri: String,
     tunnel_targets: Arc<Mutex<Vec<String>>>,
+    forward_targets: Arc<Mutex<Vec<String>>>,
     proxy_authorization_values: Arc<Mutex<Vec<String>>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ConnectProxyServer {
-    fn start(expected_tunnels: usize) -> Self {
+    fn start(expected_connections: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy server");
         let authority = listener
             .local_addr()
@@ -267,8 +268,10 @@ impl ConnectProxyServer {
             .expect("set proxy listener nonblocking");
 
         let tunnel_targets = Arc::new(Mutex::new(Vec::new()));
+        let forward_targets = Arc::new(Mutex::new(Vec::new()));
         let proxy_authorization_values = Arc::new(Mutex::new(Vec::new()));
         let tunnel_targets_clone = Arc::clone(&tunnel_targets);
+        let forward_targets_clone = Arc::clone(&forward_targets);
         let proxy_authorization_values_clone = Arc::clone(&proxy_authorization_values);
 
         let join = thread::spawn(move || {
@@ -276,17 +279,19 @@ impl ConnectProxyServer {
             let mut workers = Vec::new();
             let mut accepted = 0;
 
-            while Instant::now() < deadline && accepted < expected_tunnels {
+            while Instant::now() < deadline && accepted < expected_connections {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         accepted += 1;
                         let tunnel_targets = Arc::clone(&tunnel_targets_clone);
+                        let forward_targets = Arc::clone(&forward_targets_clone);
                         let proxy_authorization_values =
                             Arc::clone(&proxy_authorization_values_clone);
                         workers.push(thread::spawn(move || {
                             handle_proxy_connection(
                                 stream,
                                 tunnel_targets,
+                                forward_targets,
                                 proxy_authorization_values,
                             );
                         }));
@@ -306,6 +311,7 @@ impl ConnectProxyServer {
         Self {
             uri: format!("http://{authority}"),
             tunnel_targets,
+            forward_targets,
             proxy_authorization_values,
             join: Some(join),
         }
@@ -317,6 +323,10 @@ impl ConnectProxyServer {
 
     fn tunnel_targets(&self) -> Vec<String> {
         lock_unpoisoned(&self.tunnel_targets).clone()
+    }
+
+    fn forward_targets(&self) -> Vec<String> {
+        lock_unpoisoned(&self.forward_targets).clone()
     }
 
     fn proxy_authorization_values(&self) -> Vec<String> {
@@ -335,12 +345,13 @@ impl Drop for ConnectProxyServer {
 fn handle_proxy_connection(
     mut client: TcpStream,
     tunnel_targets: Arc<Mutex<Vec<String>>>,
+    forward_targets: Arc<Mutex<Vec<String>>>,
     proxy_authorization_values: Arc<Mutex<Vec<String>>>,
 ) {
-    if let Ok(connect_request) = read_http_message(&mut client)
-        && let Some(header_end) = find_header_end(&connect_request)
+    if let Ok(proxy_request) = read_http_message(&mut client)
+        && let Some(header_end) = find_header_end(&proxy_request)
     {
-        let text = String::from_utf8_lossy(&connect_request[..header_end]);
+        let text = String::from_utf8_lossy(&proxy_request[..header_end]);
         for line in text.split("\r\n").skip(1) {
             if let Some((name, value)) = line.split_once(':')
                 && name.trim().eq_ignore_ascii_case("proxy-authorization")
@@ -354,14 +365,51 @@ fn handle_proxy_connection(
             .unwrap_or_default()
             .split_whitespace();
         let method = line_parts.next().unwrap_or_default();
-        let authority = line_parts.next().unwrap_or_default().to_owned();
-
-        if method != "CONNECT" || authority.is_empty() {
+        let target = line_parts.next().unwrap_or_default().to_owned();
+        if target.is_empty() {
             let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
             return;
         }
 
-        lock_unpoisoned(&tunnel_targets).push(authority.clone());
+        if method == "CONNECT" {
+            lock_unpoisoned(&tunnel_targets).push(target.clone());
+
+            let mut upstream = match TcpStream::connect(&target) {
+                Ok(stream) => stream,
+                Err(_) => {
+                    let _ =
+                        client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+            };
+
+            let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+            if let Ok(request) = read_http_message(&mut client) {
+                let _ = upstream.write_all(&request);
+                let _ = upstream.flush();
+                if let Ok(response) = read_http_message(&mut upstream) {
+                    let _ = client.write_all(&response);
+                    let _ = client.flush();
+                }
+            }
+            return;
+        }
+
+        let parsed_target = match target.parse::<Uri>() {
+            Ok(uri) => uri,
+            Err(_) => {
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
+        };
+        let Some(host) = parsed_target.host() else {
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return;
+        };
+        let port = parsed_target.port_u16().unwrap_or(80);
+        let authority = format!("{host}:{port}");
+        lock_unpoisoned(&forward_targets).push(authority.clone());
 
         let mut upstream = match TcpStream::connect(&authority) {
             Ok(stream) => stream,
@@ -371,15 +419,11 @@ fn handle_proxy_connection(
             }
         };
 
-        let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
-
-        if let Ok(request) = read_http_message(&mut client) {
-            let _ = upstream.write_all(&request);
-            let _ = upstream.flush();
-            if let Ok(response) = read_http_message(&mut upstream) {
-                let _ = client.write_all(&response);
-                let _ = client.flush();
-            }
+        let _ = upstream.write_all(&proxy_request);
+        let _ = upstream.flush();
+        if let Ok(response) = read_http_message(&mut upstream) {
+            let _ = client.write_all(&response);
+            let _ = client.flush();
         }
     }
 }
@@ -447,7 +491,7 @@ impl Drop for RawTcpServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_connect_tunnels_http_request() {
+async fn proxy_forwards_http_request_via_absolute_form() {
     let upstream = CountingServer::start(
         1,
         ResponseSpec::new(
@@ -478,8 +522,10 @@ async fn proxy_connect_tunnels_http_request() {
     assert_eq!(upstream.served_count(), 1);
 
     let tunnel_targets = proxy.tunnel_targets();
-    assert_eq!(tunnel_targets.len(), 1);
-    assert_eq!(tunnel_targets[0], upstream.authority());
+    assert!(tunnel_targets.is_empty());
+    let forward_targets = proxy.forward_targets();
+    assert_eq!(forward_targets.len(), 1);
+    assert_eq!(forward_targets[0], upstream.authority());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

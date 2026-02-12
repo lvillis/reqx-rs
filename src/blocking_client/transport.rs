@@ -56,11 +56,7 @@ pub(super) fn remove_content_encoding_headers(headers: &mut HeaderMap) {
 }
 
 pub(super) fn is_proxy_bypassed(proxy: &ProxyConfig, uri: &Uri) -> bool {
-    let Some(host) = uri.host() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    proxy.no_proxy_rules.iter().any(|rule| rule.matches(&host))
+    crate::proxy::should_bypass_proxy_uri(&proxy.no_proxy_rules, uri)
 }
 
 #[cfg(any(

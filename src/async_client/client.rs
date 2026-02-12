@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue};
+use http::header::{
+    CONTENT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue, PROXY_AUTHORIZATION,
+};
 use http::{HeaderMap, Method, Request, Response as HttpResponse, Uri};
 use hyper::body::Incoming;
 #[cfg(any(
@@ -53,7 +55,9 @@ use crate::policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy};
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
 use crate::proxy::ProxyConnector;
-use crate::proxy::{NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules};
+use crate::proxy::{
+    NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules, should_bypass_proxy_uri,
+};
 use crate::rate_limit::{
     RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
 };
@@ -853,6 +857,7 @@ pub struct ClientBuilder {
     http_proxy: Option<Uri>,
     proxy_authorization: Option<HeaderValue>,
     no_proxy_rules: Vec<NoProxyRule>,
+    invalid_no_proxy_rules: Vec<String>,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
     retry_budget_policy: Option<RetryBudgetPolicy>,
@@ -895,6 +900,7 @@ impl ClientBuilder {
             http_proxy: None,
             proxy_authorization: None,
             no_proxy_rules: Vec::new(),
+            invalid_no_proxy_rules: Vec::new(),
             retry_policy: RetryPolicy::standard(),
             retry_eligibility: Arc::new(StrictRetryEligibility),
             retry_budget_policy: None,
@@ -977,10 +983,15 @@ impl ClientBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.no_proxy_rules = rules
-            .into_iter()
-            .filter_map(|rule| NoProxyRule::parse(rule.as_ref()))
-            .collect();
+        self.no_proxy_rules.clear();
+        self.invalid_no_proxy_rules.clear();
+        for rule in rules {
+            let raw = rule.as_ref();
+            match NoProxyRule::parse(raw) {
+                Some(rule) => self.no_proxy_rules.push(rule),
+                None => self.invalid_no_proxy_rules.push(raw.to_owned()),
+            }
+        }
         self
     }
 
@@ -990,12 +1001,16 @@ impl ClientBuilder {
         S: AsRef<str>,
     {
         self.no_proxy_rules = parse_no_proxy_rules(rules)?;
+        self.invalid_no_proxy_rules.clear();
         Ok(self)
     }
 
     pub fn add_no_proxy(mut self, rule: impl AsRef<str>) -> Self {
-        if let Some(rule) = NoProxyRule::parse(rule.as_ref()) {
+        let raw = rule.as_ref();
+        if let Some(rule) = NoProxyRule::parse(raw) {
             self.no_proxy_rules.push(rule);
+        } else {
+            self.invalid_no_proxy_rules.push(raw.to_owned());
         }
         self
     }
@@ -1288,6 +1303,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(rule) = self.invalid_no_proxy_rules.first() {
+            return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
+        }
         if let Some(policy) = self.adaptive_concurrency_policy {
             policy.validate()?;
         }
@@ -1299,7 +1317,7 @@ impl ClientBuilder {
         });
         let transport = build_transport_client(
             self.tls_backend,
-            proxy_config,
+            proxy_config.clone(),
             &self.tls_options,
             self.connect_timeout,
             self.pool_idle_timeout,
@@ -1341,6 +1359,7 @@ impl ClientBuilder {
             default_status_policy: self.default_status_policy,
             client_name: self.client_name,
             tls_backend: self.tls_backend,
+            proxy_config,
             transport,
             endpoint_selector: self.endpoint_selector,
             body_codec: self.body_codec,
@@ -1374,6 +1393,7 @@ pub struct Client {
     default_status_policy: StatusPolicy,
     client_name: String,
     tls_backend: TlsBackend,
+    proxy_config: Option<ProxyConfig>,
     transport: TransportClient,
     endpoint_selector: Arc<dyn EndpointSelector>,
     body_codec: Arc<dyn BodyCodec>,
@@ -1429,6 +1449,32 @@ impl Client {
     fn run_request_interceptors(&self, context: &RequestContext, headers: &mut HeaderMap) {
         for interceptor in &self.interceptors {
             interceptor.on_request(context, headers);
+        }
+    }
+
+    fn should_apply_http_proxy_auth_header(&self, uri: &Uri) -> bool {
+        let Some(proxy_config) = &self.proxy_config else {
+            return false;
+        };
+        let Some(scheme) = uri.scheme_str() else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("http") {
+            return false;
+        }
+        !should_bypass_proxy_uri(&proxy_config.no_proxy_rules, uri)
+    }
+
+    fn apply_http_proxy_auth_header(&self, uri: &Uri, headers: &mut HeaderMap) {
+        if !self.should_apply_http_proxy_auth_header(uri)
+            || headers.contains_key(PROXY_AUTHORIZATION)
+        {
+            return;
+        }
+        if let Some(proxy_config) = &self.proxy_config
+            && let Some(proxy_authorization) = &proxy_config.authorization
+        {
+            headers.insert(PROXY_AUTHORIZATION, proxy_authorization.clone());
         }
     }
 
@@ -2144,6 +2190,7 @@ impl Client {
                 };
             let mut adaptive_attempt = self.begin_adaptive_attempt().await;
             let mut attempt_headers = current_headers.clone();
+            self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
             self.run_request_interceptors(&context, &mut attempt_headers);
             let host_key = rate_limit_bucket_key(&current_uri);
             let _host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {

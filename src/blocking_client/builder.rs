@@ -46,6 +46,7 @@ impl ClientBuilder {
             http_proxy: None,
             proxy_authorization: None,
             no_proxy_rules: Vec::new(),
+            invalid_no_proxy_rules: Vec::new(),
             retry_policy: RetryPolicy::standard(),
             retry_eligibility: Arc::new(StrictRetryEligibility),
             retry_budget_policy: None,
@@ -126,10 +127,15 @@ impl ClientBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.no_proxy_rules = rules
-            .into_iter()
-            .filter_map(|rule| NoProxyRule::parse(rule.as_ref()))
-            .collect();
+        self.no_proxy_rules.clear();
+        self.invalid_no_proxy_rules.clear();
+        for rule in rules {
+            let raw = rule.as_ref();
+            match NoProxyRule::parse(raw) {
+                Some(rule) => self.no_proxy_rules.push(rule),
+                None => self.invalid_no_proxy_rules.push(raw.to_owned()),
+            }
+        }
         self
     }
 
@@ -139,12 +145,16 @@ impl ClientBuilder {
         S: AsRef<str>,
     {
         self.no_proxy_rules = parse_no_proxy_rules(rules)?;
+        self.invalid_no_proxy_rules.clear();
         Ok(self)
     }
 
     pub fn add_no_proxy(mut self, rule: impl AsRef<str>) -> Self {
-        if let Some(rule) = NoProxyRule::parse(rule.as_ref()) {
+        let raw = rule.as_ref();
+        if let Some(rule) = NoProxyRule::parse(raw) {
             self.no_proxy_rules.push(rule);
+        } else {
+            self.invalid_no_proxy_rules.push(raw.to_owned());
         }
         self
     }
@@ -427,6 +437,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(rule) = self.invalid_no_proxy_rules.first() {
+            return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
+        }
         if let Some(policy) = self.adaptive_concurrency_policy {
             policy.validate()?;
         }

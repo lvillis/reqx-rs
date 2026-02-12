@@ -825,6 +825,18 @@ fn try_no_proxy_rejects_non_numeric_port_suffix() {
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
 }
 
+#[test]
+fn no_proxy_records_invalid_rule_and_build_fails() {
+    let result = Client::builder("https://api.example.com")
+        .no_proxy(["example.com", "[::1]not-a-port"])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail at build time"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+}
+
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_try_add_no_proxy_rejects_invalid_rule() {
@@ -835,6 +847,19 @@ fn blocking_try_add_no_proxy_rejects_invalid_rule() {
         Err(error) => error,
     };
 
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_no_proxy_records_invalid_rule_and_build_fails() {
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .no_proxy(["example.com", "[::1]not-a-port"])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail at build time"),
+        Err(error) => error,
+    };
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
 }
 
