@@ -12,8 +12,8 @@ use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::Client;
 use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
 use reqx::{
-    CircuitBreakerPolicy, Interceptor, RateLimitPolicy, RequestContext, RetryBudgetPolicy,
-    ServerThrottleScope, TimeoutPhase,
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Interceptor, RateLimitPolicy, RequestContext,
+    RetryBudgetPolicy, ServerThrottleScope, StatusPolicy, TimeoutPhase,
 };
 use serde_json::Value;
 
@@ -701,6 +701,78 @@ fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_retry_budget_is_credited_by_non_retryable_status_response_mode() {
+    let server = MockServer::start(vec![
+        MockResponse::new(404, Vec::<(String, String)>::new(), b"not-found".to_vec()),
+        MockResponse::new(503, Vec::<(String, String)>::new(), b"busy".to_vec()),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .default_status_policy(StatusPolicy::Response)
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(60))
+                .retry_ratio(1.0)
+                .min_retries_per_window(0),
+        )
+        .request_timeout(Duration::from_secs(1))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/v1/status-404")
+        .send()
+        .expect("404 should be returned as response");
+    assert_eq!(first.status().as_u16(), 404);
+
+    let second = client
+        .get("/v1/status-503-then-200")
+        .send()
+        .expect("retry budget should allow one retry after 404 credit");
+    assert_eq!(second.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 3);
+}
+
+#[test]
+fn blocking_build_rejects_invalid_adaptive_concurrency_policy() {
+    let result = Client::builder("https://api.example.com")
+        .adaptive_concurrency_policy(
+            AdaptiveConcurrencyPolicy::standard()
+                .min_limit(10)
+                .initial_limit(8)
+                .max_limit(5),
+        )
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid adaptive concurrency policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidAdaptiveConcurrencyPolicy {
+            min_limit,
+            initial_limit,
+            max_limit,
+            ..
+        } => {
+            assert_eq!(min_limit, 10);
+            assert_eq!(initial_limit, 8);
+            assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]

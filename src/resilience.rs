@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::error::Error;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -371,6 +372,42 @@ impl AdaptiveConcurrencyPolicy {
     pub const fn high_latency_threshold(mut self, high_latency_threshold: Duration) -> Self {
         self.high_latency_threshold = high_latency_threshold;
         self
+    }
+
+    pub(crate) fn validate(self) -> crate::Result<()> {
+        if self.min_limit == 0 {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "min_limit must be >= 1",
+            });
+        }
+        if self.max_limit == 0 {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "max_limit must be >= 1",
+            });
+        }
+        if self.initial_limit == 0 {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "initial_limit must be >= 1",
+            });
+        }
+        if self.min_limit > self.max_limit {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "min_limit must be <= max_limit",
+            });
+        }
+        Ok(())
     }
 
     pub(crate) const fn configured_min_limit(self) -> usize {

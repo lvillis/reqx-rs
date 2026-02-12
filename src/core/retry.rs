@@ -214,6 +214,10 @@ impl RetryPolicy {
         self.retryable_status_codes.contains(&status.as_u16())
     }
 
+    pub(crate) fn is_retryable_status(&self, status: StatusCode) -> bool {
+        self.should_retry_status(status)
+    }
+
     fn is_within_retry_window(limit: Option<usize>, attempt: usize) -> bool {
         match limit {
             Some(limit) => attempt < limit.max(1),

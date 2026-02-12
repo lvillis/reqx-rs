@@ -738,9 +738,12 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+        let min_limit = policy.configured_min_limit().max(1);
+        let max_limit = policy.configured_max_limit().max(min_limit);
         let initial_limit = policy
             .configured_initial_limit()
-            .clamp(policy.configured_min_limit(), policy.configured_max_limit());
+            .max(1)
+            .clamp(min_limit, max_limit);
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState {
@@ -1285,6 +1288,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(policy) = self.adaptive_concurrency_policy {
+            policy.validate()?;
+        }
 
         let proxy_config = self.http_proxy.map(|uri| ProxyConfig {
             uri,
@@ -1469,6 +1475,16 @@ impl Client {
     fn record_successful_request_for_resilience(&self) {
         if let Some(retry_budget) = &self.retry_budget {
             retry_budget.record_success();
+        }
+    }
+
+    fn maybe_record_terminal_response_success(
+        &self,
+        status: http::StatusCode,
+        retry_policy: &RetryPolicy,
+    ) {
+        if !retry_policy.is_retryable_status(status) {
+            self.record_successful_request_for_resilience();
         }
     }
 
@@ -2392,6 +2408,7 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    self.maybe_record_terminal_response_success(status, &retry_policy);
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }
@@ -2498,6 +2515,7 @@ impl Client {
                     if matches!(status_policy, StatusPolicy::Response)
                         && matches!(response_mode, ResponseMode::Buffered)
                     {
+                        self.maybe_record_terminal_response_success(status, &retry_policy);
                         if let Some(attempt_guard) = circuit_attempt.take() {
                             attempt_guard.mark_success();
                         }

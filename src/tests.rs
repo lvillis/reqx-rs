@@ -18,7 +18,7 @@ use crate::util::{
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
     same_origin,
 };
-use crate::{AdvancedConfig, ClientProfile, StatusPolicy};
+use crate::{AdaptiveConcurrencyPolicy, AdvancedConfig, ClientProfile, StatusPolicy};
 
 #[test]
 fn join_base_path_handles_slashes() {
@@ -409,7 +409,7 @@ fn error_code_maps_expected_variant() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 26);
+    assert_eq!(codes.len(), 27);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -417,6 +417,7 @@ fn error_code_contract_table_is_stable() {
         vec![
             "invalid_uri",
             "invalid_no_proxy_rule",
+            "invalid_adaptive_concurrency_policy",
             "serialize_json",
             "serialize_query",
             "serialize_form",
@@ -456,6 +457,18 @@ fn error_code_maps_tls_config_variant() {
     };
     assert_eq!(error.code(), ErrorCode::TlsConfig);
     assert_eq!(error.code().as_str(), "tls_config");
+}
+
+#[test]
+fn error_code_maps_invalid_adaptive_concurrency_policy_variant() {
+    let error = Error::InvalidAdaptiveConcurrencyPolicy {
+        min_limit: 10,
+        initial_limit: 8,
+        max_limit: 5,
+        message: "min_limit must be <= max_limit",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidAdaptiveConcurrencyPolicy);
+    assert_eq!(error.code().as_str(), "invalid_adaptive_concurrency_policy");
 }
 
 #[test]
@@ -612,6 +625,34 @@ fn client_profile_and_advanced_config_compose() {
 }
 
 #[test]
+fn build_rejects_invalid_adaptive_concurrency_policy() {
+    let policy = AdaptiveConcurrencyPolicy::standard()
+        .min_limit(10)
+        .initial_limit(8)
+        .max_limit(5);
+    let result = Client::builder("https://api.example.com")
+        .adaptive_concurrency_policy(policy)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid adaptive concurrency policy should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidAdaptiveConcurrencyPolicy {
+            min_limit,
+            initial_limit,
+            max_limit,
+            ..
+        } => {
+            assert_eq!(min_limit, 10);
+            assert_eq!(initial_limit, 8);
+            assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn tls_root_store_specific_without_roots_returns_tls_config_error() {
     let result = Client::builder("https://api.example.com")
         .tls_root_store(TlsRootStore::Specific)
@@ -740,6 +781,14 @@ fn no_proxy_rule_keeps_plain_ipv6_without_port() {
 }
 
 #[test]
+fn no_proxy_rule_rejects_non_numeric_port_suffix() {
+    assert!(
+        NoProxyRule::parse("example.com:abc").is_none(),
+        "non-numeric no_proxy port suffix must be rejected"
+    );
+}
+
+#[test]
 fn try_add_no_proxy_rejects_invalid_rule() {
     let result = Client::builder("https://api.example.com").try_add_no_proxy("[::1]not-a-port");
     let error = match result {
@@ -763,6 +812,16 @@ fn try_no_proxy_rejects_invalid_rule() {
         Err(error) => error,
     };
 
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+}
+
+#[test]
+fn try_no_proxy_rejects_non_numeric_port_suffix() {
+    let result = Client::builder("https://api.example.com").try_no_proxy(["example.com:abc"]);
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail"),
+        Err(error) => error,
+    };
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
 }
 

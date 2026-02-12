@@ -427,6 +427,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(policy) = self.adaptive_concurrency_policy {
+            policy.validate()?;
+        }
 
         if !backend_is_available(self.tls_backend) {
             return Err(Error::TlsBackendUnavailable {

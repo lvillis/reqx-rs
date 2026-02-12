@@ -46,6 +46,7 @@ impl std::fmt::Display for TimeoutPhase {
 pub enum ErrorCode {
     InvalidUri,
     InvalidNoProxyRule,
+    InvalidAdaptiveConcurrencyPolicy,
     SerializeJson,
     SerializeQuery,
     SerializeForm,
@@ -73,9 +74,10 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
+        Self::InvalidAdaptiveConcurrencyPolicy,
         Self::SerializeJson,
         Self::SerializeQuery,
         Self::SerializeForm,
@@ -110,6 +112,7 @@ impl ErrorCode {
         match self {
             Self::InvalidUri => "invalid_uri",
             Self::InvalidNoProxyRule => "invalid_no_proxy_rule",
+            Self::InvalidAdaptiveConcurrencyPolicy => "invalid_adaptive_concurrency_policy",
             Self::SerializeJson => "serialize_json",
             Self::SerializeQuery => "serialize_query",
             Self::SerializeForm => "serialize_form",
@@ -145,6 +148,15 @@ pub enum Error {
     InvalidUri { uri: String },
     #[error("invalid no_proxy rule: {rule:?}")]
     InvalidNoProxyRule { rule: String },
+    #[error(
+        "invalid adaptive concurrency policy (min={min_limit}, initial={initial_limit}, max={max_limit}): {message}"
+    )]
+    InvalidAdaptiveConcurrencyPolicy {
+        min_limit: usize,
+        initial_limit: usize,
+        max_limit: usize,
+        message: &'static str,
+    },
     #[error("failed to serialize request json: {source}")]
     SerializeJson {
         #[source]
@@ -292,6 +304,9 @@ impl Error {
         match self {
             Self::InvalidUri { .. } => ErrorCode::InvalidUri,
             Self::InvalidNoProxyRule { .. } => ErrorCode::InvalidNoProxyRule,
+            Self::InvalidAdaptiveConcurrencyPolicy { .. } => {
+                ErrorCode::InvalidAdaptiveConcurrencyPolicy
+            }
             Self::SerializeJson { .. } => ErrorCode::SerializeJson,
             Self::SerializeQuery { .. } => ErrorCode::SerializeQuery,
             Self::SerializeForm { .. } => ErrorCode::SerializeForm,

@@ -65,12 +65,16 @@ impl NoProxyRule {
                 return None;
             }
             candidate = host.to_owned();
-        } else if candidate.matches(':').count() == 1
-            && let Some((host, port)) = candidate.rsplit_once(':')
-            && !port.is_empty()
-            && port.bytes().all(|byte| byte.is_ascii_digit())
-            && !host.is_empty()
-        {
+        } else if candidate.matches(':').count() == 1 {
+            let Some((host, port)) = candidate.rsplit_once(':') else {
+                return None;
+            };
+            if host.is_empty() || port.is_empty() {
+                return None;
+            }
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
             candidate = host.to_owned();
         }
         if candidate.is_empty() {

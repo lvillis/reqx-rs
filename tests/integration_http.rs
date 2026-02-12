@@ -14,7 +14,10 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
-use reqx::{Interceptor, RateLimitPolicy, RequestContext, ServerThrottleScope, TimeoutPhase};
+use reqx::{
+    Interceptor, RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope,
+    StatusPolicy, TimeoutPhase,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -1562,6 +1565,85 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
     assert_eq!(metrics.latency_samples, 0);
     assert!(metrics.status_counts.is_empty());
     assert!(metrics.error_counts.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_budget_is_credited_by_non_retryable_status_response_mode() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            404,
+            Vec::<(String, String)>::new(),
+            "not-found",
+            Duration::ZERO,
+        ),
+        MockResponse::new(503, Vec::<(String, String)>::new(), "busy", Duration::ZERO),
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok", Duration::ZERO),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .default_status_policy(StatusPolicy::Response)
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(60))
+                .retry_ratio(1.0)
+                .min_retries_per_window(0),
+        )
+        .request_timeout(Duration::from_millis(300))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/status-404")
+        .send()
+        .await
+        .expect("404 should be returned as response");
+    assert_eq!(first.status().as_u16(), 404);
+
+    let second = client
+        .get("/status-503-then-200")
+        .send()
+        .await
+        .expect("retry budget should allow one retry after 404 credit");
+    assert_eq!(second.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_rejects_invalid_adaptive_concurrency_policy() {
+    let result = Client::builder("https://api.example.com")
+        .adaptive_concurrency_policy(
+            reqx::AdaptiveConcurrencyPolicy::standard()
+                .min_limit(10)
+                .initial_limit(8)
+                .max_limit(5),
+        )
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid adaptive concurrency policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidAdaptiveConcurrencyPolicy {
+            min_limit,
+            initial_limit,
+            max_limit,
+            ..
+        } => {
+            assert_eq!(min_limit, 10);
+            assert_eq!(initial_limit, 8);
+            assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

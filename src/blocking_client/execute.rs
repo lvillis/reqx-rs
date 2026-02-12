@@ -169,6 +169,16 @@ impl Client {
         }
     }
 
+    fn maybe_record_terminal_response_success(
+        &self,
+        status: http::StatusCode,
+        retry_policy: &RetryPolicy,
+    ) {
+        if !retry_policy.is_retryable_status(status) {
+            self.record_successful_request_for_resilience();
+        }
+    }
+
     fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
         let Some(retry_budget) = &self.retry_budget else {
             return Ok(());
@@ -1041,6 +1051,7 @@ impl Client {
                     continue;
                 }
                 if matches!(status_policy, StatusPolicy::Response) {
+                    self.maybe_record_terminal_response_success(status, &retry_policy);
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }
@@ -1128,6 +1139,7 @@ impl Client {
                     if matches!(status_policy, StatusPolicy::Response)
                         && matches!(response_mode, ResponseMode::Buffered)
                     {
+                        self.maybe_record_terminal_response_success(status, &retry_policy);
                         if let Some(attempt_guard) = circuit_attempt.take() {
                             attempt_guard.mark_success();
                         }

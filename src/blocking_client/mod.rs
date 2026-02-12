@@ -49,9 +49,12 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+        let min_limit = policy.configured_min_limit().max(1);
+        let max_limit = policy.configured_max_limit().max(min_limit);
         let initial_limit = policy
             .configured_initial_limit()
-            .clamp(policy.configured_min_limit(), policy.configured_max_limit());
+            .max(1)
+            .clamp(min_limit, max_limit);
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState {
