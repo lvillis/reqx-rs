@@ -1,3 +1,8 @@
+## [0.1.16] - 2026-02-12
+
+### 🧪 Testing
+
+- Deflake async-native retry budget resilience assertions
 ## [0.1.15] - 2026-02-12
 
 ### 🚀 Features
@@ -15,6 +20,10 @@
 ### 🚜 Refactor
 
 - Unify retry loops and enforce strict no_proxy validation
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.15
 ## [0.1.14] - 2026-02-12
 
 ### 🚀 Features
