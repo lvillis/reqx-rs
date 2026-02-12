@@ -53,16 +53,24 @@ jobs:
         include:
           - name: async-rustls-ring
             command: cargo test --tests --no-default-features --features async-tls-rustls-ring
+          - name: async-rustls-alias
+            command: cargo test --tests --no-default-features --features async-rustls
           - name: async-rustls-aws-lc-rs
             command: cargo test --tests --no-default-features --features async-tls-rustls-aws-lc-rs
           - name: async-native
             command: cargo test --tests --no-default-features --features async-tls-native
+          - name: async-native-alias
+            command: cargo test --tests --no-default-features --features async-native-tls
           - name: blocking-rustls-ring
             command: cargo test --tests --no-default-features --features blocking-tls-rustls-ring
+          - name: blocking-rustls-alias
+            command: cargo test --tests --no-default-features --features blocking-rustls
           - name: blocking-rustls-aws-lc-rs
             command: cargo test --tests --no-default-features --features blocking-tls-rustls-aws-lc-rs
           - name: blocking-native
             command: cargo test --tests --no-default-features --features blocking-tls-native
+          - name: blocking-native-alias
+            command: cargo test --tests --no-default-features --features blocking-native-tls
           - name: hybrid-async-and-blocking
             command: cargo check --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
 
@@ -80,3 +88,42 @@ jobs:
 
       - name: Run feature profile
         run: ${{ matrix.command }}
+
+  feature-contract:
+    name: feature-contract / conflict guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify conflicting TLS feature sets fail
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expect_fail() {
+            local features="$1"
+            if cargo check --lib --no-default-features --features "$features"; then
+              echo "error: expected feature set to fail, but it passed: $features"
+              exit 1
+            fi
+          }
+
+          expect_fail "async-tls-rustls-ring,async-tls-rustls-aws-lc-rs"
+          expect_fail "async-tls-rustls-ring,async-tls-native"
+          expect_fail "async-tls-rustls-aws-lc-rs,async-tls-native"
+          expect_fail "async-rustls,async-native-tls"
+          expect_fail "blocking-tls-rustls-ring,blocking-tls-rustls-aws-lc-rs"
+          expect_fail "blocking-tls-rustls-ring,blocking-tls-native"
+          expect_fail "blocking-tls-rustls-aws-lc-rs,blocking-tls-native"
+          expect_fail "blocking-rustls,blocking-native-tls"

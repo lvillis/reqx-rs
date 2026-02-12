@@ -62,6 +62,21 @@ compile_error!(
 );
 
 #[cfg(all(
+    feature = "_async",
+    any(
+        all(
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs"
+        ),
+        all(feature = "async-tls-rustls-ring", feature = "async-tls-native"),
+        all(feature = "async-tls-rustls-aws-lc-rs", feature = "async-tls-native")
+    )
+))]
+compile_error!(
+    "async transport requires exactly one TLS backend: choose only one of `async-tls-rustls-ring`, `async-tls-rustls-aws-lc-rs`, or `async-tls-native`"
+);
+
+#[cfg(all(
     feature = "_blocking",
     not(feature = "blocking-tls-rustls-ring"),
     not(feature = "blocking-tls-rustls-aws-lc-rs"),
@@ -69,6 +84,24 @@ compile_error!(
 ))]
 compile_error!(
     "blocking transport requires one blocking TLS backend: enable `blocking-tls-rustls-ring`, `blocking-tls-rustls-aws-lc-rs`, or `blocking-tls-native`"
+);
+
+#[cfg(all(
+    feature = "_blocking",
+    any(
+        all(
+            feature = "blocking-tls-rustls-ring",
+            feature = "blocking-tls-rustls-aws-lc-rs"
+        ),
+        all(feature = "blocking-tls-rustls-ring", feature = "blocking-tls-native"),
+        all(
+            feature = "blocking-tls-rustls-aws-lc-rs",
+            feature = "blocking-tls-native"
+        )
+    )
+))]
+compile_error!(
+    "blocking transport requires exactly one TLS backend: choose only one of `blocking-tls-rustls-ring`, `blocking-tls-rustls-aws-lc-rs`, or `blocking-tls-native`"
 );
 
 pub(crate) const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";

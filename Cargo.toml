@@ -25,6 +25,8 @@ include = [
 
 [features]
 default = ["async-tls-rustls-ring"]
+
+# Internal transport mode switches (downstream crates should enable concrete TLS combos below).
 _async = [
     "dep:tokio",
     "dep:tokio-util",
@@ -36,6 +38,9 @@ _async = [
     "dep:tower-service",
 ]
 _blocking = ["dep:ureq"]
+
+# Canonical transport+TLS combinations.
+# Feature contract: for each enabled mode (`_async` or `_blocking`), exactly one TLS backend must be enabled.
 async-tls-rustls-aws-lc-rs = [
     "_async",
     "dep:hyper-rustls",
@@ -69,6 +74,13 @@ blocking-tls-rustls-aws-lc-rs = [
     "rustls/aws_lc_rs",
 ]
 blocking-tls-native = ["_blocking", "ureq/native-tls"]
+
+# Ergonomic aliases for downstream SDKs.
+async-rustls = ["async-tls-rustls-ring"]
+async-native-tls = ["async-tls-native"]
+blocking-rustls = ["blocking-tls-rustls-ring"]
+blocking-native-tls = ["blocking-tls-native"]
+
 otel = ["dep:opentelemetry"]
 
 [dependencies]
