@@ -1054,7 +1054,10 @@ async fn permissive_retry_eligibility_retries_post_without_idempotency_key() {
         Error::HttpStatus { status, .. } => assert_eq!(status, 503),
         other => panic!("unexpected error variant: {other}"),
     }
-    assert_eq!(server.served_count(), 2);
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1096,7 +1099,10 @@ async fn retry_budget_exhausted_stops_retry_loop_early() {
         Error::RetryBudgetExhausted { .. } => {}
         other => panic!("unexpected error variant: {other}"),
     }
-    assert_eq!(server.served_count(), 2);
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
