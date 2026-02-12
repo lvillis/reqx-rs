@@ -1,3 +1,12 @@
+## [0.1.14] - 2026-02-12
+
+### 🚀 Features
+
+- Enforce TLS backend exclusivity and add ergonomic feature aliases
+
+### 🐛 Bug Fixes
+
+- Harden no_proxy IPv6 parsing and unify response body retry/decode flow
 ## [0.1.13] - 2026-02-11
 
 ### 🚀 Features
@@ -11,6 +20,10 @@
 - Harden async per-host concurrency and resilience paths
 - Align per-authority concurrency and case-insensitive URI semantics
 - Tighten feature-gated TLS paths and remove panic fallbacks
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.13
 ## [0.1.12] - 2026-02-11
 
 ### 🐛 Bug Fixes
