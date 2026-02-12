@@ -248,6 +248,9 @@ pub(super) fn make_agent(
     let tls_config = build_sync_tls_config(tls_backend, tls_options)?;
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // reqx owns redirect semantics; keep ureq from auto-following 3xx.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .user_agent(client_name)
         .max_idle_age(pool_idle_timeout)
         .max_idle_connections_per_host(pool_max_idle_per_host)

@@ -291,6 +291,8 @@ fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        301 => "Moved Permanently",
+        302 => "Found",
         400 => "Bad Request",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
@@ -1435,6 +1437,71 @@ fn blocking_redirect_policy_follows_relative_location() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/v1/old");
     assert_eq!(requests[1].path, "/v1/new");
+}
+
+#[test]
+fn blocking_redirect_policy_none_returns_301_without_following_in_response_mode() {
+    let server = MockServer::start(vec![
+        MockResponse::new(301, vec![("Location", "/v1/new")], b"redirect".to_vec()),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::none())
+        .default_status_policy(StatusPolicy::Response)
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/v1/old")
+        .send()
+        .expect("request should return 301");
+    assert_eq!(response.status().as_u16(), 301);
+    assert_eq!(response.text_lossy(), "redirect");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/old");
+}
+
+#[test]
+fn blocking_redirect_policy_none_returns_http_status_error_without_following() {
+    let server = MockServer::start(vec![
+        MockResponse::new(301, vec![("Location", "/v1/new")], b"redirect".to_vec()),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::none())
+        .default_status_policy(StatusPolicy::Error)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .send()
+        .expect_err("request should return status error");
+
+    match error {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 301),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/old");
 }
 
 struct BlockingHeaderInterceptor {
