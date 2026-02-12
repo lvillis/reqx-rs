@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::metrics::ClientMetrics;
 use crate::otel::OtelTelemetry;
 use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
-use crate::proxy::{NoProxyRule, ProxyConfig};
+use crate::proxy::{NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
@@ -133,11 +133,26 @@ impl ClientBuilder {
         self
     }
 
+    pub fn try_no_proxy<I, S>(mut self, rules: I) -> crate::Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.no_proxy_rules = parse_no_proxy_rules(rules)?;
+        Ok(self)
+    }
+
     pub fn add_no_proxy(mut self, rule: impl AsRef<str>) -> Self {
         if let Some(rule) = NoProxyRule::parse(rule.as_ref()) {
             self.no_proxy_rules.push(rule);
         }
         self
+    }
+
+    pub fn try_add_no_proxy(mut self, rule: impl AsRef<str>) -> crate::Result<Self> {
+        self.no_proxy_rules
+            .push(parse_no_proxy_rule(rule.as_ref())?);
+        Ok(self)
     }
 
     pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {

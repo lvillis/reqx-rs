@@ -248,6 +248,7 @@ impl ClientMetrics {
                 self.add_error_count(format!("http_status:{status}"));
             }
             Error::InvalidUri { .. }
+            | Error::InvalidNoProxyRule { .. }
             | Error::SerializeJson { .. }
             | Error::SerializeQuery { .. }
             | Error::SerializeForm { .. }

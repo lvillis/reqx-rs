@@ -56,6 +56,26 @@ struct RetryScheduleContext<'a> {
     max_attempts: usize,
 }
 
+struct RetryRequestInput {
+    method: Method,
+    uri: Uri,
+    redacted_uri_text: String,
+    merged_headers: HeaderMap,
+    body: RequestBody,
+    execution_options: RequestExecutionOptions,
+}
+
+#[derive(Clone, Copy)]
+enum ResponseMode {
+    Buffered,
+    Stream,
+}
+
+enum RetryResponse {
+    Buffered(Response),
+    Stream(BlockingResponseStream),
+}
+
 impl Client {
     pub fn builder(base_url: impl Into<String>) -> ClientBuilder {
         ClientBuilder::new(base_url)
@@ -671,6 +691,60 @@ impl Client {
         body: RequestBody,
         execution_options: RequestExecutionOptions,
     ) -> Result<BlockingResponseStream, Error> {
+        match self.send_request_with_retry_mode(
+            RetryRequestInput {
+                method,
+                uri,
+                redacted_uri_text,
+                merged_headers,
+                body,
+                execution_options,
+            },
+            ResponseMode::Stream,
+        )? {
+            RetryResponse::Stream(response) => Ok(response),
+            RetryResponse::Buffered(_) => unreachable!("stream mode returned buffered response"),
+        }
+    }
+
+    fn send_request_with_retry(
+        &self,
+        method: Method,
+        uri: Uri,
+        redacted_uri_text: String,
+        merged_headers: HeaderMap,
+        body: RequestBody,
+        execution_options: RequestExecutionOptions,
+    ) -> Result<Response, Error> {
+        match self.send_request_with_retry_mode(
+            RetryRequestInput {
+                method,
+                uri,
+                redacted_uri_text,
+                merged_headers,
+                body,
+                execution_options,
+            },
+            ResponseMode::Buffered,
+        )? {
+            RetryResponse::Buffered(response) => Ok(response),
+            RetryResponse::Stream(_) => unreachable!("buffered mode returned stream response"),
+        }
+    }
+
+    fn send_request_with_retry_mode(
+        &self,
+        input: RetryRequestInput,
+        response_mode: ResponseMode,
+    ) -> Result<RetryResponse, Error> {
+        let RetryRequestInput {
+            method,
+            uri,
+            redacted_uri_text,
+            merged_headers,
+            body,
+            execution_options,
+        } = input;
         let timeout_value = execution_options
             .request_timeout
             .unwrap_or(self.request_timeout)
@@ -901,8 +975,32 @@ impl Client {
                 continue;
             }
 
-            if !status.is_success() {
+            let mut ran_response_interceptors = false;
+            let mut observed_server_throttle = false;
+            let mut evaluated_status_retry = false;
+
+            if matches!(response_mode, ResponseMode::Stream) {
                 self.run_response_interceptors(&context, status, &response_headers);
+                ran_response_interceptors = true;
+
+                if status.is_success() {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
+                    self.record_successful_request_for_resilience();
+                    return Ok(RetryResponse::Stream(BlockingResponseStream::new(
+                        status,
+                        response_headers,
+                        response.into_body(),
+                        current_method.clone(),
+                        current_redacted_uri.clone(),
+                        transport_timeout.as_millis(),
+                    )));
+                }
+
                 self.observe_server_throttle(
                     &context,
                     status,
@@ -911,6 +1009,7 @@ impl Client {
                     self.backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
                 );
+                observed_server_throttle = true;
                 let retry_decision = status_retry_decision(
                     attempt,
                     max_attempts,
@@ -918,13 +1017,13 @@ impl Client {
                     &current_redacted_uri,
                     status,
                 );
-
                 let retry_delay = status_retry_delay(
                     self.clock.as_ref(),
                     &response_headers,
                     self.backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
                 );
+                evaluated_status_retry = true;
                 if self.schedule_retry(
                     RetryScheduleContext {
                         context: &context,
@@ -948,314 +1047,15 @@ impl Client {
                     if let Some(adaptive_guard) = adaptive_attempt.take() {
                         adaptive_guard.mark_success();
                     }
-                    return Ok(BlockingResponseStream::new(
+                    return Ok(RetryResponse::Stream(BlockingResponseStream::new(
                         status,
                         response_headers,
                         response.into_body(),
                         current_method.clone(),
                         current_redacted_uri.clone(),
                         transport_timeout.as_millis(),
-                    ));
+                    )));
                 }
-                let response_body = match self.read_decoded_response_body_with_retry(
-                    &mut response,
-                    &mut response_headers,
-                    status,
-                    BodyReadRetryContext {
-                        context: &context,
-                        max_response_body_bytes,
-                        transport_timeout,
-                        retry_policy: &retry_policy,
-                        total_timeout,
-                        request_started_at,
-                        current_method: &current_method,
-                        current_redacted_uri: &current_redacted_uri,
-                        attempt: &mut attempt,
-                        max_attempts,
-                    },
-                )? {
-                    Some(body) => body,
-                    None => continue,
-                };
-                let error = http_status_error(
-                    status,
-                    &current_method,
-                    &current_redacted_uri,
-                    &response_headers,
-                    truncate_body(&response_body),
-                );
-
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            }
-
-            self.run_response_interceptors(&context, status, &response_headers);
-            if let Some(attempt_guard) = circuit_attempt.take() {
-                attempt_guard.mark_success();
-            }
-            if let Some(adaptive_guard) = adaptive_attempt.take() {
-                adaptive_guard.mark_success();
-            }
-            self.record_successful_request_for_resilience();
-            return Ok(BlockingResponseStream::new(
-                status,
-                response_headers,
-                response.into_body(),
-                current_method.clone(),
-                current_redacted_uri.clone(),
-                transport_timeout.as_millis(),
-            ));
-        }
-
-        let error = deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
-        let context = RequestContext::new(
-            current_method,
-            current_redacted_uri,
-            attempt,
-            max_attempts,
-            redirect_count,
-        );
-        self.run_error_interceptors(&context, &error);
-        Err(error)
-    }
-
-    fn send_request_with_retry(
-        &self,
-        method: Method,
-        uri: Uri,
-        redacted_uri_text: String,
-        merged_headers: HeaderMap,
-        body: RequestBody,
-        execution_options: RequestExecutionOptions,
-    ) -> Result<Response, Error> {
-        let timeout_value = execution_options
-            .request_timeout
-            .unwrap_or(self.request_timeout)
-            .max(Duration::from_millis(1));
-        let total_timeout = execution_options.total_timeout.or(self.total_timeout);
-        let max_response_body_bytes = execution_options
-            .max_response_body_bytes
-            .unwrap_or(self.max_response_body_bytes)
-            .max(1);
-
-        let (buffered_body, mut reader_body) = match body {
-            RequestBody::Buffered(body) => (Some(body), None),
-            RequestBody::Reader(reader) => (None, Some(reader)),
-        };
-
-        let body_replayable = buffered_body.is_some();
-        let retry_policy = execution_options
-            .retry_policy
-            .unwrap_or_else(|| self.retry_policy.clone());
-        let redirect_policy = execution_options
-            .redirect_policy
-            .unwrap_or(self.redirect_policy);
-        let status_policy =
-            effective_status_policy(execution_options.status_policy, self.default_status_policy);
-        let mut max_attempts = if self
-            .retry_eligibility
-            .supports_retry(&method, &merged_headers)
-            && body_replayable
-        {
-            retry_policy.configured_max_attempts()
-        } else {
-            1
-        };
-
-        let request_started_at = Instant::now();
-        let mut attempt = 1_usize;
-        let mut redirect_count = 0_usize;
-        let mut current_method = method;
-        let mut current_uri = uri;
-        let mut current_redacted_uri = redacted_uri_text;
-        let mut current_headers = merged_headers;
-
-        while attempt <= max_attempts {
-            let context = RequestContext::new(
-                current_method.clone(),
-                current_redacted_uri.clone(),
-                attempt,
-                max_attempts,
-                redirect_count,
-            );
-            self.run_request_start_observers(&context);
-            let rate_limit_host = rate_limit_bucket_key(&current_uri);
-            if let Err(error) = self.acquire_rate_limit_slot(
-                rate_limit_host.as_deref(),
-                total_timeout,
-                request_started_at,
-                &current_method,
-                &current_redacted_uri,
-            ) {
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            }
-            let Some(transport_timeout) =
-                phase_timeout(timeout_value, total_timeout, request_started_at)
-            else {
-                let error =
-                    deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            };
-            let mut circuit_attempt =
-                match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
-                    Ok(attempt) => attempt,
-                    Err(error) => {
-                        self.run_error_interceptors(&context, &error);
-                        return Err(error);
-                    }
-                };
-            let mut adaptive_attempt = self.begin_adaptive_attempt();
-
-            let request_body = if let Some(body) = &buffered_body {
-                RequestBody::Buffered(body.clone())
-            } else {
-                match reader_body.take() {
-                    Some(reader) => RequestBody::Reader(reader),
-                    None => RequestBody::Buffered(Bytes::new()),
-                }
-            };
-            let mut attempt_headers = current_headers.clone();
-            self.run_request_interceptors(&context, &mut attempt_headers);
-            let current_uri_text = current_uri.to_string();
-
-            let mut response = match self.run_once(
-                current_method.clone(),
-                &current_uri,
-                &current_uri_text,
-                &attempt_headers,
-                request_body,
-                transport_timeout,
-            ) {
-                Ok(response) => response,
-                Err(error) => {
-                    let retry_decision = match &error {
-                        Error::Transport { kind, .. } => RetryDecision {
-                            attempt,
-                            max_attempts,
-                            method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
-                            status: None,
-                            transport_error_kind: Some(*kind),
-                            timeout_phase: None,
-                            response_body_read_error: false,
-                        },
-                        Error::Timeout { phase, .. } => RetryDecision {
-                            attempt,
-                            max_attempts,
-                            method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
-                            status: None,
-                            transport_error_kind: None,
-                            timeout_phase: Some(*phase),
-                            response_body_read_error: false,
-                        },
-                        _ => {
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
-                        }
-                    };
-
-                    let retry_delay = self
-                        .backoff_source
-                        .backoff_for_retry(&retry_policy, attempt);
-                    if self.schedule_retry(
-                        RetryScheduleContext {
-                            context: &context,
-                            retry_policy: &retry_policy,
-                            total_timeout,
-                            request_started_at,
-                            current_method: &current_method,
-                            current_redacted_uri: &current_redacted_uri,
-                            attempt: &mut attempt,
-                            max_attempts,
-                        },
-                        &retry_decision,
-                        retry_delay,
-                    )? {
-                        continue;
-                    }
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
-            };
-
-            let status = response.status();
-            let mut response_headers = response.headers().clone();
-            if redirect_policy.enabled() && is_redirect_status(status) {
-                if redirect_count >= redirect_policy.max_redirects() {
-                    let error = Error::RedirectLimitExceeded {
-                        max_redirects: redirect_policy.max_redirects(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
-                if !body_replayable
-                    && !matches!(
-                        current_method,
-                        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
-                    )
-                {
-                    let error = Error::RedirectBodyNotReplayable {
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
-                let Some(location) = redirect_location(&response_headers) else {
-                    let error = Error::MissingRedirectLocation {
-                        status: status.as_u16(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                };
-                let Some(next_uri) = resolve_redirect_uri(&current_uri, &location) else {
-                    let error = Error::InvalidRedirectLocation {
-                        location,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                };
-                self.run_response_interceptors(&context, status, &response_headers);
-                if let Some(attempt_guard) = circuit_attempt.take() {
-                    attempt_guard.mark_success();
-                }
-                if let Some(adaptive_guard) = adaptive_attempt.take() {
-                    adaptive_guard.mark_success();
-                }
-                let next_method = redirect_method(&current_method, status);
-                let method_changed_to_get =
-                    next_method == Method::GET && current_method != Method::GET;
-                let same_origin_redirect = same_origin(&current_uri, &next_uri);
-                sanitize_headers_for_redirect(
-                    &mut current_headers,
-                    method_changed_to_get,
-                    same_origin_redirect,
-                );
-                if method_changed_to_get {
-                    reader_body = None;
-                }
-                current_method = next_method;
-                current_uri = next_uri;
-                current_redacted_uri = redact_uri_for_logs(&current_uri.to_string());
-                redirect_count += 1;
-                if max_attempts == 1
-                    && body_replayable
-                    && self
-                        .retry_eligibility
-                        .supports_retry(&current_method, &current_headers)
-                {
-                    max_attempts = retry_policy.configured_max_attempts();
-                }
-                continue;
             }
 
             let response_body = match self.read_decoded_response_body_with_retry(
@@ -1278,56 +1078,70 @@ impl Client {
                 Some(body) => body,
                 None => continue,
             };
-            self.run_response_interceptors(&context, status, &response_headers);
+
+            if !ran_response_interceptors {
+                self.run_response_interceptors(&context, status, &response_headers);
+            }
 
             if !status.is_success() {
-                self.observe_server_throttle(
-                    &context,
-                    status,
-                    &response_headers,
-                    rate_limit_host.as_deref(),
-                    self.backoff_source
-                        .backoff_for_retry(&retry_policy, attempt),
-                );
-                let retry_decision = status_retry_decision(
-                    attempt,
-                    max_attempts,
-                    &current_method,
-                    &current_redacted_uri,
-                    status,
-                );
-
-                let retry_delay = status_retry_delay(
-                    self.clock.as_ref(),
-                    &response_headers,
-                    self.backoff_source
-                        .backoff_for_retry(&retry_policy, attempt),
-                );
-                if self.schedule_retry(
-                    RetryScheduleContext {
-                        context: &context,
-                        retry_policy: &retry_policy,
-                        total_timeout,
-                        request_started_at,
-                        current_method: &current_method,
-                        current_redacted_uri: &current_redacted_uri,
-                        attempt: &mut attempt,
+                if !observed_server_throttle {
+                    self.observe_server_throttle(
+                        &context,
+                        status,
+                        &response_headers,
+                        rate_limit_host.as_deref(),
+                        self.backoff_source
+                            .backoff_for_retry(&retry_policy, attempt),
+                    );
+                }
+                if !evaluated_status_retry {
+                    let retry_decision = status_retry_decision(
+                        attempt,
                         max_attempts,
-                    },
-                    &retry_decision,
-                    retry_delay,
-                )? {
-                    continue;
-                }
-                if matches!(status_policy, StatusPolicy::Response) {
-                    if let Some(attempt_guard) = circuit_attempt.take() {
-                        attempt_guard.mark_success();
+                        &current_method,
+                        &current_redacted_uri,
+                        status,
+                    );
+
+                    let retry_delay = status_retry_delay(
+                        self.clock.as_ref(),
+                        &response_headers,
+                        self.backoff_source
+                            .backoff_for_retry(&retry_policy, attempt),
+                    );
+                    if self.schedule_retry(
+                        RetryScheduleContext {
+                            context: &context,
+                            retry_policy: &retry_policy,
+                            total_timeout,
+                            request_started_at,
+                            current_method: &current_method,
+                            current_redacted_uri: &current_redacted_uri,
+                            attempt: &mut attempt,
+                            max_attempts,
+                        },
+                        &retry_decision,
+                        retry_delay,
+                    )? {
+                        continue;
                     }
-                    if let Some(adaptive_guard) = adaptive_attempt.take() {
-                        adaptive_guard.mark_success();
+                    if matches!(status_policy, StatusPolicy::Response)
+                        && matches!(response_mode, ResponseMode::Buffered)
+                    {
+                        if let Some(attempt_guard) = circuit_attempt.take() {
+                            attempt_guard.mark_success();
+                        }
+                        if let Some(adaptive_guard) = adaptive_attempt.take() {
+                            adaptive_guard.mark_success();
+                        }
+                        return Ok(RetryResponse::Buffered(Response::new(
+                            status,
+                            response_headers,
+                            response_body,
+                        )));
                     }
-                    return Ok(Response::new(status, response_headers, response_body));
                 }
+
                 let error = http_status_error(
                     status,
                     &current_method,
@@ -1335,7 +1149,6 @@ impl Client {
                     &response_headers,
                     truncate_body(&response_body),
                 );
-
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
@@ -1347,7 +1160,11 @@ impl Client {
                 adaptive_guard.mark_success();
             }
             self.record_successful_request_for_resilience();
-            return Ok(Response::new(status, response_headers, response_body));
+            return Ok(RetryResponse::Buffered(Response::new(
+                status,
+                response_headers,
+                response_body,
+            )));
         }
 
         let error = deadline_exceeded_error(total_timeout, &current_method, &current_redacted_uri);

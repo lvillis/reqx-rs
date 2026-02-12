@@ -45,6 +45,7 @@ impl std::fmt::Display for TimeoutPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ErrorCode {
     InvalidUri,
+    InvalidNoProxyRule,
     SerializeJson,
     SerializeQuery,
     SerializeForm,
@@ -72,8 +73,9 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::InvalidUri,
+        Self::InvalidNoProxyRule,
         Self::SerializeJson,
         Self::SerializeQuery,
         Self::SerializeForm,
@@ -107,6 +109,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUri => "invalid_uri",
+            Self::InvalidNoProxyRule => "invalid_no_proxy_rule",
             Self::SerializeJson => "serialize_json",
             Self::SerializeQuery => "serialize_query",
             Self::SerializeForm => "serialize_form",
@@ -140,6 +143,8 @@ impl ErrorCode {
 pub enum Error {
     #[error("invalid request uri: {uri}")]
     InvalidUri { uri: String },
+    #[error("invalid no_proxy rule: {rule:?}")]
+    InvalidNoProxyRule { rule: String },
     #[error("failed to serialize request json: {source}")]
     SerializeJson {
         #[source]
@@ -286,6 +291,7 @@ impl Error {
     pub const fn code(&self) -> ErrorCode {
         match self {
             Self::InvalidUri { .. } => ErrorCode::InvalidUri,
+            Self::InvalidNoProxyRule { .. } => ErrorCode::InvalidNoProxyRule,
             Self::SerializeJson { .. } => ErrorCode::SerializeJson,
             Self::SerializeQuery { .. } => ErrorCode::SerializeQuery,
             Self::SerializeForm { .. } => ErrorCode::SerializeForm,

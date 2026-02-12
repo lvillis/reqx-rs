@@ -19,6 +19,8 @@ use hyper_util::client::legacy::connect::proxy::Tunnel;
 use tower_service::Service;
 use url::Url;
 
+use crate::error::Error;
+
 #[cfg(feature = "_async")]
 pub(crate) type BoxConnectError = Box<dyn StdError + Send + Sync>;
 
@@ -83,6 +85,23 @@ impl NoProxyRule {
             Self::Domain(domain) => host == domain || host.ends_with(&format!(".{domain}")),
         }
     }
+}
+
+pub(crate) fn parse_no_proxy_rule(rule: &str) -> crate::Result<NoProxyRule> {
+    NoProxyRule::parse(rule).ok_or_else(|| Error::InvalidNoProxyRule {
+        rule: rule.to_owned(),
+    })
+}
+
+pub(crate) fn parse_no_proxy_rules<I, S>(rules: I) -> crate::Result<Vec<NoProxyRule>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    rules
+        .into_iter()
+        .map(|rule| parse_no_proxy_rule(rule.as_ref()))
+        .collect()
 }
 
 #[derive(Clone)]

@@ -409,13 +409,14 @@ fn error_code_maps_expected_variant() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 25);
+    assert_eq!(codes.len(), 26);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
         names,
         vec![
             "invalid_uri",
+            "invalid_no_proxy_rule",
             "serialize_json",
             "serialize_query",
             "serialize_form",
@@ -736,6 +737,46 @@ fn no_proxy_rule_keeps_plain_ipv6_without_port() {
     let rule = NoProxyRule::parse("2001:db8::1").expect("valid ipv6 rule");
     assert!(rule.matches("2001:db8::1"));
     assert!(!rule.matches("2001:db8::2"));
+}
+
+#[test]
+fn try_add_no_proxy_rejects_invalid_rule() {
+    let result = Client::builder("https://api.example.com").try_add_no_proxy("[::1]not-a-port");
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "[::1]not-a-port"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_invalid_rule() {
+    let result =
+        Client::builder("https://api.example.com").try_no_proxy(["example.com", "[::1]not-a-port"]);
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_try_add_no_proxy_rejects_invalid_rule() {
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .try_add_no_proxy("[::1]not-a-port");
+    let error = match result {
+        Ok(_) => panic!("invalid no_proxy rule should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
 }
 
 #[test]
