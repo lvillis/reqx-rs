@@ -151,7 +151,7 @@ struct RequestExecutionOptions {
 
 enum RequestBody {
     Buffered(Bytes),
-    Reader(Box<dyn Read + Send + Sync>),
+    Reader(Box<dyn Read + Send>),
 }
 
 pub struct ClientBuilder {

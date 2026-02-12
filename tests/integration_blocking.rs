@@ -1,7 +1,7 @@
 #![cfg(feature = "_blocking")]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -293,6 +293,8 @@ fn status_text(status: u16) -> &'static str {
         201 => "Created",
         301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
         400 => "Bad Request",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
@@ -429,6 +431,40 @@ fn blocking_head_stream_into_response_with_content_encoding_empty_body_succeeds(
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, "HEAD");
     assert_eq!(requests[0].headers.get("accept-encoding"), None);
+}
+
+#[test]
+fn blocking_body_reader_accepts_send_non_sync_reader() {
+    #[derive(Default)]
+    struct NonSyncReader {
+        data: Vec<u8>,
+        pos: std::cell::Cell<usize>,
+    }
+
+    impl Read for NonSyncReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let start = self.pos.get();
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let remaining = &self.data[start..];
+            let to_copy = remaining.len().min(buf.len());
+            buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
+            self.pos.set(start + to_copy);
+            Ok(to_copy)
+        }
+    }
+
+    let client = Client::builder("http://127.0.0.1")
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let _request = client.post("/v1/upload").body_reader(NonSyncReader {
+        data: b"payload".to_vec(),
+        ..NonSyncReader::default()
+    });
 }
 
 #[test]
@@ -1437,6 +1473,98 @@ fn blocking_redirect_policy_follows_relative_location() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/v1/old");
     assert_eq!(requests[1].path, "/v1/new");
+}
+
+#[test]
+fn blocking_redirect_post_302_rewrites_to_get_and_drops_body() {
+    let server = MockServer::start(vec![
+        MockResponse::new(302, vec![("Location", "/v1/new")], b"redirect".to_vec()),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .post("/v1/old")
+        .json(&serde_json::json!({ "name": "demo" }))
+        .expect("serialize body")
+        .send_json()
+        .expect("redirect should be followed");
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert!(requests[1].body.is_empty());
+}
+
+#[test]
+fn blocking_redirect_303_allows_non_replayable_reader_body_when_method_changes_to_get() {
+    let server = MockServer::start(vec![
+        MockResponse::new(303, vec![("Location", "/v1/new")], b"redirect".to_vec()),
+        MockResponse::new(200, vec![("Content-Type", "text/plain")], b"ok".to_vec()),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/old")
+        .body_reader(Cursor::new(b"payload".to_vec()))
+        .send()
+        .expect("303 redirect should be followed even for non-replayable body");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert!(requests[1].body.is_empty());
+}
+
+#[test]
+fn blocking_redirect_307_rejects_non_replayable_reader_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        307,
+        vec![("Location", "/v1/new")],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .post("/v1/old")
+        .body_reader(Cursor::new(b"payload".to_vec()))
+        .send()
+        .expect_err("307 redirect should fail for non-replayable body");
+
+    match error {
+        Error::RedirectBodyNotReplayable { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
 }
 
 #[test]

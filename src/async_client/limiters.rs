@@ -20,6 +20,7 @@ pub(crate) struct RequestLimiters {
 #[derive(Clone)]
 struct PerHostLimiterEntry {
     semaphore: Arc<Semaphore>,
+    limit: usize,
     last_used_at: Instant,
 }
 
@@ -74,6 +75,7 @@ impl RequestLimiters {
                     cleanup_stale_per_host_limiters(&mut guard, now);
                     let entry = guard.entry(host).or_insert_with(|| PerHostLimiterEntry {
                         semaphore: Arc::new(Semaphore::new(limit)),
+                        limit,
                         last_used_at: now,
                     });
                     entry.last_used_at = now;
@@ -97,16 +99,90 @@ fn cleanup_stale_per_host_limiters(
     entries: &mut BTreeMap<String, PerHostLimiterEntry>,
     now: Instant,
 ) {
-    entries.retain(|_, entry| now.duration_since(entry.last_used_at) <= PER_HOST_LIMITER_ENTRY_TTL);
+    entries.retain(|_, entry| {
+        entry.semaphore.available_permits() < entry.limit
+            || now.duration_since(entry.last_used_at) <= PER_HOST_LIMITER_ENTRY_TTL
+    });
 
     while entries.len() > PER_HOST_LIMITER_MAX_ENTRIES {
         let oldest_key = entries
             .iter()
+            .filter(|(_, entry)| entry.semaphore.available_permits() == entry.limit)
             .min_by_key(|(_, entry)| entry.last_used_at)
             .map(|(host, _)| host.clone());
         let Some(oldest_key) = oldest_key else {
             break;
         };
         entries.remove(&oldest_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_keeps_stale_entry_while_permit_is_active() {
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(PER_HOST_LIMITER_ENTRY_TTL + Duration::from_secs(1))
+            .expect("stale instant");
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire active permit");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "active.example.com".to_owned(),
+            PerHostLimiterEntry {
+                semaphore: Arc::clone(&semaphore),
+                limit: 1,
+                last_used_at: stale,
+            },
+        );
+
+        cleanup_stale_per_host_limiters(&mut entries, now);
+        assert!(entries.contains_key("active.example.com"));
+
+        drop(permit);
+        cleanup_stale_per_host_limiters(&mut entries, now);
+        assert!(!entries.contains_key("active.example.com"));
+    }
+
+    #[test]
+    fn cleanup_does_not_evict_active_entries_when_over_capacity() {
+        let now = Instant::now();
+        let active_semaphore = Arc::new(Semaphore::new(1));
+        let _active_permit = active_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire active permit");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "active.example.com".to_owned(),
+            PerHostLimiterEntry {
+                semaphore: Arc::clone(&active_semaphore),
+                limit: 1,
+                last_used_at: now,
+            },
+        );
+
+        for index in 0..PER_HOST_LIMITER_MAX_ENTRIES {
+            entries.insert(
+                format!("idle-{index}.example.com"),
+                PerHostLimiterEntry {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    limit: 1,
+                    last_used_at: now,
+                },
+            );
+        }
+
+        cleanup_stale_per_host_limiters(&mut entries, now);
+        assert!(entries.contains_key("active.example.com"));
+        assert_eq!(entries.len(), PER_HOST_LIMITER_MAX_ENTRIES);
     }
 }

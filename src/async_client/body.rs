@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use http::{HeaderMap, Method, Request, Uri};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 
@@ -15,7 +15,7 @@ pub(crate) use crate::content_encoding::{
 use crate::error::Error;
 
 type BoxBodyError = Box<dyn StdError + Send + Sync>;
-pub(crate) type ReqBody = BoxBody<Bytes, BoxBodyError>;
+pub(crate) type ReqBody = UnsyncBoxBody<Bytes, BoxBodyError>;
 
 pub(crate) enum RequestBody {
     Buffered(Bytes),
@@ -35,19 +35,21 @@ fn map_infallible_to_box_error(never: Infallible) -> BoxBodyError {
 pub(crate) fn empty_req_body() -> ReqBody {
     Full::new(Bytes::new())
         .map_err(map_infallible_to_box_error)
-        .boxed()
+        .boxed_unsync()
 }
 
 pub(crate) fn buffered_req_body(body: Bytes) -> ReqBody {
-    Full::new(body).map_err(map_infallible_to_box_error).boxed()
+    Full::new(body)
+        .map_err(map_infallible_to_box_error)
+        .boxed_unsync()
 }
 
 pub(crate) fn stream_req_body<S, E>(stream: S) -> ReqBody
 where
-    S: Stream<Item = Result<Bytes, E>> + Send + Sync + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: StdError + Send + Sync + 'static,
 {
-    BodyExt::boxed(StreamBody::new(stream.map(|item| {
+    BodyExt::boxed_unsync(StreamBody::new(stream.map(|item| {
         item.map(Frame::data)
             .map_err(|error| Box::new(error) as BoxBodyError)
     })))

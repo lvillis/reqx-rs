@@ -107,7 +107,7 @@ impl<'a> RequestBuilder<'a> {
 
     pub fn body_stream<S, E>(mut self, stream: S) -> Self
     where
-        S: Stream<Item = Result<Bytes, E>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
         E: StdError + Send + Sync + 'static,
     {
         self.body = Some(RequestBody::Streaming(stream_req_body(stream)));
@@ -116,14 +116,14 @@ impl<'a> RequestBuilder<'a> {
 
     pub fn body_reader<R>(self, reader: R) -> Self
     where
-        R: AsyncRead + Send + Sync + 'static,
+        R: AsyncRead + Send + 'static,
     {
         self.body_stream(ReaderStream::new(reader))
     }
 
     pub fn upload_from_reader<R>(self, reader: R) -> Self
     where
-        R: AsyncRead + Send + Sync + 'static,
+        R: AsyncRead + Send + 'static,
     {
         self.body_reader(reader)
     }
@@ -134,7 +134,7 @@ impl<'a> RequestBuilder<'a> {
         content_length: u64,
     ) -> crate::Result<Self>
     where
-        R: AsyncRead + Send + Sync + 'static,
+        R: AsyncRead + Send + 'static,
     {
         let value = HeaderValue::from_str(&content_length.to_string()).map_err(|source| {
             crate::error::Error::InvalidHeaderValue {

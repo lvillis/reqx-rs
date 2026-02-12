@@ -435,6 +435,10 @@ fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
         400 => "Bad Request",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
@@ -1680,6 +1684,120 @@ async fn redirect_policy_follows_relative_location() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/v1/old");
     assert_eq!(requests[1].path, "/v1/new");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_post_302_rewrites_to_get_and_drops_body() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            302,
+            vec![("Location", "/v1/new")],
+            "redirect",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            r#"{"ok":true}"#,
+            Duration::ZERO,
+        ),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .post("/v1/old")
+        .json(&json!({ "name": "demo" }))
+        .expect("json serialization should succeed")
+        .send_json()
+        .await
+        .expect("redirect should be followed");
+    assert_eq!(body["ok"], Value::Bool(true));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert!(requests[1].body.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_303_allows_non_replayable_stream_body_when_method_changes_to_get() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            303,
+            vec![("Location", "/v1/new")],
+            "redirect",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            "ok",
+            Duration::ZERO,
+        ),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/old")
+        .body_stream(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"payload"))
+        }))
+        .send()
+        .await
+        .expect("303 redirect should be followed even for non-replayable body");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert!(requests[1].body.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_307_rejects_non_replayable_stream_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        307,
+        vec![("Location", "/v1/new")],
+        "redirect",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .post("/v1/old")
+        .body_stream(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"payload"))
+        }))
+        .send()
+        .await
+        .expect_err("307 redirect should fail for non-replayable body");
+
+    match error {
+        Error::RedirectBodyNotReplayable { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
 }
 
 struct HeaderInjectingInterceptor {

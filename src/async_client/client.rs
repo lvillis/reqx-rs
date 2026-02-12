@@ -2093,7 +2093,7 @@ impl Client {
             .max_response_body_bytes
             .unwrap_or(self.max_response_body_bytes)
             .max(1);
-        let (buffered_body, mut streaming_body) = match body {
+        let (mut buffered_body, mut streaming_body) = match body {
             RequestBody::Buffered(body) => (Some(body), None),
             RequestBody::Streaming(body) => (None, Some(body)),
         };
@@ -2311,7 +2311,11 @@ impl Client {
                     self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
+                let next_method = redirect_method(&current_method, status);
+                let method_changed_to_get =
+                    next_method == Method::GET && current_method != Method::GET;
                 if !body_replayable
+                    && !method_changed_to_get
                     && !matches!(
                         current_method,
                         Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
@@ -2349,9 +2353,6 @@ impl Client {
                 if let Some(adaptive_guard) = adaptive_attempt.take() {
                     adaptive_guard.mark_success();
                 }
-                let next_method = redirect_method(&current_method, status);
-                let method_changed_to_get =
-                    next_method == Method::GET && current_method != Method::GET;
                 let same_origin_redirect = same_origin(&current_uri, &next_uri);
                 sanitize_headers_for_redirect(
                     &mut current_headers,
@@ -2359,6 +2360,7 @@ impl Client {
                     same_origin_redirect,
                 );
                 if method_changed_to_get {
+                    buffered_body = None;
                     streaming_body = None;
                 }
                 current_method = next_method;
@@ -2366,7 +2368,7 @@ impl Client {
                 current_redacted_uri = redact_uri_for_logs(&current_uri.to_string());
                 redirect_count += 1;
                 if max_attempts == 1
-                    && body_replayable
+                    && (body_replayable || method_changed_to_get)
                     && self
                         .retry_eligibility
                         .supports_retry(&current_method, &current_headers)
