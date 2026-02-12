@@ -40,10 +40,10 @@ feature-matrix:
     cargo check --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
 
 feature-contract:
-    cargo check --lib --no-default-features --features async-rustls
-    cargo check --lib --no-default-features --features async-native-tls
-    cargo check --lib --no-default-features --features blocking-rustls
-    cargo check --lib --no-default-features --features blocking-native-tls
+    cargo check --lib --no-default-features --features strict-feature-guards,async-rustls
+    cargo check --lib --no-default-features --features strict-feature-guards,async-native-tls
+    cargo check --lib --no-default-features --features strict-feature-guards,blocking-rustls
+    cargo check --lib --no-default-features --features strict-feature-guards,blocking-native-tls
     @bash -euo pipefail -c '\
       expect_fail() { \
         local features="$1"; \
@@ -52,14 +52,14 @@ feature-contract:
           exit 1; \
         fi; \
       }; \
-      expect_fail "async-tls-rustls-ring,async-tls-rustls-aws-lc-rs"; \
-      expect_fail "async-tls-rustls-ring,async-tls-native"; \
-      expect_fail "async-tls-rustls-aws-lc-rs,async-tls-native"; \
-      expect_fail "async-rustls,async-native-tls"; \
-      expect_fail "blocking-tls-rustls-ring,blocking-tls-rustls-aws-lc-rs"; \
-      expect_fail "blocking-tls-rustls-ring,blocking-tls-native"; \
-      expect_fail "blocking-tls-rustls-aws-lc-rs,blocking-tls-native"; \
-      expect_fail "blocking-rustls,blocking-native-tls"; \
+      expect_fail "strict-feature-guards,async-tls-rustls-ring,async-tls-rustls-aws-lc-rs"; \
+      expect_fail "strict-feature-guards,async-tls-rustls-ring,async-tls-native"; \
+      expect_fail "strict-feature-guards,async-tls-rustls-aws-lc-rs,async-tls-native"; \
+      expect_fail "strict-feature-guards,async-rustls,async-native-tls"; \
+      expect_fail "strict-feature-guards,blocking-tls-rustls-ring,blocking-tls-rustls-aws-lc-rs"; \
+      expect_fail "strict-feature-guards,blocking-tls-rustls-ring,blocking-tls-native"; \
+      expect_fail "strict-feature-guards,blocking-tls-rustls-aws-lc-rs,blocking-tls-native"; \
+      expect_fail "strict-feature-guards,blocking-rustls,blocking-native-tls"; \
     '
 
 docsrs-check:

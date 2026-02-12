@@ -1,7 +1,7 @@
 use http::{HeaderMap, Method};
 use std::time::{Duration, SystemTime};
 
-use crate::util::parse_retry_after;
+use crate::util::{parse_retry_after, redact_uri_for_logs};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -360,5 +360,65 @@ impl Error {
             .or_else(|| headers.get("x-amz-request-id"))
             .or_else(|| headers.get("x-amz-id-2"))
             .and_then(|value| value.to_str().ok())
+    }
+
+    pub fn request_method(&self) -> Option<&Method> {
+        match self {
+            Self::Transport { method, .. }
+            | Self::Timeout { method, .. }
+            | Self::DeadlineExceeded { method, .. }
+            | Self::ResponseBodyTooLarge { method, .. }
+            | Self::HttpStatus { method, .. }
+            | Self::DecodeContentEncoding { method, .. }
+            | Self::RetryBudgetExhausted { method, .. }
+            | Self::CircuitOpen { method, .. }
+            | Self::MissingRedirectLocation { method, .. }
+            | Self::InvalidRedirectLocation { method, .. }
+            | Self::RedirectLimitExceeded { method, .. }
+            | Self::RedirectBodyNotReplayable { method, .. } => Some(method),
+            _ => None,
+        }
+    }
+
+    pub fn request_uri(&self) -> Option<&str> {
+        match self {
+            Self::InvalidUri { uri }
+            | Self::Transport { uri, .. }
+            | Self::Timeout { uri, .. }
+            | Self::DeadlineExceeded { uri, .. }
+            | Self::ResponseBodyTooLarge { uri, .. }
+            | Self::HttpStatus { uri, .. }
+            | Self::DecodeContentEncoding { uri, .. }
+            | Self::RetryBudgetExhausted { uri, .. }
+            | Self::CircuitOpen { uri, .. }
+            | Self::MissingRedirectLocation { uri, .. }
+            | Self::InvalidRedirectLocation { uri, .. }
+            | Self::RedirectLimitExceeded { uri, .. }
+            | Self::RedirectBodyNotReplayable { uri, .. } => Some(uri),
+            _ => None,
+        }
+    }
+
+    pub fn request_uri_redacted(&self) -> Option<String> {
+        self.request_uri().map(redact_uri_for_logs)
+    }
+
+    pub fn request_path(&self) -> Option<String> {
+        let uri = self.request_uri_redacted()?;
+        if let Ok(parsed) = uri.parse::<http::Uri>() {
+            let path = parsed.path();
+            if !path.is_empty() {
+                return Some(path.to_owned());
+            }
+        }
+        let without_query = uri.split_once('?').map_or(uri.as_str(), |(left, _)| left);
+        let without_fragment = without_query
+            .split_once('#')
+            .map_or(without_query, |(left, _)| left);
+        if without_fragment.is_empty() {
+            None
+        } else {
+            Some(without_fragment.to_owned())
+        }
     }
 }

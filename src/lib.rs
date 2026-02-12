@@ -46,12 +46,16 @@
 //! - Set both request timeout and total timeout.
 //! - For `POST` retries, always set `idempotency_key(...)`.
 
-#[cfg(not(any(feature = "_async", feature = "_blocking")))]
+#[cfg(all(
+    feature = "strict-feature-guards",
+    not(any(feature = "_async", feature = "_blocking"))
+))]
 compile_error!(
     "reqx requires at least one transport feature: enable an `async-tls-*` or `blocking-tls-*` feature"
 );
 
 #[cfg(all(
+    feature = "strict-feature-guards",
     feature = "_async",
     not(feature = "async-tls-rustls-ring"),
     not(feature = "async-tls-rustls-aws-lc-rs"),
@@ -62,6 +66,7 @@ compile_error!(
 );
 
 #[cfg(all(
+    feature = "strict-feature-guards",
     feature = "_async",
     any(
         all(
@@ -77,6 +82,7 @@ compile_error!(
 );
 
 #[cfg(all(
+    feature = "strict-feature-guards",
     feature = "_blocking",
     not(feature = "blocking-tls-rustls-ring"),
     not(feature = "blocking-tls-rustls-aws-lc-rs"),
@@ -87,6 +93,7 @@ compile_error!(
 );
 
 #[cfg(all(
+    feature = "strict-feature-guards",
     feature = "_blocking",
     any(
         all(

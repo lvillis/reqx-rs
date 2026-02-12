@@ -17,7 +17,7 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
 };
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
-use crate::util::{parse_header_name, parse_header_value, validate_base_url};
+use crate::util::{parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url};
 use crate::{AdvancedConfig, ClientProfile};
 use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer};
 use crate::{PolicyBackoffSource, PrimaryEndpointSelector, StandardBodyCodec, SystemClock};
@@ -469,7 +469,7 @@ impl ClientBuilder {
         let proxied = if let Some(proxy_config) = &proxy_config {
             let proxy =
                 ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| Error::InvalidUri {
-                    uri: proxy_config.uri.to_string(),
+                    uri: redact_uri_for_logs(&proxy_config.uri.to_string()),
                 })?;
 
             Some(make_agent(

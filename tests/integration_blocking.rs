@@ -969,7 +969,7 @@ fn blocking_build_rejects_invalid_base_url_early() {
 
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "ftp://api.example.com");
+            assert_eq!(uri, "ftp://api.example.com/");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -985,7 +985,7 @@ fn blocking_build_rejects_base_url_with_query() {
 
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "https://api.example.com/v1?token=abc");
+            assert_eq!(uri, "https://api.example.com/v1");
         }
         other => panic!("unexpected error: {other}"),
     }

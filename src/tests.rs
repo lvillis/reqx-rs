@@ -440,6 +440,43 @@ fn error_code_maps_expected_variant() {
 }
 
 #[test]
+fn error_display_redacts_query_from_request_uri() {
+    let error = Error::Transport {
+        kind: TransportErrorKind::Connect,
+        method: http::Method::GET,
+        uri: crate::util::redact_uri_for_logs("https://api.example.com/v1/items?token=secret"),
+        source: Box::new(std::io::Error::other("connect failed")),
+    };
+
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    assert!(!display.contains("token=secret"));
+    assert!(!debug.contains("token=secret"));
+    assert!(display.contains("/v1/items"));
+}
+
+#[test]
+fn error_safe_request_accessors_return_method_uri_and_path() {
+    let error = Error::HttpStatus {
+        status: 404,
+        method: http::Method::POST,
+        uri: "https://api.example.com/v1/items".to_owned(),
+        headers: Box::new(http::HeaderMap::new()),
+        body: String::new(),
+    };
+
+    assert_eq!(
+        error.request_method().map(http::Method::as_str),
+        Some("POST")
+    );
+    assert_eq!(
+        error.request_uri_redacted().as_deref(),
+        Some("https://api.example.com/v1/items")
+    );
+    assert_eq!(error.request_path().as_deref(), Some("/v1/items"));
+}
+
+#[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
     assert_eq!(codes.len(), 27);
@@ -575,7 +612,7 @@ fn build_rejects_non_http_base_url_scheme() {
     };
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "ftp://api.example.com");
+            assert_eq!(uri, "ftp://api.example.com/");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -590,7 +627,7 @@ fn build_rejects_base_url_with_query() {
     };
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "https://api.example.com/v1?token=abc");
+            assert_eq!(uri, "https://api.example.com/v1");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -605,7 +642,7 @@ fn build_rejects_base_url_with_fragment() {
     };
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "https://api.example.com/v1#anchor");
+            assert_eq!(uri, "https://api.example.com/v1");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -620,7 +657,7 @@ fn build_rejects_base_url_with_userinfo() {
     };
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, "https://user:pass@api.example.com/v1");
+            assert_eq!(uri, "https://api.example.com/v1");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -635,7 +672,7 @@ fn build_rejects_base_url_with_surrounding_whitespace() {
     };
     match error {
         Error::InvalidUri { uri } => {
-            assert_eq!(uri, " https://api.example.com/v1 ");
+            assert_eq!(uri, "https://api.example.com/v1");
         }
         other => panic!("unexpected error: {other}"),
     }

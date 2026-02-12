@@ -49,7 +49,7 @@ pub(crate) fn ensure_accept_encoding_blocking(method: &Method, headers: &mut Hea
 
 fn invalid_base_url_error(base_url: &str) -> Error {
     Error::InvalidUri {
-        uri: base_url.to_owned(),
+        uri: redact_uri_for_logs(base_url),
     }
 }
 
@@ -97,21 +97,21 @@ pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), E
         Ok(uri) if uri.host().is_some() => {
             let Some(scheme) = uri.scheme_str() else {
                 return Err(Error::InvalidUri {
-                    uri: path.to_owned(),
+                    uri: redact_uri_for_logs(path),
                 });
             };
             if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
                 path.to_owned()
             } else {
                 return Err(Error::InvalidUri {
-                    uri: path.to_owned(),
+                    uri: redact_uri_for_logs(path),
                 });
             }
         }
         _ => join_base_path(base_url, path),
     };
     let uri = uri_text.parse().map_err(|_| Error::InvalidUri {
-        uri: uri_text.clone(),
+        uri: redact_uri_for_logs(&uri_text),
     })?;
     Ok((uri_text, uri))
 }
