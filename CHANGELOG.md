@@ -1,3 +1,20 @@
+## [0.1.15] - 2026-02-12
+
+### 🚀 Features
+
+- Align stream concurrency lifetime, no_proxy port matching, and system+custom CA trust
+
+### 🐛 Bug Fixes
+
+- Harden policy validation and retry-budget semantics
+- Harden rate limiting, async proxy routing, and no_proxy validation
+- *(blocking)* Enforce no-redirect policy and add regression tests
+- Align redirect body semantics and harden limiter cleanup
+- Harden error redaction and add safe error accessors
+
+### 🚜 Refactor
+
+- Unify retry loops and enforce strict no_proxy validation
 ## [0.1.14] - 2026-02-12
 
 ### 🚀 Features
@@ -7,6 +24,10 @@
 ### 🐛 Bug Fixes
 
 - Harden no_proxy IPv6 parsing and unify response body retry/decode flow
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.14
 ## [0.1.13] - 2026-02-11
 
 ### 🚀 Features
