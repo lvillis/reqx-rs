@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode, Uri};
 
-use crate::error::Error;
+use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
@@ -78,12 +78,115 @@ pub(crate) fn status_retry_decision(
     }
 }
 
+pub(crate) fn transport_retry_decision(
+    attempt: usize,
+    max_attempts: usize,
+    method: &Method,
+    redacted_uri: &str,
+    transport_error_kind: TransportErrorKind,
+) -> RetryDecision {
+    RetryDecision {
+        attempt,
+        max_attempts,
+        method: method.clone(),
+        uri: redacted_uri.to_owned(),
+        status: None,
+        transport_error_kind: Some(transport_error_kind),
+        timeout_phase: None,
+        response_body_read_error: false,
+    }
+}
+
+pub(crate) fn timeout_retry_decision(
+    attempt: usize,
+    max_attempts: usize,
+    method: &Method,
+    redacted_uri: &str,
+    timeout_phase: TimeoutPhase,
+) -> RetryDecision {
+    RetryDecision {
+        attempt,
+        max_attempts,
+        method: method.clone(),
+        uri: redacted_uri.to_owned(),
+        status: None,
+        transport_error_kind: None,
+        timeout_phase: Some(timeout_phase),
+        response_body_read_error: false,
+    }
+}
+
+pub(crate) fn response_body_read_retry_decision(
+    attempt: usize,
+    max_attempts: usize,
+    method: &Method,
+    redacted_uri: &str,
+) -> RetryDecision {
+    RetryDecision {
+        attempt,
+        max_attempts,
+        method: method.clone(),
+        uri: redacted_uri.to_owned(),
+        status: None,
+        transport_error_kind: None,
+        timeout_phase: None,
+        response_body_read_error: true,
+    }
+}
+
 pub(crate) fn status_retry_delay(
     clock: &dyn Clock,
     headers: &HeaderMap,
     fallback: Duration,
 ) -> Duration {
     parse_retry_after(headers, clock.now_system()).unwrap_or(fallback)
+}
+
+#[cfg(feature = "_async")]
+pub(crate) fn status_retry_error(
+    status: StatusCode,
+    method: &Method,
+    redacted_uri: &str,
+    headers: &HeaderMap,
+) -> Error {
+    http_status_error(status, method, redacted_uri, headers, String::new())
+}
+
+pub(crate) const fn should_return_non_success_response(status_policy: StatusPolicy) -> bool {
+    matches!(status_policy, StatusPolicy::Response)
+}
+
+pub(crate) struct StatusRetryPlan {
+    pub(crate) decision: RetryDecision,
+    pub(crate) delay: Duration,
+}
+
+pub(crate) struct StatusRetryPlanInput<'a> {
+    pub(crate) attempt: usize,
+    pub(crate) max_attempts: usize,
+    pub(crate) method: &'a Method,
+    pub(crate) redacted_uri: &'a str,
+    pub(crate) status: StatusCode,
+    pub(crate) headers: &'a HeaderMap,
+    pub(crate) clock: &'a dyn Clock,
+    pub(crate) fallback_delay: Duration,
+}
+
+pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryPlan {
+    let StatusRetryPlanInput {
+        attempt,
+        max_attempts,
+        method,
+        redacted_uri,
+        status,
+        headers,
+        clock,
+        fallback_delay,
+    } = input;
+    StatusRetryPlan {
+        decision: status_retry_decision(attempt, max_attempts, method, redacted_uri, status),
+        delay: status_retry_delay(clock, headers, fallback_delay),
+    }
 }
 
 pub(crate) fn http_status_error(

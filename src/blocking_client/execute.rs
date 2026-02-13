@@ -7,9 +7,10 @@ use http::{HeaderMap, Method, Uri};
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::execution::{
-    RedirectInput, RedirectTransitionInput, apply_redirect_transition, effective_status_policy,
-    http_status_error, next_redirect_action, select_base_url, status_retry_decision,
-    status_retry_delay,
+    RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
+    effective_status_policy, http_status_error, next_redirect_action,
+    response_body_read_retry_decision, select_base_url, should_return_non_success_response,
+    status_retry_delay, status_retry_plan, timeout_retry_decision, transport_retry_decision,
 };
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
@@ -373,16 +374,13 @@ impl Client {
                         method: current_method.clone(),
                         uri: current_redacted_uri.to_owned(),
                     };
-                    let retry_decision = RetryDecision {
-                        attempt: *attempt,
+                    let retry_decision = timeout_retry_decision(
+                        *attempt,
                         max_attempts,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.to_owned(),
-                        status: None,
-                        transport_error_kind: None,
-                        timeout_phase: Some(timeout_phase),
-                        response_body_read_error: false,
-                    };
+                        current_method,
+                        current_redacted_uri,
+                        timeout_phase,
+                    );
                     let retry_delay = self
                         .backoff_source
                         .backoff_for_retry(retry_policy, *attempt);
@@ -409,16 +407,12 @@ impl Client {
                 let error = Error::ReadBody {
                     source: Box::new(source),
                 };
-                let retry_decision = RetryDecision {
-                    attempt: *attempt,
+                let retry_decision = response_body_read_retry_decision(
+                    *attempt,
                     max_attempts,
-                    method: current_method.clone(),
-                    uri: current_redacted_uri.to_owned(),
-                    status: None,
-                    transport_error_kind: None,
-                    timeout_phase: None,
-                    response_body_read_error: true,
-                };
+                    current_method,
+                    current_redacted_uri,
+                );
                 let retry_delay = self
                     .backoff_source
                     .backoff_for_retry(retry_policy, *attempt);
@@ -860,26 +854,20 @@ impl Client {
                 Ok(response) => response,
                 Err(error) => {
                     let retry_decision = match &error {
-                        Error::Transport { kind, .. } => RetryDecision {
+                        Error::Transport { kind, .. } => transport_retry_decision(
                             attempt,
                             max_attempts,
-                            method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
-                            status: None,
-                            transport_error_kind: Some(*kind),
-                            timeout_phase: None,
-                            response_body_read_error: false,
-                        },
-                        Error::Timeout { phase, .. } => RetryDecision {
+                            &current_method,
+                            &current_redacted_uri,
+                            *kind,
+                        ),
+                        Error::Timeout { phase, .. } => timeout_retry_decision(
                             attempt,
                             max_attempts,
-                            method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
-                            status: None,
-                            transport_error_kind: None,
-                            timeout_phase: Some(*phase),
-                            response_body_read_error: false,
-                        },
+                            &current_method,
+                            &current_redacted_uri,
+                            *phase,
+                        ),
                         _ => {
                             self.run_error_interceptors(&context, &error);
                             return Err(error);
@@ -996,19 +984,18 @@ impl Client {
                         .backoff_for_retry(&retry_policy, attempt),
                 );
                 observed_server_throttle = true;
-                let retry_decision = status_retry_decision(
+                let retry_plan = status_retry_plan(StatusRetryPlanInput {
                     attempt,
                     max_attempts,
-                    &current_method,
-                    &current_redacted_uri,
+                    method: &current_method,
+                    redacted_uri: &current_redacted_uri,
                     status,
-                );
-                let retry_delay = status_retry_delay(
-                    self.clock.as_ref(),
-                    &response_headers,
-                    self.backoff_source
+                    headers: &response_headers,
+                    clock: self.clock.as_ref(),
+                    fallback_delay: self
+                        .backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
-                );
+                });
                 evaluated_status_retry = true;
                 if self.schedule_retry(
                     RetryScheduleContext {
@@ -1021,12 +1008,12 @@ impl Client {
                         attempt: &mut attempt,
                         max_attempts,
                     },
-                    &retry_decision,
-                    retry_delay,
+                    &retry_plan.decision,
+                    retry_plan.delay,
                 )? {
                     continue;
                 }
-                if matches!(status_policy, StatusPolicy::Response) {
+                if should_return_non_success_response(status_policy) {
                     self.maybe_record_terminal_response_success(status, &retry_policy);
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
@@ -1086,20 +1073,18 @@ impl Client {
                     );
                 }
                 if !evaluated_status_retry {
-                    let retry_decision = status_retry_decision(
+                    let retry_plan = status_retry_plan(StatusRetryPlanInput {
                         attempt,
                         max_attempts,
-                        &current_method,
-                        &current_redacted_uri,
+                        method: &current_method,
+                        redacted_uri: &current_redacted_uri,
                         status,
-                    );
-
-                    let retry_delay = status_retry_delay(
-                        self.clock.as_ref(),
-                        &response_headers,
-                        self.backoff_source
+                        headers: &response_headers,
+                        clock: self.clock.as_ref(),
+                        fallback_delay: self
+                            .backoff_source
                             .backoff_for_retry(&retry_policy, attempt),
-                    );
+                    });
                     if self.schedule_retry(
                         RetryScheduleContext {
                             context: &context,
@@ -1111,12 +1096,12 @@ impl Client {
                             attempt: &mut attempt,
                             max_attempts,
                         },
-                        &retry_decision,
-                        retry_delay,
+                        &retry_plan.decision,
+                        retry_plan.delay,
                     )? {
                         continue;
                     }
-                    if matches!(status_policy, StatusPolicy::Response)
+                    if should_return_non_success_response(status_policy)
                         && matches!(response_mode, ResponseMode::Buffered)
                     {
                         self.maybe_record_terminal_response_success(status, &retry_policy);
