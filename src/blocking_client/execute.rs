@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 
 use crate::content_encoding::should_decode_content_encoded_body;
-use crate::error::{Error, TimeoutPhase};
+use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, http_status_error, next_redirect_action,
@@ -89,6 +89,17 @@ enum ResponseMode {
 enum RetryResponse {
     Buffered(Response),
     Stream(BlockingResponseStream),
+}
+
+fn response_mode_mismatch_error(method: &Method, redacted_uri: &str, expected_mode: &str) -> Error {
+    Error::Transport {
+        kind: TransportErrorKind::Other,
+        method: method.clone(),
+        uri: redacted_uri.to_owned(),
+        source: Box::new(std::io::Error::other(format!(
+            "internal response mode mismatch: expected {expected_mode} response variant"
+        ))),
+    }
 }
 
 impl Client {
@@ -813,6 +824,8 @@ impl Client {
                 return Err(error);
             }
         };
+        let expected_method = method.clone();
+        let expected_redacted_uri = redacted_uri_text.clone();
 
         let result = match self.send_request_with_retry_mode(
             RetryRequestInput {
@@ -828,9 +841,11 @@ impl Client {
             request_started_at,
         ) {
             Ok(RetryResponse::Stream(response)) => Ok(response),
-            Ok(RetryResponse::Buffered(_)) => {
-                unreachable!("stream mode returned buffered response")
-            }
+            Ok(RetryResponse::Buffered(_)) => Err(response_mode_mismatch_error(
+                &expected_method,
+                &expected_redacted_uri,
+                "stream",
+            )),
             Err(error) => Err(error),
         };
 
@@ -852,6 +867,8 @@ impl Client {
         input: RetryRequestInput,
         request_started_at: Instant,
     ) -> Result<Response, Error> {
+        let expected_method = input.method.clone();
+        let expected_redacted_uri = input.redacted_uri_text.clone();
         match self.send_request_with_retry_mode(
             input,
             ResponseMode::Buffered,
@@ -859,7 +876,11 @@ impl Client {
             request_started_at,
         )? {
             RetryResponse::Buffered(response) => Ok(response),
-            RetryResponse::Stream(_) => unreachable!("buffered mode returned stream response"),
+            RetryResponse::Stream(_) => Err(response_mode_mismatch_error(
+                &expected_method,
+                &expected_redacted_uri,
+                "buffered",
+            )),
         }
     }
 

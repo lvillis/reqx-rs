@@ -17,9 +17,13 @@ impl RedirectPolicy {
     }
 
     pub const fn limited(max_redirects: usize) -> Self {
-        Self {
-            enabled: true,
-            max_redirects,
+        if max_redirects == 0 {
+            Self::none()
+        } else {
+            Self {
+                enabled: true,
+                max_redirects,
+            }
         }
     }
 
@@ -39,6 +43,19 @@ impl RedirectPolicy {
 impl Default for RedirectPolicy {
     fn default() -> Self {
         Self::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedirectPolicy;
+
+    #[test]
+    fn redirect_policy_limited_zero_is_equivalent_to_none() {
+        let policy = RedirectPolicy::limited(0);
+        assert!(!policy.enabled());
+        assert_eq!(policy.max_redirects(), 0);
+        assert_eq!(policy, RedirectPolicy::none());
     }
 }
 

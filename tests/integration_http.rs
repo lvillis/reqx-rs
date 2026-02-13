@@ -1477,10 +1477,10 @@ async fn response_body_timeout_reports_phase_and_metrics() {
         200,
         vec![("Content-Type".to_owned(), "application/json".to_owned())],
         br#"{"ok":true}"#.to_vec(),
-        Duration::from_millis(120),
+        Duration::from_millis(250),
     );
     let client = Client::builder(server.base_url.clone())
-        .request_timeout(Duration::from_millis(20))
+        .request_timeout(Duration::from_millis(100))
         .retry_policy(RetryPolicy::disabled())
         .metrics_enabled(true)
         .build()
