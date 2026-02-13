@@ -1,8 +1,17 @@
+## [0.1.19] - 2026-02-13
+
+### 🐛 Bug Fixes
+
+- Harden redirect semantics and remove internal panic paths
 ## [0.1.18] - 2026-02-13
 
 ### 🐛 Bug Fixes
 
 - Expose raw stream URI and add redacted URI accessor
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.18
 ## [0.1.17] - 2026-02-13
 
 ### 🚀 Features
