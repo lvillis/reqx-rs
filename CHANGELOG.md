@@ -1,3 +1,8 @@
+## [0.1.18] - 2026-02-13
+
+### 🐛 Bug Fixes
+
+- Expose raw stream URI and add redacted URI accessor
 ## [0.1.17] - 2026-02-13
 
 ### 🚀 Features
@@ -15,6 +20,10 @@
 - Unify status retry flow and enforce async stream body timeouts
 - Align timeout semantics and add blocking in-flight limiters
 - Unify timeout/retry semantics and restore strict feature guards
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.17
 ## [0.1.16] - 2026-02-12
 
 ### 🧪 Testing
