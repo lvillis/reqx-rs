@@ -85,7 +85,7 @@ use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
     parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    truncate_body, validate_base_url,
+    total_timeout_expired, truncate_body, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1830,12 +1830,20 @@ impl Client {
                 Err(error)
             }
             Err(_) => {
-                let error = Error::Timeout {
-                    phase: TimeoutPhase::ResponseBody,
-                    timeout_ms: read_timeout.as_millis(),
-                    method: method.clone(),
-                    uri: redacted_uri.to_owned(),
+                let error = if total_timeout_expired(total_timeout, request_started_at) {
+                    deadline_exceeded_error(total_timeout, method, redacted_uri)
+                } else {
+                    Error::Timeout {
+                        phase: TimeoutPhase::ResponseBody,
+                        timeout_ms: read_timeout.as_millis(),
+                        method: method.clone(),
+                        uri: redacted_uri.to_owned(),
+                    }
                 };
+                if matches!(error, Error::DeadlineExceeded { .. }) {
+                    self.run_error_interceptors(context, &error);
+                    return Err(error);
+                }
                 let retry_decision = timeout_retry_decision(
                     *attempt,
                     max_attempts,

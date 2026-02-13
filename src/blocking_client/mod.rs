@@ -21,8 +21,11 @@ use crate::util::lock_unpoisoned;
 
 mod builder;
 mod execute;
+pub(crate) mod limiters;
 mod request;
 mod transport;
+
+use crate::blocking_client::limiters::RequestLimiters;
 
 pub use request::RequestBuilder;
 
@@ -145,6 +148,8 @@ pub struct ClientBuilder {
     clock: Arc<dyn Clock>,
     backoff_source: Arc<dyn BackoffSource>,
     client_name: String,
+    max_in_flight: Option<usize>,
+    max_in_flight_per_host: Option<usize>,
     metrics_enabled: bool,
     otel_enabled: bool,
     otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
@@ -177,6 +182,7 @@ pub struct Client {
     clock: Arc<dyn Clock>,
     backoff_source: Arc<dyn BackoffSource>,
     connect_timeout: Duration,
+    request_limiters: Option<RequestLimiters>,
     metrics: ClientMetrics,
     interceptors: Vec<Arc<dyn Interceptor>>,
     observers: Vec<Arc<dyn Observer>>,

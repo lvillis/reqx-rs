@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -266,6 +266,114 @@ impl ChunkedBodyServer {
 }
 
 impl Drop for ChunkedBodyServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn update_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct CountingServer {
+    authority: String,
+    served: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CountingServer {
+    fn start(expected_requests: usize, response: MockResponse, response_delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting server");
+        let authority = listener
+            .local_addr()
+            .expect("read counting server address")
+            .to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set counting listener nonblocking");
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let response = Arc::new(response);
+        let served_clone = Arc::clone(&served);
+        let active_clone = Arc::clone(&active);
+        let max_active_clone = Arc::clone(&max_active);
+
+        let join = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut workers = Vec::new();
+
+            while Instant::now() < deadline {
+                if served_clone.load(Ordering::SeqCst) >= expected_requests {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let served = Arc::clone(&served_clone);
+                        let active = Arc::clone(&active_clone);
+                        let max_active = Arc::clone(&max_active_clone);
+                        let response = Arc::clone(&response);
+
+                        workers.push(thread::spawn(move || {
+                            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            update_max(&max_active, now_active);
+
+                            if !response_delay.is_zero() {
+                                thread::sleep(response_delay);
+                            }
+
+                            let _ = read_request(&mut stream);
+                            let _ = write_response(&mut stream, &response);
+
+                            served.fetch_add(1, Ordering::SeqCst);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+
+        Self {
+            authority,
+            served,
+            max_active,
+            join: Some(join),
+        }
+    }
+
+    fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    fn served_count(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CountingServer {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -773,6 +881,114 @@ fn blocking_retry_after_429_global_scope_backpressures_other_hosts() {
 }
 
 #[test]
+fn blocking_max_in_flight_enforces_single_active_request() {
+    let server = CountingServer::start(
+        3,
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+        Duration::from_millis(120),
+    );
+    let client = Arc::new(
+        Client::builder(format!("http://{}", server.authority()))
+            .max_in_flight(1)
+            .request_timeout(Duration::from_millis(800))
+            .retry_policy(RetryPolicy::disabled())
+            .build()
+            .expect("client should build"),
+    );
+    let barrier = Arc::new(Barrier::new(4));
+
+    let started = Instant::now();
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        let client = Arc::clone(&client);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            client
+                .get("/slow")
+                .send()
+                .map(|response| response.status().as_u16())
+        }));
+    }
+    barrier.wait();
+
+    for worker in workers {
+        let status = worker
+            .join()
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(server.served_count(), 3);
+    assert_eq!(server.max_active(), 1);
+}
+
+#[test]
+fn blocking_max_in_flight_per_host_limits_each_host_independently() {
+    let server_a = CountingServer::start(
+        2,
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-a".to_vec()),
+        Duration::from_millis(120),
+    );
+    let server_b = CountingServer::start(
+        2,
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok-b".to_vec()),
+        Duration::from_millis(120),
+    );
+    let client = Arc::new(
+        Client::builder(format!("http://{}", server_a.authority()))
+            .max_in_flight_per_host(1)
+            .request_timeout(Duration::from_millis(800))
+            .retry_policy(RetryPolicy::disabled())
+            .build()
+            .expect("client should build"),
+    );
+    let server_b_url = format!("http://{}/host-b", server_b.authority());
+    let barrier = Arc::new(Barrier::new(5));
+
+    let started = Instant::now();
+    let mut workers = Vec::new();
+    for idx in 0..4 {
+        let client = Arc::clone(&client);
+        let barrier = Arc::clone(&barrier);
+        let path = if idx % 2 == 0 {
+            "/host-a".to_owned()
+        } else {
+            server_b_url.clone()
+        };
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            client
+                .get(path)
+                .send()
+                .map(|response| response.status().as_u16())
+        }));
+    }
+    barrier.wait();
+
+    for worker in workers {
+        let status = worker
+            .join()
+            .expect("join spawned request")
+            .expect("request should succeed");
+        assert_eq!(status, 200);
+    }
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(220));
+    assert!(
+        elapsed < Duration::from_millis(460),
+        "per-host run took too long: {elapsed:?}"
+    );
+    assert_eq!(server_a.served_count(), 2);
+    assert_eq!(server_b.served_count(), 2);
+    assert_eq!(server_a.max_active(), 1);
+    assert_eq!(server_b.max_active(), 1);
+}
+
+#[test]
 fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
     let server = MockServer::start(vec![
         MockResponse::new(
@@ -1235,6 +1451,36 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
             assert!(uri.contains("/v1/slow-stream"));
         }
         other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_buffered_response_body_timeout_maps_to_deadline_exceeded_when_total_timeout_is_exhausted()
+ {
+    let server = SplitBodyServer::start(
+        200,
+        vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        br#"{"ok":true}"#.to_vec(),
+        Duration::from_millis(180),
+    );
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(120))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/slow-body-total-timeout")
+        .send()
+        .expect_err("slow body read should stop at the total timeout deadline");
+    match error {
+        Error::DeadlineExceeded { method, uri, .. } => {
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/slow-body-total-timeout"));
+        }
+        other => panic!("unexpected error variant: {other}"),
     }
 }
 

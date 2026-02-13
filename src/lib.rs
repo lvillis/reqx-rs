@@ -1,8 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(
-    not(any(feature = "_async", feature = "_blocking")),
-    allow(dead_code, unused_imports)
-)]
+#![cfg_attr(not(any(feature = "_async", feature = "_blocking")), allow(dead_code))]
 
 //! `reqx` is an internal HTTP transport crate for API SDKs with HTTP/1.1 + HTTP/2 support.
 //!
@@ -139,12 +136,14 @@ pub(crate) use crate::async_client::request;
 pub(crate) use crate::core::config;
 pub(crate) use crate::core::content_encoding;
 pub(crate) use crate::core::error;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 pub(crate) use crate::core::execution;
 pub(crate) use crate::core::extensions;
 pub(crate) use crate::core::metrics;
 pub(crate) use crate::core::observe;
 pub(crate) use crate::core::otel;
 pub(crate) use crate::core::policy;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 pub(crate) use crate::core::proxy;
 pub(crate) use crate::core::retry;
 pub(crate) use crate::core::util;

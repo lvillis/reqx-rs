@@ -541,6 +541,7 @@ mod blocking_stream {
     use http::{HeaderMap, StatusCode};
     use serde::de::DeserializeOwned;
 
+    use crate::blocking_client::limiters::{GlobalRequestPermit, HostRequestPermit};
     use crate::content_encoding::{
         DecodeContentEncodingError, decode_content_encoded_body_limited,
         should_decode_content_encoded_body,
@@ -657,6 +658,8 @@ mod blocking_stream {
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
+        _global_permit: Option<GlobalRequestPermit>,
+        _host_permit: Option<HostRequestPermit>,
     }
 
     #[derive(Debug)]
@@ -666,6 +669,8 @@ mod blocking_stream {
         pub(crate) timeout_ms: u128,
         pub(crate) total_timeout_ms: Option<u128>,
         pub(crate) deadline_at: Option<Instant>,
+        pub(crate) global_permit: Option<GlobalRequestPermit>,
+        pub(crate) host_permit: Option<HostRequestPermit>,
     }
 
     impl BlockingResponseStream {
@@ -681,6 +686,8 @@ mod blocking_stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                global_permit,
+                host_permit,
             } = context;
             Self {
                 status,
@@ -691,6 +698,8 @@ mod blocking_stream {
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
+                _global_permit: global_permit,
+                _host_permit: host_permit,
             }
         }
 
@@ -831,6 +840,8 @@ mod blocking_stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                _global_permit,
+                _host_permit,
             } = self;
             let max_bytes = max_bytes.max(1);
             let mut chunk = [0_u8; 8192];

@@ -1470,6 +1470,35 @@ async fn response_body_timeout_reports_phase_and_metrics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_body_timeout_maps_to_deadline_exceeded_when_total_timeout_is_exhausted() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        br#"{"ok":true}"#.to_vec(),
+        Duration::from_millis(180),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(120))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/slow-body-total-timeout")
+        .send()
+        .await
+        .expect_err("slow body read should stop at the total timeout deadline");
+    match error {
+        Error::DeadlineExceeded { method, uri, .. } => {
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/slow-body-total-timeout"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_stream_copy_to_writer_reports_response_body_timeout() {
     let server = SplitBodySequenceServer::start(vec![
         SplitBodyResponse::new(

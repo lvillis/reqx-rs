@@ -28,6 +28,7 @@ use super::{
     AdaptiveConcurrencyController, Client, ClientBuilder, DEFAULT_CLIENT_NAME,
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_RESPONSE_BODY_BYTES, DEFAULT_POOL_IDLE_TIMEOUT,
     DEFAULT_POOL_MAX_IDLE_CONNECTIONS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_REQUEST_TIMEOUT,
+    RequestLimiters,
 };
 
 impl ClientBuilder {
@@ -65,6 +66,8 @@ impl ClientBuilder {
             clock: Arc::new(SystemClock),
             backoff_source: Arc::new(PolicyBackoffSource),
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
+            max_in_flight: None,
+            max_in_flight_per_host: None,
             metrics_enabled: false,
             otel_enabled: false,
             otel_path_normalizer: Arc::new(StandardOtelPathNormalizer),
@@ -370,6 +373,16 @@ impl ClientBuilder {
         self
     }
 
+    pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = Some(max_in_flight.max(1));
+        self
+    }
+
+    pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
+        self.max_in_flight_per_host = Some(max_in_flight_per_host.max(1));
+        self
+    }
+
     pub fn metrics_enabled(mut self, enabled: bool) -> Self {
         self.metrics_enabled = enabled;
         self
@@ -548,6 +561,7 @@ impl ClientBuilder {
             clock: self.clock,
             backoff_source: self.backoff_source,
             connect_timeout: self.connect_timeout,
+            request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
             metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
             observers: self.observers,

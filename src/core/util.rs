@@ -371,6 +371,13 @@ pub(crate) fn phase_timeout(
     Some(per_attempt_timeout.min(remaining))
 }
 
+pub(crate) fn total_timeout_expired(
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+) -> bool {
+    total_timeout.is_some_and(|timeout| request_started_at.elapsed() >= timeout)
+}
+
 pub(crate) fn bounded_retry_delay(
     retry_delay: Duration,
     total_timeout: Option<Duration>,

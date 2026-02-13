@@ -20,9 +20,11 @@ use crate::retry::{RetryDecision, RetryPolicy};
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking, merge_headers,
-    phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, truncate_body,
+    phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, total_timeout_expired,
+    truncate_body,
 };
 
+use super::limiters::{GlobalRequestPermit, HostRequestPermit};
 use super::transport::{
     ReadBodyError, classify_ureq_transport_error, is_proxy_bypassed, read_all_body_limited,
     remove_content_encoding_headers, wrapped_ureq_error,
@@ -229,6 +231,20 @@ impl Client {
         Some(controller.acquire())
     }
 
+    fn acquire_global_request_permit(&self) -> Result<GlobalRequestPermit, Error> {
+        match &self.request_limiters {
+            Some(limiters) => limiters.acquire_global(),
+            None => Ok(GlobalRequestPermit::none()),
+        }
+    }
+
+    fn acquire_host_request_permit(&self, host: Option<&str>) -> Result<HostRequestPermit, Error> {
+        match &self.request_limiters {
+            Some(limiters) => limiters.acquire_host(host),
+            None => Ok(HostRequestPermit::none()),
+        }
+    }
+
     fn acquire_rate_limit_slot(
         &self,
         host: Option<&str>,
@@ -424,12 +440,20 @@ impl Client {
                 {
                     let _ = timeout;
                     let timeout_phase = TimeoutPhase::ResponseBody;
-                    let error = Error::Timeout {
-                        phase: timeout_phase,
-                        timeout_ms: transport_timeout.as_millis(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.to_owned(),
+                    let error = if total_timeout_expired(total_timeout, request_started_at) {
+                        deadline_exceeded_error(total_timeout, current_method, current_redacted_uri)
+                    } else {
+                        Error::Timeout {
+                            phase: timeout_phase,
+                            timeout_ms: transport_timeout.as_millis(),
+                            method: current_method.clone(),
+                            uri: current_redacted_uri.to_owned(),
+                        }
                     };
+                    if matches!(error, Error::DeadlineExceeded { .. }) {
+                        self.run_error_interceptors(context, &error);
+                        return Err(error);
+                    }
                     let retry_decision = timeout_retry_decision(
                         *attempt,
                         max_attempts,
@@ -663,6 +687,16 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
+        let _global_permit = match self.acquire_global_request_permit() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.metrics
+                    .record_request_completed_error(&error, request_started_at.elapsed());
+                self.metrics
+                    .finish_otel_request_span_error(otel_span, &error);
+                return Err(error);
+            }
+        };
 
         let result = self.send_request_with_retry(
             method,
@@ -718,15 +752,35 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
+        let global_permit = match self.acquire_global_request_permit() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.metrics
+                    .record_request_completed_error(&error, request_started_at.elapsed());
+                self.metrics
+                    .finish_otel_request_span_error(otel_span, &error);
+                return Err(error);
+            }
+        };
 
-        let result = self.send_request_stream_with_retry(
-            method,
-            uri,
-            redacted_uri_text,
-            merged_headers,
-            body,
-            execution_options,
-        );
+        let result = match self.send_request_with_retry_mode(
+            RetryRequestInput {
+                method,
+                uri,
+                redacted_uri_text,
+                merged_headers,
+                body,
+                execution_options,
+            },
+            ResponseMode::Stream,
+            Some(global_permit),
+        ) {
+            Ok(RetryResponse::Stream(response)) => Ok(response),
+            Ok(RetryResponse::Buffered(_)) => {
+                unreachable!("stream mode returned buffered response")
+            }
+            Err(error) => Err(error),
+        };
 
         self.metrics
             .record_request_completed_blocking_stream(&result, request_started_at.elapsed());
@@ -739,31 +793,6 @@ impl Client {
                 .finish_otel_request_span_error(otel_span, error),
         }
         result
-    }
-
-    fn send_request_stream_with_retry(
-        &self,
-        method: Method,
-        uri: Uri,
-        redacted_uri_text: String,
-        merged_headers: HeaderMap,
-        body: RequestBody,
-        execution_options: RequestExecutionOptions,
-    ) -> Result<BlockingResponseStream, Error> {
-        match self.send_request_with_retry_mode(
-            RetryRequestInput {
-                method,
-                uri,
-                redacted_uri_text,
-                merged_headers,
-                body,
-                execution_options,
-            },
-            ResponseMode::Stream,
-        )? {
-            RetryResponse::Stream(response) => Ok(response),
-            RetryResponse::Buffered(_) => unreachable!("stream mode returned buffered response"),
-        }
     }
 
     fn send_request_with_retry(
@@ -785,6 +814,7 @@ impl Client {
                 execution_options,
             },
             ResponseMode::Buffered,
+            None,
         )? {
             RetryResponse::Buffered(response) => Ok(response),
             RetryResponse::Stream(_) => unreachable!("buffered mode returned stream response"),
@@ -795,6 +825,7 @@ impl Client {
         &self,
         input: RetryRequestInput,
         response_mode: ResponseMode,
+        stream_global_permit: Option<GlobalRequestPermit>,
     ) -> Result<RetryResponse, Error> {
         let RetryRequestInput {
             method,
@@ -848,6 +879,7 @@ impl Client {
         let mut current_uri = uri;
         let mut current_redacted_uri = redacted_uri_text;
         let mut current_headers = merged_headers;
+        let mut stream_global_permit = stream_global_permit;
 
         while attempt <= max_attempts {
             let context = RequestContext::new(
@@ -886,6 +918,13 @@ impl Client {
                     }
                 };
             let mut adaptive_attempt = self.begin_adaptive_attempt();
+            let host_permit = match self.acquire_host_request_permit(rate_limit_host.as_deref()) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+            };
 
             let request_body = if let Some(body) = &buffered_body {
                 RequestBody::Buffered(body.clone())
@@ -1027,6 +1066,8 @@ impl Client {
                             timeout_ms: transport_timeout.as_millis(),
                             total_timeout_ms: stream_total_timeout_ms,
                             deadline_at: stream_deadline_at,
+                            global_permit: stream_global_permit.take(),
+                            host_permit: Some(host_permit),
                         },
                     )));
                 }
@@ -1075,6 +1116,8 @@ impl Client {
                             timeout_ms: transport_timeout.as_millis(),
                             total_timeout_ms: stream_total_timeout_ms,
                             deadline_at: stream_deadline_at,
+                            global_permit: stream_global_permit.take(),
+                            host_permit: Some(host_permit),
                         },
                     )));
                 }
