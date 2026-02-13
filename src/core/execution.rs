@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::{HeaderMap, Method, StatusCode, Uri};
 
@@ -7,8 +7,9 @@ use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
 use crate::util::{
-    is_redirect_status, parse_retry_after, redact_uri_for_logs, redirect_location, redirect_method,
-    resolve_redirect_uri, same_origin, sanitize_headers_for_redirect,
+    deadline_exceeded_error, is_redirect_status, parse_retry_after, redact_uri_for_logs,
+    redirect_location, redirect_method, resolve_redirect_uri, same_origin,
+    sanitize_headers_for_redirect, total_timeout_expired,
 };
 
 #[derive(Debug)]
@@ -132,6 +133,58 @@ pub(crate) fn response_body_read_retry_decision(
         timeout_phase: None,
         response_body_read_error: true,
     }
+}
+
+pub(crate) fn transport_retry_decision_from_error(
+    attempt: usize,
+    max_attempts: usize,
+    method: &Method,
+    redacted_uri: &str,
+    error: &Error,
+) -> Option<RetryDecision> {
+    match error {
+        Error::Transport { kind, .. } => Some(transport_retry_decision(
+            attempt,
+            max_attempts,
+            method,
+            redacted_uri,
+            *kind,
+        )),
+        Error::Timeout { phase, .. } => Some(timeout_retry_decision(
+            attempt,
+            max_attempts,
+            method,
+            redacted_uri,
+            *phase,
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn transport_timeout_error(
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    timeout_ms: u128,
+    method: &Method,
+    redacted_uri: &str,
+) -> Error {
+    if total_timeout_expired(total_timeout, request_started_at) {
+        deadline_exceeded_error(total_timeout, method, redacted_uri)
+    } else {
+        Error::Timeout {
+            phase: TimeoutPhase::Transport,
+            timeout_ms,
+            method: method.clone(),
+            uri: redacted_uri.to_owned(),
+        }
+    }
+}
+
+pub(crate) fn should_mark_non_success_for_resilience(
+    retry_policy: &RetryPolicy,
+    status: StatusCode,
+) -> bool {
+    !retry_policy.is_retryable_status(status)
 }
 
 pub(crate) fn status_retry_delay(

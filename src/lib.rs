@@ -49,7 +49,6 @@
 
 #[cfg(all(
     feature = "strict-feature-guards",
-    not(feature = "_internal-all-features"),
     not(any(feature = "_async", feature = "_blocking"))
 ))]
 compile_error!(
@@ -58,7 +57,6 @@ compile_error!(
 
 #[cfg(all(
     feature = "strict-feature-guards",
-    not(feature = "_internal-all-features"),
     feature = "_async",
     not(feature = "async-tls-rustls-ring"),
     not(feature = "async-tls-rustls-aws-lc-rs"),
@@ -70,7 +68,6 @@ compile_error!(
 
 #[cfg(all(
     feature = "strict-feature-guards",
-    not(feature = "_internal-all-features"),
     feature = "_async",
     any(
         all(
@@ -87,7 +84,6 @@ compile_error!(
 
 #[cfg(all(
     feature = "strict-feature-guards",
-    not(feature = "_internal-all-features"),
     feature = "_blocking",
     not(feature = "blocking-tls-rustls-ring"),
     not(feature = "blocking-tls-rustls-aws-lc-rs"),
@@ -99,7 +95,6 @@ compile_error!(
 
 #[cfg(all(
     feature = "strict-feature-guards",
-    not(feature = "_internal-all-features"),
     feature = "_blocking",
     any(
         all(

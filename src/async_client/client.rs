@@ -39,9 +39,9 @@ use crate::error::{Error, TimeoutPhase};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, http_status_error, next_redirect_action,
-    response_body_read_retry_decision, select_base_url, should_return_non_success_response,
-    status_retry_delay, status_retry_error, status_retry_plan, timeout_retry_decision,
-    transport_retry_decision,
+    response_body_read_retry_decision, select_base_url, should_mark_non_success_for_resilience,
+    should_return_non_success_response, status_retry_delay, status_retry_error, status_retry_plan,
+    timeout_retry_decision, transport_retry_decision_from_error, transport_timeout_error,
 };
 use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
@@ -2354,13 +2354,16 @@ impl Client {
                         uri: current_redacted_uri.clone(),
                         source: Box::new(source),
                     };
-                    let retry_decision = transport_retry_decision(
+                    let Some(retry_decision) = transport_retry_decision_from_error(
                         attempt,
                         max_attempts,
                         &current_method,
                         &current_redacted_uri,
-                        kind,
-                    );
+                        &error,
+                    ) else {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    };
                     if self
                         .schedule_retry(
                             RetryContext {
@@ -2386,19 +2389,23 @@ impl Client {
                     return Err(error);
                 }
                 Err(TransportRequestError::Timeout) => {
-                    let error = Error::Timeout {
-                        phase: TimeoutPhase::Transport,
-                        timeout_ms: transport_timeout.as_millis(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    let retry_decision = timeout_retry_decision(
+                    let error = transport_timeout_error(
+                        total_timeout,
+                        request_started_at,
+                        transport_timeout.as_millis(),
+                        &current_method,
+                        &current_redacted_uri,
+                    );
+                    let Some(retry_decision) = transport_retry_decision_from_error(
                         attempt,
                         max_attempts,
                         &current_method,
                         &current_redacted_uri,
-                        TimeoutPhase::Transport,
-                    );
+                        &error,
+                    ) else {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    };
                     if self
                         .schedule_retry(
                             RetryContext {
@@ -2654,7 +2661,7 @@ impl Client {
                     &response_headers,
                     truncate_body(&response_body),
                 );
-                if !retry_policy.is_retryable_status(status) {
+                if should_mark_non_success_for_resilience(&retry_policy, status) {
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }

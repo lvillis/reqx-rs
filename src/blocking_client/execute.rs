@@ -9,8 +9,9 @@ use crate::error::{Error, TimeoutPhase};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, http_status_error, next_redirect_action,
-    response_body_read_retry_decision, select_base_url, should_return_non_success_response,
-    status_retry_delay, status_retry_plan, timeout_retry_decision, transport_retry_decision,
+    response_body_read_retry_decision, select_base_url, should_mark_non_success_for_resilience,
+    should_return_non_success_response, status_retry_delay, status_retry_plan,
+    timeout_retry_decision, transport_retry_decision_from_error, transport_timeout_error,
 };
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
@@ -1006,25 +1007,32 @@ impl Client {
             ) {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry_decision = match &error {
-                        Error::Transport { kind, .. } => transport_retry_decision(
-                            attempt,
-                            max_attempts,
-                            &current_method,
-                            &current_redacted_uri,
-                            *kind,
-                        ),
-                        Error::Timeout { phase, .. } => timeout_retry_decision(
-                            attempt,
-                            max_attempts,
-                            &current_method,
-                            &current_redacted_uri,
-                            *phase,
-                        ),
-                        _ => {
-                            self.run_error_interceptors(&context, &error);
-                            return Err(error);
+                    let error = if matches!(
+                        error,
+                        Error::Timeout {
+                            phase: TimeoutPhase::Transport,
+                            ..
                         }
+                    ) {
+                        transport_timeout_error(
+                            total_timeout,
+                            request_started_at,
+                            transport_timeout.as_millis(),
+                            &current_method,
+                            &current_redacted_uri,
+                        )
+                    } else {
+                        error
+                    };
+                    let Some(retry_decision) = transport_retry_decision_from_error(
+                        attempt,
+                        max_attempts,
+                        &current_method,
+                        &current_redacted_uri,
+                        &error,
+                    ) else {
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
                     };
 
                     let retry_delay = self
@@ -1259,7 +1267,7 @@ impl Client {
                     &response_headers,
                     truncate_body(&response_body),
                 );
-                if !retry_policy.is_retryable_status(status) {
+                if should_mark_non_success_for_resilience(&retry_policy, status) {
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }
