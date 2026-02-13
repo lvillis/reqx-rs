@@ -1,8 +1,29 @@
+## [0.1.17] - 2026-02-13
+
+### 🚀 Features
+
+- Harden transport resilience and async/blocking behavior contracts
+
+### 🐛 Bug Fixes
+
+- Enforce queue-wait deadlines and unify limiter cleanup
+- Tighten timeout semantics, resilience classification, and feature-guard ergonomics
+
+### 🚜 Refactor
+
+- Unify async and blocking retry decision flow
+- Unify status retry flow and enforce async stream body timeouts
+- Align timeout semantics and add blocking in-flight limiters
+- Unify timeout/retry semantics and restore strict feature guards
 ## [0.1.16] - 2026-02-12
 
 ### 🧪 Testing
 
 - Deflake async-native retry budget resilience assertions
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.16
 ## [0.1.15] - 2026-02-12
 
 ### 🚀 Features
