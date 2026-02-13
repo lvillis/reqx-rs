@@ -445,6 +445,18 @@ struct ReadBodyRetryContext<'a> {
     attempt: &'a mut usize,
 }
 
+struct StatusRetryContext<'a> {
+    context: &'a RequestContext,
+    retry_policy: &'a RetryPolicy,
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    method: &'a Method,
+    redacted_uri: &'a str,
+    status: http::StatusCode,
+    headers: &'a HeaderMap,
+    max_attempts: usize,
+}
+
 struct RetryRequestInput {
     method: Method,
     uri: Uri,
@@ -1699,6 +1711,53 @@ impl Client {
         Ok(true)
     }
 
+    async fn schedule_status_retry(
+        &self,
+        status_context: StatusRetryContext<'_>,
+        attempt: &mut usize,
+    ) -> Result<bool, Error> {
+        let StatusRetryContext {
+            context,
+            retry_policy,
+            total_timeout,
+            request_started_at,
+            method,
+            redacted_uri,
+            status,
+            headers,
+            max_attempts,
+        } = status_context;
+        let retry_plan = status_retry_plan(StatusRetryPlanInput {
+            attempt: *attempt,
+            max_attempts,
+            method,
+            redacted_uri,
+            status,
+            headers,
+            clock: self.clock.as_ref(),
+            fallback_delay: self
+                .backoff_source
+                .backoff_for_retry(retry_policy, *attempt),
+        });
+        let retry_error = status_retry_error(status, method, redacted_uri, headers);
+        self.schedule_retry(
+            RetryContext {
+                context,
+                retry_policy,
+                total_timeout,
+                request_started_at,
+                method,
+                redacted_uri,
+                max_attempts,
+            },
+            &retry_plan.decision,
+            retry_plan.delay,
+            attempt,
+            &retry_error,
+        )
+        .await
+    }
+
     async fn read_response_body_with_retry(
         &self,
         body: Incoming,
@@ -2356,40 +2415,21 @@ impl Client {
                 );
                 observed_server_throttle = true;
 
-                let retry_plan = status_retry_plan(StatusRetryPlanInput {
-                    attempt,
-                    max_attempts,
-                    method: &current_method,
-                    redacted_uri: &current_redacted_uri,
-                    status,
-                    headers: &response_headers,
-                    clock: self.clock.as_ref(),
-                    fallback_delay: self
-                        .backoff_source
-                        .backoff_for_retry(&retry_policy, attempt),
-                });
-                let retry_error = status_retry_error(
-                    status,
-                    &current_method,
-                    &current_redacted_uri,
-                    &response_headers,
-                );
                 evaluated_status_retry = true;
                 if self
-                    .schedule_retry(
-                        RetryContext {
+                    .schedule_status_retry(
+                        StatusRetryContext {
                             context: &context,
                             retry_policy: &retry_policy,
                             total_timeout,
                             request_started_at,
                             method: &current_method,
                             redacted_uri: &current_redacted_uri,
+                            status,
+                            headers: &response_headers,
                             max_attempts,
                         },
-                        &retry_plan.decision,
-                        retry_plan.delay,
                         &mut attempt,
-                        &retry_error,
                     )
                     .await?
                 {
@@ -2469,39 +2509,20 @@ impl Client {
                     );
                 }
                 if !evaluated_status_retry {
-                    let retry_plan = status_retry_plan(StatusRetryPlanInput {
-                        attempt,
-                        max_attempts,
-                        method: &current_method,
-                        redacted_uri: &current_redacted_uri,
-                        status,
-                        headers: &response_headers,
-                        clock: self.clock.as_ref(),
-                        fallback_delay: self
-                            .backoff_source
-                            .backoff_for_retry(&retry_policy, attempt),
-                    });
-                    let retry_error = status_retry_error(
-                        status,
-                        &current_method,
-                        &current_redacted_uri,
-                        &response_headers,
-                    );
                     if self
-                        .schedule_retry(
-                            RetryContext {
+                        .schedule_status_retry(
+                            StatusRetryContext {
                                 context: &context,
                                 retry_policy: &retry_policy,
                                 total_timeout,
                                 request_started_at,
                                 method: &current_method,
                                 redacted_uri: &current_redacted_uri,
+                                status,
+                                headers: &response_headers,
                                 max_attempts,
                             },
-                            &retry_plan.decision,
-                            retry_plan.delay,
                             &mut attempt,
-                            &retry_error,
                         )
                         .await?
                     {

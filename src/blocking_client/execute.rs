@@ -56,6 +56,18 @@ struct RetryScheduleContext<'a> {
     max_attempts: usize,
 }
 
+struct StatusRetryContext<'a> {
+    context: &'a RequestContext,
+    retry_policy: &'a RetryPolicy,
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    current_method: &'a Method,
+    current_redacted_uri: &'a str,
+    status: http::StatusCode,
+    response_headers: &'a HeaderMap,
+    max_attempts: usize,
+}
+
 struct RetryRequestInput {
     method: Method,
     uri: Uri,
@@ -306,6 +318,50 @@ impl Client {
         }
         *attempt += 1;
         Ok(true)
+    }
+
+    fn schedule_status_retry(
+        &self,
+        status_context: StatusRetryContext<'_>,
+        attempt: &mut usize,
+    ) -> Result<bool, Error> {
+        let StatusRetryContext {
+            context,
+            retry_policy,
+            total_timeout,
+            request_started_at,
+            current_method,
+            current_redacted_uri,
+            status,
+            response_headers,
+            max_attempts,
+        } = status_context;
+        let retry_plan = status_retry_plan(StatusRetryPlanInput {
+            attempt: *attempt,
+            max_attempts,
+            method: current_method,
+            redacted_uri: current_redacted_uri,
+            status,
+            headers: response_headers,
+            clock: self.clock.as_ref(),
+            fallback_delay: self
+                .backoff_source
+                .backoff_for_retry(retry_policy, *attempt),
+        });
+        self.schedule_retry(
+            RetryScheduleContext {
+                context,
+                retry_policy,
+                total_timeout,
+                request_started_at,
+                current_method,
+                current_redacted_uri,
+                attempt,
+                max_attempts,
+            },
+            &retry_plan.decision,
+            retry_plan.delay,
+        )
     }
 
     fn decode_response_body_limited(
@@ -984,32 +1040,20 @@ impl Client {
                         .backoff_for_retry(&retry_policy, attempt),
                 );
                 observed_server_throttle = true;
-                let retry_plan = status_retry_plan(StatusRetryPlanInput {
-                    attempt,
-                    max_attempts,
-                    method: &current_method,
-                    redacted_uri: &current_redacted_uri,
-                    status,
-                    headers: &response_headers,
-                    clock: self.clock.as_ref(),
-                    fallback_delay: self
-                        .backoff_source
-                        .backoff_for_retry(&retry_policy, attempt),
-                });
                 evaluated_status_retry = true;
-                if self.schedule_retry(
-                    RetryScheduleContext {
+                if self.schedule_status_retry(
+                    StatusRetryContext {
                         context: &context,
                         retry_policy: &retry_policy,
                         total_timeout,
                         request_started_at,
                         current_method: &current_method,
                         current_redacted_uri: &current_redacted_uri,
-                        attempt: &mut attempt,
+                        status,
+                        response_headers: &response_headers,
                         max_attempts,
                     },
-                    &retry_plan.decision,
-                    retry_plan.delay,
+                    &mut attempt,
                 )? {
                     continue;
                 }
@@ -1073,31 +1117,19 @@ impl Client {
                     );
                 }
                 if !evaluated_status_retry {
-                    let retry_plan = status_retry_plan(StatusRetryPlanInput {
-                        attempt,
-                        max_attempts,
-                        method: &current_method,
-                        redacted_uri: &current_redacted_uri,
-                        status,
-                        headers: &response_headers,
-                        clock: self.clock.as_ref(),
-                        fallback_delay: self
-                            .backoff_source
-                            .backoff_for_retry(&retry_policy, attempt),
-                    });
-                    if self.schedule_retry(
-                        RetryScheduleContext {
+                    if self.schedule_status_retry(
+                        StatusRetryContext {
                             context: &context,
                             retry_policy: &retry_policy,
                             total_timeout,
                             request_started_at,
                             current_method: &current_method,
                             current_redacted_uri: &current_redacted_uri,
-                            attempt: &mut attempt,
+                            status,
+                            response_headers: &response_headers,
                             max_attempts,
                         },
-                        &retry_plan.decision,
-                        retry_plan.delay,
+                        &mut attempt,
                     )? {
                         continue;
                     }

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
@@ -51,6 +52,7 @@ impl Response {
 
 #[cfg(feature = "_async")]
 mod stream {
+    use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
@@ -61,7 +63,7 @@ mod stream {
     use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
-    use tokio::time::timeout;
+    use tokio::time::{Sleep, timeout};
 
     use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
     use crate::content_encoding::should_decode_content_encoded_body;
@@ -96,33 +98,124 @@ mod stream {
     #[derive(Debug)]
     pub struct StreamBody {
         inner: Incoming,
+        method: http::Method,
+        uri: String,
+        timeout_ms: u128,
+        total_timeout_ms: Option<u128>,
+        deadline_at: Option<Instant>,
+        frame_timeout: Option<Pin<Box<Sleep>>>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
 
     impl StreamBody {
-        pub(crate) fn new(
-            inner: Incoming,
-            global_permit: Option<GlobalRequestPermit>,
-            host_permit: Option<HostRequestPermit>,
-        ) -> Self {
+        pub(crate) fn new(inner: Incoming, context: ResponseStreamContext) -> Self {
+            let ResponseStreamContext {
+                method,
+                uri,
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+                permits,
+            } = context;
             Self {
                 inner,
-                _global_permit: global_permit,
-                _host_permit: host_permit,
+                method,
+                uri,
+                timeout_ms: timeout_ms.max(1),
+                total_timeout_ms,
+                deadline_at,
+                frame_timeout: None,
+                _global_permit: permits.global,
+                _host_permit: permits.host,
             }
+        }
+
+        fn response_body_timeout_error(&self) -> Error {
+            Error::Timeout {
+                phase: TimeoutPhase::ResponseBody,
+                timeout_ms: self.timeout_ms.max(1),
+                method: self.method.clone(),
+                uri: self.uri.clone(),
+            }
+        }
+
+        fn deadline_exceeded_error(&self) -> Error {
+            Error::DeadlineExceeded {
+                timeout_ms: self
+                    .total_timeout_ms
+                    .unwrap_or_else(|| self.timeout_ms.max(1)),
+                method: self.method.clone(),
+                uri: self.uri.clone(),
+            }
+        }
+
+        fn effective_frame_timeout(&self) -> crate::Result<Duration> {
+            let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
+            let Some(deadline_at) = self.deadline_at else {
+                return Ok(phase_timeout);
+            };
+            let now = Instant::now();
+            if now >= deadline_at {
+                return Err(self.deadline_exceeded_error());
+            }
+            let remaining = deadline_at.duration_since(now);
+            Ok(phase_timeout.min(remaining))
+        }
+
+        fn ensure_frame_timeout(&mut self) -> crate::Result<()> {
+            if self.frame_timeout.is_none() {
+                let timeout = self.effective_frame_timeout()?;
+                self.frame_timeout = Some(Box::pin(tokio::time::sleep(timeout)));
+            }
+            Ok(())
         }
     }
 
     impl HyperBody for StreamBody {
         type Data = Bytes;
-        type Error = hyper::Error;
+        type Error = Error;
 
         fn poll_frame(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            Pin::new(&mut self.inner).poll_frame(cx)
+            match Pin::new(&mut self.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    self.frame_timeout = None;
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                Poll::Ready(Some(Err(source))) => {
+                    self.frame_timeout = None;
+                    Poll::Ready(Some(Err(Error::ReadBody {
+                        source: Box::new(source),
+                    })))
+                }
+                Poll::Ready(None) => {
+                    self.frame_timeout = None;
+                    Poll::Ready(None)
+                }
+                Poll::Pending => {
+                    if let Err(error) = self.ensure_frame_timeout() {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    if let Some(timer) = self.frame_timeout.as_mut()
+                        && timer.as_mut().poll(cx).is_ready()
+                    {
+                        self.frame_timeout = None;
+                        let error = if self
+                            .deadline_at
+                            .is_some_and(|deadline_at| Instant::now() >= deadline_at)
+                        {
+                            self.deadline_exceeded_error()
+                        } else {
+                            self.response_body_timeout_error()
+                        };
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    Poll::Pending
+                }
+            }
         }
 
         fn is_end_stream(&self) -> bool {
@@ -219,7 +312,28 @@ mod stream {
         }
 
         pub fn into_body(self) -> StreamBody {
-            StreamBody::new(self.body, self._global_permit, self._host_permit)
+            let ResponseStream {
+                body,
+                method,
+                uri,
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+                _global_permit,
+                _host_permit,
+                ..
+            } = self;
+            StreamBody::new(
+                body,
+                ResponseStreamContext {
+                    method,
+                    uri,
+                    timeout_ms,
+                    total_timeout_ms,
+                    deadline_at,
+                    permits: StreamPermits::new(_global_permit, _host_permit),
+                },
+            )
         }
 
         pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {

@@ -1,4 +1,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(
+    not(any(feature = "_async", feature = "_blocking")),
+    allow(dead_code, unused_imports)
+)]
 
 //! `reqx` is an internal HTTP transport crate for API SDKs with HTTP/1.1 + HTTP/2 support.
 //!

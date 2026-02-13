@@ -13,6 +13,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use http_body_util::BodyExt;
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
 use reqx::{
     Interceptor, RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope,
@@ -1560,6 +1561,42 @@ async fn send_stream_copy_to_writer_respects_total_timeout_deadline() {
     match error {
         Error::DeadlineExceeded { uri, .. } => {
             assert!(uri.contains("/stream-total-timeout"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_into_body_collect_reports_response_body_timeout() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        b"delayed".to_vec(),
+        Duration::from_millis(120),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(20))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/slow-stream-collect")
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let error = stream
+        .into_body()
+        .collect()
+        .await
+        .expect_err("collecting a delayed stream body should timeout");
+    match error {
+        Error::Timeout { phase, uri, .. } => {
+            assert_eq!(phase, TimeoutPhase::ResponseBody);
+            assert!(uri.contains("/slow-stream-collect"));
         }
         other => panic!("unexpected error variant: {other}"),
     }
