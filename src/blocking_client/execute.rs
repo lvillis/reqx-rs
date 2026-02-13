@@ -1128,7 +1128,8 @@ impl Client {
                         response.into_body(),
                         BlockingResponseStreamContext {
                             method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
+                            uri_raw: current_uri.to_string(),
+                            uri_redacted: current_redacted_uri.clone(),
                             timeout_ms: transport_timeout.as_millis(),
                             total_timeout_ms: stream_total_timeout_ms,
                             deadline_at: stream_deadline_at,
@@ -1178,7 +1179,8 @@ impl Client {
                         response.into_body(),
                         BlockingResponseStreamContext {
                             method: current_method.clone(),
-                            uri: current_redacted_uri.clone(),
+                            uri_raw: current_uri.to_string(),
+                            uri_redacted: current_redacted_uri.clone(),
                             timeout_ms: transport_timeout.as_millis(),
                             total_timeout_ms: stream_total_timeout_ms,
                             deadline_at: stream_deadline_at,

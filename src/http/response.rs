@@ -112,7 +112,8 @@ mod stream {
         pub(crate) fn new(inner: Incoming, context: ResponseStreamContext) -> Self {
             let ResponseStreamContext {
                 method,
-                uri,
+                uri_raw: _,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -121,7 +122,7 @@ mod stream {
             Self {
                 inner,
                 method,
-                uri,
+                uri: uri_redacted,
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
@@ -245,7 +246,8 @@ mod stream {
     #[derive(Debug)]
     pub(crate) struct ResponseStreamContext {
         pub(crate) method: http::Method,
-        pub(crate) uri: String,
+        pub(crate) uri_raw: String,
+        pub(crate) uri_redacted: String,
         pub(crate) timeout_ms: u128,
         pub(crate) total_timeout_ms: Option<u128>,
         pub(crate) deadline_at: Option<Instant>,
@@ -258,7 +260,8 @@ mod stream {
         headers: HeaderMap,
         body: Incoming,
         method: http::Method,
-        uri: String,
+        uri_raw: String,
+        uri_redacted: String,
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
@@ -275,7 +278,8 @@ mod stream {
         ) -> Self {
             let ResponseStreamContext {
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -286,7 +290,8 @@ mod stream {
                 headers,
                 body,
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
@@ -307,15 +312,30 @@ mod stream {
             &self.method
         }
 
+        /// Returns the original request URI, including query string.
         pub fn uri(&self) -> &str {
-            &self.uri
+            &self.uri_raw
+        }
+
+        /// Returns the original request URI, including query string.
+        pub fn uri_raw(&self) -> &str {
+            &self.uri_raw
+        }
+
+        /// Returns a redacted URI suitable for logs and errors.
+        ///
+        /// The redacted form omits the query string to reduce accidental
+        /// leakage of sensitive parameters.
+        pub fn uri_redacted(&self) -> &str {
+            &self.uri_redacted
         }
 
         pub fn into_body(self) -> StreamBody {
             let ResponseStream {
                 body,
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -327,7 +347,8 @@ mod stream {
                 body,
                 ResponseStreamContext {
                     method,
-                    uri,
+                    uri_raw,
+                    uri_redacted,
                     timeout_ms,
                     total_timeout_ms,
                     deadline_at,
@@ -384,7 +405,7 @@ mod stream {
                             limit_bytes: max_bytes,
                             actual_bytes: copied as usize,
                             method: self.method.clone(),
-                            uri: self.uri.clone(),
+                            uri: self.uri_redacted.clone(),
                         });
                     }
                     writer
@@ -407,7 +428,8 @@ mod stream {
                 mut headers,
                 body,
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -420,7 +442,8 @@ mod stream {
                 headers: HeaderMap::new(),
                 body,
                 method: method.clone(),
-                uri: uri.clone(),
+                uri_raw: uri_raw.clone(),
+                uri_redacted: uri_redacted.clone(),
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -430,8 +453,9 @@ mod stream {
             let body = stream.read_raw_bytes_limited(max_bytes).await?;
             let should_decode = should_decode_content_encoded_body(&method, status, body.len());
             let body = if should_decode {
-                decode_content_encoded_body_limited(body, &headers, max_bytes)
-                    .map_err(|error| map_decode_body_error(error, &method, &uri, max_bytes))?
+                decode_content_encoded_body_limited(body, &headers, max_bytes).map_err(|error| {
+                    map_decode_body_error(error, &method, &uri_redacted, max_bytes)
+                })?
             } else {
                 body
             };
@@ -460,7 +484,7 @@ mod stream {
                 phase: TimeoutPhase::ResponseBody,
                 timeout_ms: self.timeout_ms.max(1),
                 method: self.method.clone(),
-                uri: self.uri.clone(),
+                uri: self.uri_redacted.clone(),
             }
         }
 
@@ -470,7 +494,7 @@ mod stream {
                     .total_timeout_ms
                     .unwrap_or_else(|| self.timeout_ms.max(1)),
                 method: self.method.clone(),
-                uri: self.uri.clone(),
+                uri: self.uri_redacted.clone(),
             }
         }
 
@@ -521,7 +545,7 @@ mod stream {
                             limit_bytes: max_bytes,
                             actual_bytes: total_len,
                             method: self.method.clone(),
-                            uri: self.uri.clone(),
+                            uri: self.uri_redacted.clone(),
                         });
                     }
                     collected.extend_from_slice(data);
@@ -654,7 +678,8 @@ mod blocking_stream {
         headers: HeaderMap,
         body: ureq::Body,
         method: http::Method,
-        uri: String,
+        uri_raw: String,
+        uri_redacted: String,
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
@@ -665,7 +690,8 @@ mod blocking_stream {
     #[derive(Debug)]
     pub(crate) struct BlockingResponseStreamContext {
         pub(crate) method: http::Method,
-        pub(crate) uri: String,
+        pub(crate) uri_raw: String,
+        pub(crate) uri_redacted: String,
         pub(crate) timeout_ms: u128,
         pub(crate) total_timeout_ms: Option<u128>,
         pub(crate) deadline_at: Option<Instant>,
@@ -682,7 +708,8 @@ mod blocking_stream {
         ) -> Self {
             let BlockingResponseStreamContext {
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -694,7 +721,8 @@ mod blocking_stream {
                 headers,
                 body,
                 method,
-                uri,
+                uri_raw,
+                uri_redacted,
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
@@ -715,8 +743,22 @@ mod blocking_stream {
             &self.method
         }
 
+        /// Returns the original request URI, including query string.
         pub fn uri(&self) -> &str {
-            &self.uri
+            &self.uri_raw
+        }
+
+        /// Returns the original request URI, including query string.
+        pub fn uri_raw(&self) -> &str {
+            &self.uri_raw
+        }
+
+        /// Returns a redacted URI suitable for logs and errors.
+        ///
+        /// The redacted form omits the query string to reduce accidental
+        /// leakage of sensitive parameters.
+        pub fn uri_redacted(&self) -> &str {
+            &self.uri_redacted
         }
 
         pub fn into_body(self) -> ureq::Body {
@@ -727,7 +769,7 @@ mod blocking_stream {
             ensure_within_deadline(
                 self.deadline_at,
                 &self.method,
-                &self.uri,
+                &self.uri_redacted,
                 self.timeout_ms,
                 self.total_timeout_ms,
             )?;
@@ -735,7 +777,7 @@ mod blocking_stream {
                 map_read_error_with_deadline(
                     source,
                     &self.method,
-                    &self.uri,
+                    &self.uri_redacted,
                     self.timeout_ms,
                     self.deadline_at,
                     self.total_timeout_ms,
@@ -789,7 +831,7 @@ mod blocking_stream {
                         limit_bytes: max_bytes,
                         actual_bytes: copied as usize,
                         method: self.method.clone(),
-                        uri: self.uri.clone(),
+                        uri: self.uri_redacted.clone(),
                     });
                 }
                 writer
@@ -821,7 +863,7 @@ mod blocking_stream {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
                         method: self.method.clone(),
-                        uri: self.uri.clone(),
+                        uri: self.uri_redacted.clone(),
                     });
                 }
                 collected.extend_from_slice(&chunk[..read]);
@@ -836,7 +878,8 @@ mod blocking_stream {
                 mut headers,
                 mut body,
                 method,
-                uri,
+                uri_raw: _,
+                uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
@@ -849,12 +892,18 @@ mod blocking_stream {
             let mut total_len = 0_usize;
 
             loop {
-                ensure_within_deadline(deadline_at, &method, &uri, timeout_ms, total_timeout_ms)?;
+                ensure_within_deadline(
+                    deadline_at,
+                    &method,
+                    &uri_redacted,
+                    timeout_ms,
+                    total_timeout_ms,
+                )?;
                 let read = body.as_reader().read(&mut chunk).map_err(|source| {
                     map_read_error_with_deadline(
                         source,
                         &method,
-                        &uri,
+                        &uri_redacted,
                         timeout_ms,
                         deadline_at,
                         total_timeout_ms,
@@ -869,7 +918,7 @@ mod blocking_stream {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
                         method: method.clone(),
-                        uri: uri.clone(),
+                        uri: uri_redacted.clone(),
                     });
                 }
                 collected.extend_from_slice(&chunk[..read]);
@@ -878,7 +927,7 @@ mod blocking_stream {
             let should_decode = should_decode_content_encoded_body(&method, status, body.len());
             let body = if should_decode {
                 decode_content_encoded_body_limited(body, &headers, max_bytes)
-                    .map_err(|error| map_decode_error(error, &method, &uri, max_bytes))?
+                    .map_err(|error| map_decode_error(error, &method, &uri_redacted, max_bytes))?
             } else {
                 body
             };

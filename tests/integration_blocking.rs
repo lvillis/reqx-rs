@@ -1573,6 +1573,44 @@ fn blocking_send_stream_downloads_body_and_status() {
 }
 
 #[test]
+fn blocking_send_stream_uri_exposes_raw_and_redacted_variants() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/v1/list?list-type=2&uploads=")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    assert_eq!(stream.status().as_u16(), 200);
+    assert!(stream.uri().contains("/v1/list?"));
+    assert!(stream.uri().contains("list-type=2"));
+    assert!(stream.uri().contains("uploads="));
+
+    assert!(stream.uri_raw().contains("/v1/list?"));
+    assert!(stream.uri_raw().contains("list-type=2"));
+    assert!(stream.uri_raw().contains("uploads="));
+
+    assert!(stream.uri_redacted().contains("/v1/list"));
+    assert!(!stream.uri_redacted().contains('?'));
+    assert!(!stream.uri_redacted().contains("list-type=2"));
+    assert!(!stream.uri_redacted().contains("uploads="));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/list?list-type=2&uploads=");
+}
+
+#[test]
 fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
