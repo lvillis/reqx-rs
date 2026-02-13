@@ -9,14 +9,15 @@ use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limite
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
+use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
-    join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    same_origin,
+    join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
+    resolve_redirect_uri, resolve_uri, same_origin,
 };
 use crate::{AdaptiveConcurrencyPolicy, AdvancedConfig, ClientProfile, StatusPolicy};
 
@@ -51,6 +52,18 @@ fn resolve_uri_rejects_non_http_absolute_uri() {
     match error {
         Error::InvalidUri { uri } => {
             assert_eq!(uri, "ftp://x.test/a");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn resolve_uri_rejects_absolute_uri_with_userinfo() {
+    let error = resolve_uri("https://api.example.com/v1", "https://user:pass@x.test/a")
+        .expect_err("absolute uri with userinfo should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://x.test/a");
         }
         other => panic!("unexpected error variant: {other}"),
     }
@@ -139,6 +152,43 @@ fn same_origin_handles_uppercase_scheme() {
 }
 
 #[test]
+fn resolve_redirect_uri_rejects_non_http_scheme() {
+    let current: http::Uri = "https://api.example.com/v1/old"
+        .parse()
+        .expect("current uri should parse");
+    assert!(resolve_redirect_uri(&current, "mailto:user:pass@example.com").is_none());
+    assert!(resolve_redirect_uri(&current, "javascript:alert(1)").is_none());
+}
+
+#[test]
+fn resolve_redirect_uri_rejects_userinfo_location() {
+    let current: http::Uri = "https://api.example.com/v1/old"
+        .parse()
+        .expect("current uri should parse");
+    assert!(resolve_redirect_uri(&current, "https://user:pass@example.com/v1/new").is_none());
+}
+
+#[test]
+fn standard_otel_path_normalizer_truncates_on_segment_boundary() {
+    let input = format!(
+        "/{}",
+        std::iter::repeat_n("segment", 30)
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let normalizer = StandardOtelPathNormalizer;
+    let normalized = normalizer.normalize_path(&input);
+    assert!(normalized.len() <= 128);
+    assert!(
+        normalized
+            .split('/')
+            .skip(1)
+            .all(|segment| segment == "segment"),
+        "truncated path should not keep partial segments: {normalized}"
+    );
+}
+
+#[test]
 fn redact_uri_for_logs_masks_telegram_token() {
     let redacted = redact_uri_for_logs(
         "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates?offset=10",
@@ -153,6 +203,25 @@ fn redact_uri_for_logs_masks_telegram_token() {
 fn redact_uri_for_logs_masks_userinfo() {
     let redacted = redact_uri_for_logs("http://user:pass@proxy.example.com:7890/path");
     assert_eq!(redacted, "http://proxy.example.com:7890/path");
+}
+
+#[test]
+fn redact_uri_for_logs_fallback_masks_userinfo_query_and_fragment() {
+    let redacted =
+        redact_uri_for_logs("https://user:pass@proxy.example.com:badport/path?token=secret#frag");
+    assert_eq!(redacted, "https://proxy.example.com:badport/path");
+}
+
+#[test]
+fn redact_uri_for_logs_masks_non_authority_credentials() {
+    let redacted = redact_uri_for_logs("mailto:user:pass@example.com?subject=secret");
+    assert_eq!(redacted, "mailto:<redacted>@example.com");
+}
+
+#[test]
+fn redact_uri_for_logs_keeps_unknown_non_authority_uri_shape() {
+    let redacted = redact_uri_for_logs("urn:example:foo@bar?token=secret");
+    assert_eq!(redacted, "urn:example:foo@bar");
 }
 
 #[test]

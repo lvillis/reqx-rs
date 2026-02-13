@@ -53,6 +53,7 @@ impl Response {
 mod stream {
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
@@ -60,34 +61,13 @@ mod stream {
     use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tokio::time::timeout;
 
-    use crate::body::{
-        DecodeContentEncodingError, ReadBodyError, decode_content_encoded_body_limited,
-        read_all_body_limited,
-    };
+    use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
     use crate::content_encoding::should_decode_content_encoded_body;
-    use crate::error::Error;
+    use crate::error::{Error, TimeoutPhase};
     use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
     use crate::response::Response;
-
-    fn map_read_body_error(
-        error: ReadBodyError,
-        method: &http::Method,
-        uri: &str,
-        max_bytes: usize,
-    ) -> Error {
-        match error {
-            ReadBodyError::Read(source) => Error::ReadBody {
-                source: Box::new(source),
-            },
-            ReadBodyError::TooLarge { actual_bytes } => Error::ResponseBodyTooLarge {
-                limit_bytes: max_bytes,
-                actual_bytes,
-                method: method.clone(),
-                uri: uri.to_owned(),
-            },
-        }
-    }
 
     fn map_decode_body_error(
         error: DecodeContentEncodingError,
@@ -155,12 +135,40 @@ mod stream {
     }
 
     #[derive(Debug)]
+    pub(crate) struct StreamPermits {
+        global: Option<GlobalRequestPermit>,
+        host: Option<HostRequestPermit>,
+    }
+
+    impl StreamPermits {
+        pub(crate) fn new(
+            global: Option<GlobalRequestPermit>,
+            host: Option<HostRequestPermit>,
+        ) -> Self {
+            Self { global, host }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ResponseStreamContext {
+        pub(crate) method: http::Method,
+        pub(crate) uri: String,
+        pub(crate) timeout_ms: u128,
+        pub(crate) total_timeout_ms: Option<u128>,
+        pub(crate) deadline_at: Option<Instant>,
+        pub(crate) permits: StreamPermits,
+    }
+
+    #[derive(Debug)]
     pub struct ResponseStream {
         status: StatusCode,
         headers: HeaderMap,
         body: Incoming,
         method: http::Method,
         uri: String,
+        timeout_ms: u128,
+        total_timeout_ms: Option<u128>,
+        deadline_at: Option<Instant>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -170,19 +178,27 @@ mod stream {
             status: StatusCode,
             headers: HeaderMap,
             body: Incoming,
-            method: http::Method,
-            uri: String,
-            global_permit: Option<GlobalRequestPermit>,
-            host_permit: Option<HostRequestPermit>,
+            context: ResponseStreamContext,
         ) -> Self {
+            let ResponseStreamContext {
+                method,
+                uri,
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+                permits,
+            } = context;
             Self {
                 status,
                 headers,
                 body,
                 method,
                 uri,
-                _global_permit: global_permit,
-                _host_permit: host_permit,
+                timeout_ms: timeout_ms.max(1),
+                total_timeout_ms,
+                deadline_at,
+                _global_permit: permits.global,
+                _host_permit: permits.host,
             }
         }
 
@@ -208,9 +224,8 @@ mod stream {
 
         pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
             let max_bytes = max_bytes.max(1);
-            read_all_body_limited(self.body, max_bytes)
-                .await
-                .map_err(|error| map_read_body_error(error, &self.method, &self.uri, max_bytes))
+            let mut this = self;
+            this.read_raw_bytes_limited(max_bytes).await
         }
 
         pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
@@ -219,10 +234,7 @@ mod stream {
         {
             let mut copied = 0_u64;
 
-            while let Some(frame) = self.body.frame().await {
-                let frame = frame.map_err(|source| Error::ReadBody {
-                    source: Box::new(source),
-                })?;
+            while let Some(frame) = self.next_frame_with_timeout().await? {
                 if let Some(data) = frame.data_ref() {
                     writer
                         .write_all(data)
@@ -250,10 +262,7 @@ mod stream {
             let max_bytes = max_bytes.max(1);
             let mut copied = 0_u64;
 
-            while let Some(frame) = self.body.frame().await {
-                let frame = frame.map_err(|source| Error::ReadBody {
-                    source: Box::new(source),
-                })?;
+            while let Some(frame) = self.next_frame_with_timeout().await? {
                 if let Some(data) = frame.data_ref() {
                     copied = copied.saturating_add(data.len() as u64);
                     if copied > max_bytes as u64 {
@@ -285,13 +294,26 @@ mod stream {
                 body,
                 method,
                 uri,
-                _global_permit: _,
-                _host_permit: _,
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+                _global_permit,
+                _host_permit,
             } = self;
             let max_bytes = max_bytes.max(1);
-            let body = read_all_body_limited(body, max_bytes)
-                .await
-                .map_err(|error| map_read_body_error(error, &method, &uri, max_bytes))?;
+            let mut stream = ResponseStream {
+                status,
+                headers: HeaderMap::new(),
+                body,
+                method: method.clone(),
+                uri: uri.clone(),
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+                _global_permit,
+                _host_permit,
+            };
+            let body = stream.read_raw_bytes_limited(max_bytes).await?;
             let should_decode = should_decode_content_encoded_body(&method, status, body.len());
             let body = if should_decode {
                 decode_content_encoded_body_limited(body, &headers, max_bytes)
@@ -318,12 +340,88 @@ mod stream {
             let response = self.into_response_limited(max_bytes).await?;
             response.json()
         }
+
+        fn response_body_timeout_error(&self) -> Error {
+            Error::Timeout {
+                phase: TimeoutPhase::ResponseBody,
+                timeout_ms: self.timeout_ms.max(1),
+                method: self.method.clone(),
+                uri: self.uri.clone(),
+            }
+        }
+
+        fn deadline_exceeded_error(&self) -> Error {
+            Error::DeadlineExceeded {
+                timeout_ms: self
+                    .total_timeout_ms
+                    .unwrap_or_else(|| self.timeout_ms.max(1)),
+                method: self.method.clone(),
+                uri: self.uri.clone(),
+            }
+        }
+
+        fn effective_frame_timeout(&self) -> crate::Result<Duration> {
+            let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
+            let Some(deadline_at) = self.deadline_at else {
+                return Ok(phase_timeout);
+            };
+            let now = Instant::now();
+            if now >= deadline_at {
+                return Err(self.deadline_exceeded_error());
+            }
+            let remaining = deadline_at.duration_since(now);
+            Ok(phase_timeout.min(remaining))
+        }
+
+        async fn next_frame_with_timeout(&mut self) -> crate::Result<Option<Frame<Bytes>>> {
+            let timeout_duration = self.effective_frame_timeout()?;
+            let next = timeout(timeout_duration, self.body.frame())
+                .await
+                .map_err(|_| {
+                    if self
+                        .deadline_at
+                        .is_some_and(|deadline_at| Instant::now() >= deadline_at)
+                    {
+                        self.deadline_exceeded_error()
+                    } else {
+                        self.response_body_timeout_error()
+                    }
+                })?;
+            match next {
+                Some(frame) => frame.map(Some).map_err(|source| Error::ReadBody {
+                    source: Box::new(source),
+                }),
+                None => Ok(None),
+            }
+        }
+
+        async fn read_raw_bytes_limited(&mut self, max_bytes: usize) -> crate::Result<Bytes> {
+            let max_bytes = max_bytes.max(1);
+            let mut collected = Vec::new();
+            let mut total_len = 0_usize;
+            while let Some(frame) = self.next_frame_with_timeout().await? {
+                if let Some(data) = frame.data_ref() {
+                    total_len = total_len.saturating_add(data.len());
+                    if total_len > max_bytes {
+                        return Err(Error::ResponseBodyTooLarge {
+                            limit_bytes: max_bytes,
+                            actual_bytes: total_len,
+                            method: self.method.clone(),
+                            uri: self.uri.clone(),
+                        });
+                    }
+                    collected.extend_from_slice(data);
+                }
+            }
+            Ok(Bytes::from(collected))
+        }
     }
 }
 
 #[cfg(feature = "_blocking")]
 mod blocking_stream {
     use std::io::{Read, Write};
+    use std::time::Instant;
 
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
@@ -361,6 +459,23 @@ mod blocking_stream {
         }
     }
 
+    fn map_read_error_with_deadline(
+        source: std::io::Error,
+        method: &http::Method,
+        uri: &str,
+        timeout_ms: u128,
+        deadline_at: Option<Instant>,
+        total_timeout_ms: Option<u128>,
+    ) -> Error {
+        let mapped = map_read_error(source, method, uri, timeout_ms);
+        if matches!(mapped, Error::Timeout { .. })
+            && deadline_at.is_some_and(|deadline_at| Instant::now() >= deadline_at)
+        {
+            return deadline_exceeded_error(method, uri, timeout_ms, total_timeout_ms);
+        }
+        mapped
+    }
+
     fn map_decode_error(
         error: DecodeContentEncodingError,
         method: &http::Method,
@@ -385,6 +500,39 @@ mod blocking_stream {
         }
     }
 
+    fn deadline_exceeded_error(
+        method: &http::Method,
+        uri: &str,
+        timeout_ms: u128,
+        total_timeout_ms: Option<u128>,
+    ) -> Error {
+        Error::DeadlineExceeded {
+            timeout_ms: total_timeout_ms.unwrap_or_else(|| timeout_ms.max(1)),
+            method: method.clone(),
+            uri: uri.to_owned(),
+        }
+    }
+
+    fn ensure_within_deadline(
+        deadline_at: Option<Instant>,
+        method: &http::Method,
+        uri: &str,
+        timeout_ms: u128,
+        total_timeout_ms: Option<u128>,
+    ) -> crate::Result<()> {
+        if let Some(deadline_at) = deadline_at
+            && Instant::now() >= deadline_at
+        {
+            return Err(deadline_exceeded_error(
+                method,
+                uri,
+                timeout_ms,
+                total_timeout_ms,
+            ));
+        }
+        Ok(())
+    }
+
     #[derive(Debug)]
     pub struct BlockingResponseStream {
         status: StatusCode,
@@ -393,6 +541,17 @@ mod blocking_stream {
         method: http::Method,
         uri: String,
         timeout_ms: u128,
+        total_timeout_ms: Option<u128>,
+        deadline_at: Option<Instant>,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct BlockingResponseStreamContext {
+        pub(crate) method: http::Method,
+        pub(crate) uri: String,
+        pub(crate) timeout_ms: u128,
+        pub(crate) total_timeout_ms: Option<u128>,
+        pub(crate) deadline_at: Option<Instant>,
     }
 
     impl BlockingResponseStream {
@@ -400,17 +559,24 @@ mod blocking_stream {
             status: StatusCode,
             headers: HeaderMap,
             body: ureq::Body,
-            method: http::Method,
-            uri: String,
-            timeout_ms: u128,
+            context: BlockingResponseStreamContext,
         ) -> Self {
+            let BlockingResponseStreamContext {
+                method,
+                uri,
+                timeout_ms,
+                total_timeout_ms,
+                deadline_at,
+            } = context;
             Self {
                 status,
                 headers,
                 body,
                 method,
                 uri,
-                timeout_ms,
+                timeout_ms: timeout_ms.max(1),
+                total_timeout_ms,
+                deadline_at,
             }
         }
 
@@ -435,10 +601,23 @@ mod blocking_stream {
         }
 
         pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
-            self.body
-                .as_reader()
-                .read(buffer)
-                .map_err(|source| map_read_error(source, &self.method, &self.uri, self.timeout_ms))
+            ensure_within_deadline(
+                self.deadline_at,
+                &self.method,
+                &self.uri,
+                self.timeout_ms,
+                self.total_timeout_ms,
+            )?;
+            self.body.as_reader().read(buffer).map_err(|source| {
+                map_read_error_with_deadline(
+                    source,
+                    &self.method,
+                    &self.uri,
+                    self.timeout_ms,
+                    self.deadline_at,
+                    self.total_timeout_ms,
+                )
+            })
         }
 
         pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
@@ -536,6 +715,8 @@ mod blocking_stream {
                 method,
                 uri,
                 timeout_ms,
+                total_timeout_ms,
+                deadline_at,
             } = self;
             let max_bytes = max_bytes.max(1);
             let mut chunk = [0_u8; 8192];
@@ -543,10 +724,17 @@ mod blocking_stream {
             let mut total_len = 0_usize;
 
             loop {
-                let read = body
-                    .as_reader()
-                    .read(&mut chunk)
-                    .map_err(|source| map_read_error(source, &method, &uri, timeout_ms))?;
+                ensure_within_deadline(deadline_at, &method, &uri, timeout_ms, total_timeout_ms)?;
+                let read = body.as_reader().read(&mut chunk).map_err(|source| {
+                    map_read_error_with_deadline(
+                        source,
+                        &method,
+                        &uri,
+                        timeout_ms,
+                        deadline_at,
+                        total_timeout_ms,
+                    )
+                })?;
                 if read == 0 {
                     break;
                 }
@@ -593,5 +781,9 @@ mod blocking_stream {
 
 #[cfg(feature = "_blocking")]
 pub use blocking_stream::BlockingResponseStream;
+#[cfg(feature = "_blocking")]
+pub(crate) use blocking_stream::BlockingResponseStreamContext;
 #[cfg(feature = "_async")]
 pub use stream::{ResponseStream, StreamBody};
+#[cfg(feature = "_async")]
+pub(crate) use stream::{ResponseStreamContext, StreamPermits};

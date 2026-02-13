@@ -5,14 +5,15 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Uri};
 
-use crate::extensions::{BackoffSource, BodyCodec, Clock, EndpointSelector};
+use crate::extensions::{BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer};
 use crate::metrics::ClientMetrics;
 use crate::observe::Observer;
 use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
-    AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
+    AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState, CircuitBreaker, CircuitBreakerPolicy,
+    RetryBudget, RetryBudgetPolicy,
 };
 use crate::retry::{RetryEligibility, RetryPolicy};
 use crate::tls::{TlsBackend, TlsOptions};
@@ -34,13 +35,6 @@ const DEFAULT_CLIENT_NAME: &str = "reqx";
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
-struct AdaptiveConcurrencyState {
-    in_flight: usize,
-    current_limit: usize,
-    ewma_latency_ms: f64,
-}
-
-#[derive(Debug)]
 struct AdaptiveConcurrencyController {
     policy: AdaptiveConcurrencyPolicy,
     state: Mutex<AdaptiveConcurrencyState>,
@@ -49,32 +43,21 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
-        let min_limit = policy.configured_min_limit().max(1);
-        let max_limit = policy.configured_max_limit().max(min_limit);
-        let initial_limit = policy
-            .configured_initial_limit()
-            .max(1)
-            .clamp(min_limit, max_limit);
         Self {
             policy,
-            state: Mutex::new(AdaptiveConcurrencyState {
-                in_flight: 0,
-                current_limit: initial_limit,
-                ewma_latency_ms: 0.0,
-            }),
+            state: Mutex::new(AdaptiveConcurrencyState::new(policy)),
             condvar: Condvar::new(),
         }
     }
 
     fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
         let mut state = lock_unpoisoned(&self.state);
-        while state.in_flight >= state.current_limit {
+        while !state.try_acquire() {
             state = match self.condvar.wait(state) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        state.in_flight = state.in_flight.saturating_add(1);
         drop(state);
         AdaptiveConcurrencyPermit {
             controller: Arc::clone(self),
@@ -85,32 +68,7 @@ impl AdaptiveConcurrencyController {
 
     fn release_and_record(&self, success: bool, latency: Duration) {
         let mut state = lock_unpoisoned(&self.state);
-        state.in_flight = state.in_flight.saturating_sub(1);
-
-        let latency_ms = latency.as_secs_f64() * 1000.0;
-        if state.ewma_latency_ms <= f64::EPSILON {
-            state.ewma_latency_ms = latency_ms;
-        } else {
-            state.ewma_latency_ms = state.ewma_latency_ms * 0.8 + latency_ms * 0.2;
-        }
-
-        let threshold_ms = self
-            .policy
-            .configured_high_latency_threshold()
-            .as_secs_f64()
-            * 1000.0;
-        let should_decrease = !success || state.ewma_latency_ms > threshold_ms;
-        if should_decrease {
-            let decreased = (state.current_limit as f64 * self.policy.configured_decrease_ratio())
-                .floor() as usize;
-            state.current_limit = decreased.max(self.policy.configured_min_limit());
-        } else {
-            state.current_limit = state
-                .current_limit
-                .saturating_add(self.policy.configured_increase_step())
-                .min(self.policy.configured_max_limit());
-        }
-
+        state.release_and_record(self.policy, success, latency);
         self.condvar.notify_all();
     }
 }
@@ -189,6 +147,7 @@ pub struct ClientBuilder {
     client_name: String,
     metrics_enabled: bool,
     otel_enabled: bool,
+    otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
     interceptors: Vec<Arc<dyn Interceptor>>,
     observers: Vec<Arc<dyn Observer>>,
 }

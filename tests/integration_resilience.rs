@@ -248,6 +248,111 @@ impl Drop for CountingServer {
     }
 }
 
+struct DelayedBodyServer {
+    authority: String,
+    served: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl DelayedBodyServer {
+    fn start(expected_requests: usize, response: ResponseSpec) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed body server");
+        let authority = listener
+            .local_addr()
+            .expect("read local address")
+            .to_string();
+        listener
+            .set_nonblocking(true)
+            .expect("set delayed body listener nonblocking");
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let response = Arc::new(response);
+        let served_clone = Arc::clone(&served);
+
+        let join = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut workers = Vec::new();
+
+            while Instant::now() < deadline {
+                if served_clone.load(Ordering::SeqCst) >= expected_requests {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let served = Arc::clone(&served_clone);
+                        let response = Arc::clone(&response);
+
+                        workers.push(thread::spawn(move || {
+                            let _ = read_http_message(&mut stream);
+                            let mut head = format!(
+                                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                response.status,
+                                status_text(response.status),
+                                response.body.len()
+                            )
+                            .into_bytes();
+                            for (name, value) in &response.headers {
+                                head.extend_from_slice(name.as_bytes());
+                                head.extend_from_slice(b": ");
+                                head.extend_from_slice(value.as_bytes());
+                                head.extend_from_slice(b"\r\n");
+                            }
+                            head.extend_from_slice(b"\r\n");
+
+                            let _ = stream.write_all(&head);
+                            let _ = stream.flush();
+                            if !response.delay.is_zero() {
+                                thread::sleep(response.delay);
+                            }
+                            let _ = stream.write_all(&response.body);
+                            let _ = stream.flush();
+                            served.fetch_add(1, Ordering::SeqCst);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+
+        Self {
+            authority,
+            served,
+            join: Some(join),
+        }
+    }
+
+    fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    fn wait_for_served_count(&self, expected: usize, timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observed = self.served.load(Ordering::SeqCst);
+            if observed >= expected || Instant::now() >= deadline {
+                return observed;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for DelayedBodyServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 struct ConnectProxyServer {
     uri: String,
     tunnel_targets: Arc<Mutex<Vec<String>>>,
@@ -690,6 +795,76 @@ async fn max_in_flight_stream_holds_permit_until_stream_is_dropped() {
     assert!(
         started.elapsed() >= Duration::from_millis(120),
         "second request should wait until stream drop before acquiring permit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_stream_into_response_holds_permit_until_buffering_finishes() {
+    let server = DelayedBodyServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::from_millis(220),
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(600))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let first_stream = client
+        .get("/stream-buffer-hold")
+        .send_stream()
+        .await
+        .expect("first stream request should succeed");
+    let first = tokio::spawn(async move {
+        first_stream
+            .into_response_limited(1024)
+            .await
+            .map(|response| response.status().as_u16())
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let started = Instant::now();
+    let cloned = client.clone();
+    let second = tokio::spawn(async move {
+        cloned
+            .get("/stream-after-buffer")
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    });
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !second.is_finished(),
+        "second request should remain queued while first stream is buffering into response"
+    );
+
+    let first_status = first
+        .await
+        .expect("join first buffered stream")
+        .expect("first buffered stream should succeed");
+    assert_eq!(first_status, 200);
+
+    let second_status = second
+        .await
+        .expect("join second request")
+        .expect("second request should succeed");
+    assert_eq!(second_status, 200);
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(180),
+        "second request should wait for first buffered stream to finish"
+    );
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
     );
 }
 

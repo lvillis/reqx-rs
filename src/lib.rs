@@ -151,8 +151,9 @@ pub use crate::client::{Client, ClientBuilder};
 pub use crate::config::{AdvancedConfig, ClientProfile};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 pub use crate::extensions::{
-    BackoffSource, BodyCodec, Clock, EndpointSelector, PolicyBackoffSource,
-    PrimaryEndpointSelector, RoundRobinEndpointSelector, StandardBodyCodec, SystemClock,
+    BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
+    PrimaryEndpointSelector, RoundRobinEndpointSelector, StandardBodyCodec,
+    StandardOtelPathNormalizer, SystemClock,
 };
 pub use crate::metrics::MetricsSnapshot;
 pub use crate::observe::Observer;
@@ -204,12 +205,13 @@ pub mod prelude {
             AdaptiveConcurrencyPolicy, AdvancedConfig, BackoffSource,
             BlockingResumableUploadBackend, BlockingResumableUploader, BodyCodec,
             CircuitBreakerPolicy, ClientProfile, Clock, EndpointSelector, Interceptor,
-            MetricsSnapshot, Observer, PartChecksumAlgorithm, PermissiveRetryEligibility,
-            PolicyBackoffSource, PrimaryEndpointSelector, RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
-            RateLimitPolicy, RequestContext, ResumableUploadCheckpoint, ResumableUploadError,
-            ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
-            RetryDecision, RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope,
-            StandardBodyCodec, StrictRetryEligibility, SystemClock, TimeoutPhase,
+            MetricsSnapshot, Observer, OtelPathNormalizer, PartChecksumAlgorithm,
+            PermissiveRetryEligibility, PolicyBackoffSource, PrimaryEndpointSelector,
+            RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RequestContext,
+            ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
+            ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision,
+            RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope, StandardBodyCodec,
+            StandardOtelPathNormalizer, StrictRetryEligibility, SystemClock, TimeoutPhase,
             TransportErrorKind, UploadedPart,
         };
         #[cfg(feature = "_async")]

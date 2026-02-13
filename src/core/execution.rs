@@ -1,12 +1,47 @@
 use std::time::Duration;
 
-use http::{HeaderMap, Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::error::Error;
 use crate::extensions::{Clock, EndpointSelector};
-use crate::policy::StatusPolicy;
-use crate::retry::RetryDecision;
-use crate::util::parse_retry_after;
+use crate::policy::{RedirectPolicy, StatusPolicy};
+use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
+use crate::util::{
+    is_redirect_status, parse_retry_after, redact_uri_for_logs, redirect_location, redirect_method,
+    resolve_redirect_uri, same_origin, sanitize_headers_for_redirect,
+};
+
+#[derive(Debug)]
+pub(crate) struct RedirectAction {
+    pub(crate) next_method: Method,
+    pub(crate) next_uri: Uri,
+    pub(crate) next_redacted_uri: String,
+    pub(crate) method_changed_to_get: bool,
+    pub(crate) same_origin_redirect: bool,
+}
+
+pub(crate) struct RedirectInput<'a> {
+    pub(crate) redirect_policy: RedirectPolicy,
+    pub(crate) redirect_count: usize,
+    pub(crate) status: StatusCode,
+    pub(crate) current_method: &'a Method,
+    pub(crate) current_uri: &'a Uri,
+    pub(crate) current_redacted_uri: &'a str,
+    pub(crate) response_headers: &'a HeaderMap,
+    pub(crate) body_replayable: bool,
+}
+
+pub(crate) struct RedirectTransitionInput<'a> {
+    pub(crate) retry_eligibility: &'a dyn RetryEligibility,
+    pub(crate) retry_policy: &'a RetryPolicy,
+    pub(crate) max_attempts: &'a mut usize,
+    pub(crate) body_replayable: bool,
+    pub(crate) current_headers: &'a mut HeaderMap,
+    pub(crate) current_method: &'a mut Method,
+    pub(crate) current_uri: &'a mut Uri,
+    pub(crate) current_redacted_uri: &'a mut String,
+    pub(crate) redirect_count: &'a mut usize,
+}
 
 pub(crate) fn effective_status_policy(
     request_policy: Option<StatusPolicy>,
@@ -65,4 +100,103 @@ pub(crate) fn http_status_error(
         headers: Box::new(headers.clone()),
         body,
     }
+}
+
+pub(crate) fn next_redirect_action(
+    redirect_input: RedirectInput<'_>,
+) -> Result<Option<RedirectAction>, Error> {
+    let RedirectInput {
+        redirect_policy,
+        redirect_count,
+        status,
+        current_method,
+        current_uri,
+        current_redacted_uri,
+        response_headers,
+        body_replayable,
+    } = redirect_input;
+
+    if !redirect_policy.enabled() || !is_redirect_status(status) {
+        return Ok(None);
+    }
+
+    if redirect_count >= redirect_policy.max_redirects() {
+        return Err(Error::RedirectLimitExceeded {
+            max_redirects: redirect_policy.max_redirects(),
+            method: current_method.clone(),
+            uri: current_redacted_uri.to_owned(),
+        });
+    }
+
+    let next_method = redirect_method(current_method, status);
+    let method_changed_to_get = next_method == Method::GET && *current_method != Method::GET;
+    if !body_replayable
+        && !method_changed_to_get
+        && !matches!(
+            *current_method,
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+        )
+    {
+        return Err(Error::RedirectBodyNotReplayable {
+            method: current_method.clone(),
+            uri: current_redacted_uri.to_owned(),
+        });
+    }
+
+    let Some(location) = redirect_location(response_headers) else {
+        return Err(Error::MissingRedirectLocation {
+            status: status.as_u16(),
+            method: current_method.clone(),
+            uri: current_redacted_uri.to_owned(),
+        });
+    };
+    let Some(next_uri) = resolve_redirect_uri(current_uri, &location) else {
+        return Err(Error::InvalidRedirectLocation {
+            location: redact_uri_for_logs(&location),
+            method: current_method.clone(),
+            uri: current_redacted_uri.to_owned(),
+        });
+    };
+
+    Ok(Some(RedirectAction {
+        next_method,
+        same_origin_redirect: same_origin(current_uri, &next_uri),
+        next_redacted_uri: redact_uri_for_logs(&next_uri.to_string()),
+        next_uri,
+        method_changed_to_get,
+    }))
+}
+
+pub(crate) fn apply_redirect_transition(
+    input: RedirectTransitionInput<'_>,
+    redirect_action: RedirectAction,
+) -> bool {
+    let RedirectTransitionInput {
+        retry_eligibility,
+        retry_policy,
+        max_attempts,
+        body_replayable,
+        current_headers,
+        current_method,
+        current_uri,
+        current_redacted_uri,
+        redirect_count,
+    } = input;
+    sanitize_headers_for_redirect(
+        current_headers,
+        redirect_action.method_changed_to_get,
+        redirect_action.same_origin_redirect,
+    );
+    let method_changed_to_get = redirect_action.method_changed_to_get;
+    *current_method = redirect_action.next_method;
+    *current_uri = redirect_action.next_uri;
+    *current_redacted_uri = redirect_action.next_redacted_uri;
+    *redirect_count = redirect_count.saturating_add(1);
+    if *max_attempts == 1
+        && (body_replayable || method_changed_to_get)
+        && retry_eligibility.supports_retry(current_method, current_headers)
+    {
+        *max_attempts = retry_policy.configured_max_attempts();
+    }
+    method_changed_to_get
 }

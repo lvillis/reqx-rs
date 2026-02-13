@@ -37,12 +37,13 @@ use crate::config::{AdvancedConfig, ClientProfile};
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::execution::{
-    effective_status_policy, http_status_error, select_base_url, status_retry_decision,
+    RedirectInput, RedirectTransitionInput, apply_redirect_transition, effective_status_policy,
+    http_status_error, next_redirect_action, select_base_url, status_retry_decision,
     status_retry_delay,
 };
 use crate::extensions::{
-    BackoffSource, BodyCodec, Clock, EndpointSelector, PolicyBackoffSource,
-    PrimaryEndpointSelector, StandardBodyCodec, SystemClock,
+    BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
+    PrimaryEndpointSelector, StandardBodyCodec, StandardOtelPathNormalizer, SystemClock,
 };
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit, RequestLimiters};
 use crate::metrics::{ClientMetrics, MetricsSnapshot};
@@ -63,9 +64,10 @@ use crate::rate_limit::{
 };
 use crate::request::RequestBuilder;
 use crate::resilience::{
-    AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
+    AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState, CircuitBreaker, CircuitBreakerPolicy,
+    RetryBudget, RetryBudgetPolicy,
 };
-use crate::response::{Response, ResponseStream};
+use crate::response::{Response, ResponseStream, ResponseStreamContext, StreamPermits};
 use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
     StrictRetryEligibility,
@@ -79,10 +81,9 @@ use crate::tls::tls_config_error;
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
-    ensure_accept_encoding_async, is_redirect_status, lock_unpoisoned, merge_headers,
-    parse_header_name, parse_header_value, phase_timeout, rate_limit_bucket_key,
-    redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, resolve_uri,
-    same_origin, sanitize_headers_for_redirect, truncate_body, validate_base_url,
+    ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
+    parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
+    truncate_body, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -739,13 +740,6 @@ fn build_transport_client(
 }
 
 #[derive(Debug)]
-struct AdaptiveConcurrencyState {
-    in_flight: usize,
-    current_limit: usize,
-    ewma_latency_ms: f64,
-}
-
-#[derive(Debug)]
 struct AdaptiveConcurrencyController {
     policy: AdaptiveConcurrencyPolicy,
     state: Mutex<AdaptiveConcurrencyState>,
@@ -754,19 +748,9 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
-        let min_limit = policy.configured_min_limit().max(1);
-        let max_limit = policy.configured_max_limit().max(min_limit);
-        let initial_limit = policy
-            .configured_initial_limit()
-            .max(1)
-            .clamp(min_limit, max_limit);
         Self {
             policy,
-            state: Mutex::new(AdaptiveConcurrencyState {
-                in_flight: 0,
-                current_limit: initial_limit,
-                ewma_latency_ms: 0.0,
-            }),
+            state: Mutex::new(AdaptiveConcurrencyState::new(policy)),
             notify: Notify::new(),
         }
     }
@@ -775,8 +759,7 @@ impl AdaptiveConcurrencyController {
         loop {
             {
                 let mut state = lock_unpoisoned(&self.state);
-                if state.in_flight < state.current_limit {
-                    state.in_flight = state.in_flight.saturating_add(1);
+                if state.try_acquire() {
                     return AdaptiveConcurrencyPermit {
                         controller: Arc::clone(self),
                         started_at: Instant::now(),
@@ -790,32 +773,7 @@ impl AdaptiveConcurrencyController {
 
     fn release_and_record(&self, success: bool, latency: Duration) {
         let mut state = lock_unpoisoned(&self.state);
-        state.in_flight = state.in_flight.saturating_sub(1);
-
-        let latency_ms = latency.as_secs_f64() * 1000.0;
-        if state.ewma_latency_ms <= f64::EPSILON {
-            state.ewma_latency_ms = latency_ms;
-        } else {
-            state.ewma_latency_ms = state.ewma_latency_ms * 0.8 + latency_ms * 0.2;
-        }
-
-        let threshold_ms = self
-            .policy
-            .configured_high_latency_threshold()
-            .as_secs_f64()
-            * 1000.0;
-        let should_decrease = !success || state.ewma_latency_ms > threshold_ms;
-        if should_decrease {
-            let decreased = (state.current_limit as f64 * self.policy.configured_decrease_ratio())
-                .floor() as usize;
-            state.current_limit = decreased.max(self.policy.configured_min_limit());
-        } else {
-            state.current_limit = state
-                .current_limit
-                .saturating_add(self.policy.configured_increase_step())
-                .min(self.policy.configured_max_limit());
-        }
-
+        state.release_and_record(self.policy, success, latency);
         self.notify.notify_waiters();
     }
 }
@@ -891,6 +849,7 @@ pub struct ClientBuilder {
     max_in_flight_per_host: Option<usize>,
     metrics_enabled: bool,
     otel_enabled: bool,
+    otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
     interceptors: Vec<Arc<dyn Interceptor>>,
     observers: Vec<Arc<dyn Observer>>,
 }
@@ -934,6 +893,7 @@ impl ClientBuilder {
             max_in_flight_per_host: None,
             metrics_enabled: false,
             otel_enabled: false,
+            otel_path_normalizer: Arc::new(StandardOtelPathNormalizer),
             interceptors: Vec::new(),
             observers: Vec::new(),
         }
@@ -1256,6 +1216,21 @@ impl ClientBuilder {
         self
     }
 
+    pub fn otel_path_normalizer_arc(
+        mut self,
+        otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
+    ) -> Self {
+        self.otel_path_normalizer = otel_path_normalizer;
+        self
+    }
+
+    pub fn otel_path_normalizer<N>(self, otel_path_normalizer: N) -> Self
+    where
+        N: OtelPathNormalizer + 'static,
+    {
+        self.otel_path_normalizer_arc(Arc::new(otel_path_normalizer))
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -1337,7 +1312,10 @@ impl ClientBuilder {
             self.http2_only,
         )?;
         let otel = if self.otel_enabled {
-            OtelTelemetry::enabled(self.client_name.clone())
+            OtelTelemetry::enabled_with_path_normalizer(
+                self.client_name.clone(),
+                self.otel_path_normalizer,
+            )
         } else {
             OtelTelemetry::disabled()
         };
@@ -2116,6 +2094,9 @@ impl Client {
             1
         };
         let request_started_at = Instant::now();
+        let stream_total_timeout_ms = total_timeout.map(|timeout| timeout.as_millis());
+        let stream_deadline_at =
+            total_timeout.and_then(|timeout| request_started_at.checked_add(timeout));
         let mut attempt = 1_usize;
         let mut redirect_count = 0_usize;
         let mut current_method = method;
@@ -2301,51 +2282,23 @@ impl Client {
 
             let status = response.status();
             let mut response_headers = response.headers().clone();
-            if redirect_policy.enabled() && is_redirect_status(status) {
-                if redirect_count >= redirect_policy.max_redirects() {
-                    let error = Error::RedirectLimitExceeded {
-                        max_redirects: redirect_policy.max_redirects(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
+            let redirect_action = match next_redirect_action(RedirectInput {
+                redirect_policy,
+                redirect_count,
+                status,
+                current_method: &current_method,
+                current_uri: &current_uri,
+                current_redacted_uri: &current_redacted_uri,
+                response_headers: &response_headers,
+                body_replayable,
+            }) {
+                Ok(action) => action,
+                Err(error) => {
                     self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
-                let next_method = redirect_method(&current_method, status);
-                let method_changed_to_get =
-                    next_method == Method::GET && current_method != Method::GET;
-                if !body_replayable
-                    && !method_changed_to_get
-                    && !matches!(
-                        current_method,
-                        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
-                    )
-                {
-                    let error = Error::RedirectBodyNotReplayable {
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                }
-                let Some(location) = redirect_location(&response_headers) else {
-                    let error = Error::MissingRedirectLocation {
-                        status: status.as_u16(),
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                };
-                let Some(next_uri) = resolve_redirect_uri(&current_uri, &location) else {
-                    let error = Error::InvalidRedirectLocation {
-                        location,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                    };
-                    self.run_error_interceptors(&context, &error);
-                    return Err(error);
-                };
+            };
+            if let Some(redirect_action) = redirect_action {
                 self.run_response_interceptors(&context, status, &response_headers);
                 if let Some(attempt_guard) = circuit_attempt.take() {
                     attempt_guard.mark_success();
@@ -2353,27 +2306,23 @@ impl Client {
                 if let Some(adaptive_guard) = adaptive_attempt.take() {
                     adaptive_guard.mark_success();
                 }
-                let same_origin_redirect = same_origin(&current_uri, &next_uri);
-                sanitize_headers_for_redirect(
-                    &mut current_headers,
-                    method_changed_to_get,
-                    same_origin_redirect,
+                let method_changed_to_get = apply_redirect_transition(
+                    RedirectTransitionInput {
+                        retry_eligibility: self.retry_eligibility.as_ref(),
+                        retry_policy: &retry_policy,
+                        max_attempts: &mut max_attempts,
+                        body_replayable,
+                        current_headers: &mut current_headers,
+                        current_method: &mut current_method,
+                        current_uri: &mut current_uri,
+                        current_redacted_uri: &mut current_redacted_uri,
+                        redirect_count: &mut redirect_count,
+                    },
+                    redirect_action,
                 );
                 if method_changed_to_get {
                     buffered_body = None;
                     streaming_body = None;
-                }
-                current_method = next_method;
-                current_uri = next_uri;
-                current_redacted_uri = redact_uri_for_logs(&current_uri.to_string());
-                redirect_count += 1;
-                if max_attempts == 1
-                    && (body_replayable || method_changed_to_get)
-                    && self
-                        .retry_eligibility
-                        .supports_retry(&current_method, &current_headers)
-                {
-                    max_attempts = retry_policy.configured_max_attempts();
                 }
                 continue;
             }
@@ -2398,10 +2347,17 @@ impl Client {
                         status,
                         response_headers,
                         response.into_body(),
-                        current_method.clone(),
-                        current_redacted_uri.clone(),
-                        stream_global_permit.take(),
-                        Some(host_permit),
+                        ResponseStreamContext {
+                            method: current_method.clone(),
+                            uri: current_redacted_uri.clone(),
+                            timeout_ms: transport_timeout.as_millis(),
+                            total_timeout_ms: stream_total_timeout_ms,
+                            deadline_at: stream_deadline_at,
+                            permits: StreamPermits::new(
+                                stream_global_permit.take(),
+                                Some(host_permit),
+                            ),
+                        },
                     )));
                 }
 
@@ -2468,10 +2424,17 @@ impl Client {
                         status,
                         response_headers,
                         response.into_body(),
-                        current_method.clone(),
-                        current_redacted_uri.clone(),
-                        stream_global_permit.take(),
-                        Some(host_permit),
+                        ResponseStreamContext {
+                            method: current_method.clone(),
+                            uri: current_redacted_uri.clone(),
+                            timeout_ms: transport_timeout.as_millis(),
+                            total_timeout_ms: stream_total_timeout_ms,
+                            deadline_at: stream_deadline_at,
+                            permits: StreamPermits::new(
+                                stream_global_permit.take(),
+                                Some(host_permit),
+                            ),
+                        },
                     )));
                 }
             }

@@ -53,9 +53,90 @@ fn invalid_base_url_error(base_url: &str) -> Error {
     }
 }
 
+fn uri_has_userinfo(uri: &Uri) -> bool {
+    uri.authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+}
+
+fn strip_query_and_fragment(uri_text: &str) -> &str {
+    let query_index = uri_text.find('?');
+    let fragment_index = uri_text.find('#');
+    let cutoff = match (query_index, fragment_index) {
+        (Some(query), Some(fragment)) => query.min(fragment),
+        (Some(query), None) => query,
+        (None, Some(fragment)) => fragment,
+        (None, None) => uri_text.len(),
+    };
+    &uri_text[..cutoff]
+}
+
+fn redact_userinfo_in_authority(uri_text: &str) -> String {
+    fn redact_with_prefix(prefix: &str, rest: &str) -> Option<String> {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let (authority, suffix) = rest.split_at(authority_end);
+        let at_index = authority.rfind('@')?;
+        let host_port = &authority[at_index + 1..];
+        if host_port.is_empty() {
+            return None;
+        }
+        Some(format!("{prefix}{host_port}{suffix}"))
+    }
+
+    if let Some(scheme_separator) = uri_text.find("://") {
+        let prefix_end = scheme_separator + 3;
+        let (prefix, rest) = uri_text.split_at(prefix_end);
+        if let Some(redacted) = redact_with_prefix(prefix, rest) {
+            return redacted;
+        }
+        return uri_text.to_owned();
+    }
+
+    if let Some(rest) = uri_text.strip_prefix("//")
+        && let Some(redacted) = redact_with_prefix("//", rest)
+    {
+        return redacted;
+    }
+
+    uri_text.to_owned()
+}
+
+fn redact_non_authority_credentials(uri_text: &str) -> String {
+    let Some((scheme, remainder)) = uri_text.split_once(':') else {
+        return uri_text.to_owned();
+    };
+    let redactable_scheme = matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "mailto" | "sip" | "sips"
+    );
+    if !redactable_scheme {
+        return uri_text.to_owned();
+    }
+    if remainder.starts_with("//") {
+        return uri_text.to_owned();
+    }
+
+    let Some(at_index) = remainder.rfind('@') else {
+        return uri_text.to_owned();
+    };
+    let credential_like_prefix = &remainder[..at_index];
+    if credential_like_prefix.is_empty() {
+        return uri_text.to_owned();
+    }
+    if !credential_like_prefix.contains(':')
+        && !credential_like_prefix.to_ascii_lowercase().contains("%3a")
+    {
+        return uri_text.to_owned();
+    }
+
+    let suffix = &remainder[at_index + 1..];
+    format!("{scheme}:<redacted>@{suffix}")
+}
+
 pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(uri_text) else {
-        return uri_text.split('?').next().unwrap_or(uri_text).to_owned();
+        let stripped = strip_query_and_fragment(uri_text);
+        let authority_redacted = redact_userinfo_in_authority(stripped);
+        return redact_non_authority_credentials(&authority_redacted);
     };
 
     let _ = parsed.set_username("");
@@ -89,7 +170,9 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
         parsed.set_path(&rebuilt_path);
     }
 
-    parsed.to_string()
+    let serialized = parsed.to_string();
+    let authority_redacted = redact_userinfo_in_authority(&serialized);
+    redact_non_authority_credentials(&authority_redacted)
 }
 
 pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), Error> {
@@ -100,6 +183,11 @@ pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), E
                     uri: redact_uri_for_logs(path),
                 });
             };
+            if uri_has_userinfo(&uri) {
+                return Err(Error::InvalidUri {
+                    uri: redact_uri_for_logs(path),
+                });
+            }
             if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
                 path.to_owned()
             } else {
@@ -113,6 +201,11 @@ pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), E
     let uri = uri_text.parse().map_err(|_| Error::InvalidUri {
         uri: redact_uri_for_logs(&uri_text),
     })?;
+    if uri_has_userinfo(&uri) {
+        return Err(Error::InvalidUri {
+            uri: redact_uri_for_logs(&uri_text),
+        });
+    }
     Ok((uri_text, uri))
 }
 
@@ -392,7 +485,17 @@ pub(crate) fn same_origin(left: &Uri, right: &Uri) -> bool {
 pub(crate) fn resolve_redirect_uri(current_uri: &Uri, location: &str) -> Option<Uri> {
     let base = url::Url::parse(&current_uri.to_string()).ok()?;
     let joined = base.join(location).ok()?;
-    joined.as_str().parse().ok()
+    if !matches!(joined.scheme(), "http" | "https") {
+        return None;
+    }
+    if !joined.username().is_empty() || joined.password().is_some() {
+        return None;
+    }
+    let resolved: Uri = joined.as_str().parse().ok()?;
+    if uri_has_userinfo(&resolved) {
+        return None;
+    }
+    Some(resolved)
 }
 
 pub(crate) fn sanitize_headers_for_redirect(

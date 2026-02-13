@@ -28,8 +28,8 @@ impl RetryBudgetPolicy {
         }
     }
 
-    pub const fn window(mut self, window: Duration) -> Self {
-        self.window = window;
+    pub fn window(mut self, window: Duration) -> Self {
+        self.window = window.max(Duration::from_millis(1));
         self
     }
 
@@ -332,6 +332,13 @@ pub struct AdaptiveConcurrencyPolicy {
     high_latency_threshold: Duration,
 }
 
+#[derive(Debug)]
+pub(crate) struct AdaptiveConcurrencyState {
+    in_flight: usize,
+    current_limit: usize,
+    ewma_latency_ms: f64,
+}
+
 impl AdaptiveConcurrencyPolicy {
     pub const fn standard() -> Self {
         Self {
@@ -441,6 +448,59 @@ impl Default for AdaptiveConcurrencyPolicy {
     }
 }
 
+impl AdaptiveConcurrencyState {
+    pub(crate) fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+        let min_limit = policy.configured_min_limit().max(1);
+        let max_limit = policy.configured_max_limit().max(min_limit);
+        let initial_limit = policy
+            .configured_initial_limit()
+            .max(1)
+            .clamp(min_limit, max_limit);
+        Self {
+            in_flight: 0,
+            current_limit: initial_limit,
+            ewma_latency_ms: 0.0,
+        }
+    }
+
+    pub(crate) fn try_acquire(&mut self) -> bool {
+        if self.in_flight >= self.current_limit {
+            return false;
+        }
+        self.in_flight = self.in_flight.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn release_and_record(
+        &mut self,
+        policy: AdaptiveConcurrencyPolicy,
+        success: bool,
+        latency: Duration,
+    ) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+
+        let latency_ms = latency.as_secs_f64() * 1000.0;
+        if self.ewma_latency_ms <= f64::EPSILON {
+            self.ewma_latency_ms = latency_ms;
+        } else {
+            self.ewma_latency_ms = self.ewma_latency_ms * 0.8 + latency_ms * 0.2;
+        }
+
+        let threshold_ms = policy.configured_high_latency_threshold().as_secs_f64() * 1000.0;
+        let should_decrease = !success || self.ewma_latency_ms > threshold_ms;
+        if should_decrease {
+            let decreased =
+                (self.current_limit as f64 * policy.configured_decrease_ratio()).floor() as usize;
+            self.current_limit = decreased.max(policy.configured_min_limit());
+        } else {
+            self.current_limit = self
+                .current_limit
+                .saturating_add(policy.configured_increase_step())
+                .min(policy.configured_max_limit());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -480,6 +540,22 @@ mod tests {
 
         assert!(budget.try_consume_retry());
         assert!(!budget.try_consume_retry());
+    }
+
+    #[test]
+    fn retry_budget_zero_window_is_clamped() {
+        let budget = RetryBudget::new(
+            RetryBudgetPolicy::standard()
+                .window(Duration::ZERO)
+                .retry_ratio(0.0)
+                .min_retries_per_window(1),
+        );
+
+        assert!(budget.try_consume_retry());
+        assert!(
+            !budget.try_consume_retry(),
+            "zero window must not reset budget on every check"
+        );
     }
 
     #[test]

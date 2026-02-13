@@ -4,6 +4,7 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
+use crate::StandardOtelPathNormalizer;
 use crate::error::Error;
 use crate::metrics::ClientMetrics;
 use crate::otel::OtelTelemetry;
@@ -19,7 +20,7 @@ use crate::retry::{
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url};
 use crate::{AdvancedConfig, ClientProfile};
-use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer};
+use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer, OtelPathNormalizer};
 use crate::{PolicyBackoffSource, PrimaryEndpointSelector, StandardBodyCodec, SystemClock};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
@@ -66,6 +67,7 @@ impl ClientBuilder {
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             metrics_enabled: false,
             otel_enabled: false,
+            otel_path_normalizer: Arc::new(StandardOtelPathNormalizer),
             interceptors: Vec::new(),
             observers: Vec::new(),
         }
@@ -378,6 +380,21 @@ impl ClientBuilder {
         self
     }
 
+    pub fn otel_path_normalizer_arc(
+        mut self,
+        otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
+    ) -> Self {
+        self.otel_path_normalizer = otel_path_normalizer;
+        self
+    }
+
+    pub fn otel_path_normalizer<N>(self, otel_path_normalizer: N) -> Self
+    where
+        N: OtelPathNormalizer + 'static,
+    {
+        self.otel_path_normalizer_arc(Arc::new(otel_path_normalizer))
+    }
+
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
@@ -485,7 +502,10 @@ impl ClientBuilder {
             None
         };
         let otel = if self.otel_enabled {
-            OtelTelemetry::enabled(self.client_name.clone())
+            OtelTelemetry::enabled_with_path_normalizer(
+                self.client_name.clone(),
+                self.otel_path_normalizer,
+            )
         } else {
             OtelTelemetry::disabled()
         };

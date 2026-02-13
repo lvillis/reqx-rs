@@ -197,6 +197,82 @@ impl Drop for SplitBodyServer {
     }
 }
 
+struct ChunkedBodyServer {
+    base_url: String,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ChunkedBodyServer {
+    fn start(
+        status: u16,
+        headers: Vec<(String, String)>,
+        chunks: Vec<Vec<u8>>,
+        chunk_delay: Duration,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind chunked body server");
+        let address = listener
+            .local_addr()
+            .expect("read chunked body server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set chunked body listener nonblocking");
+
+        let join = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = read_request(&mut stream);
+
+                        let total_len: usize = chunks.iter().map(Vec::len).sum();
+                        let mut head = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            status,
+                            status_text(status),
+                            total_len
+                        );
+                        for (name, value) in &headers {
+                            head.push_str(name);
+                            head.push_str(": ");
+                            head.push_str(value);
+                            head.push_str("\r\n");
+                        }
+                        head.push_str("\r\n");
+
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.flush();
+                        for chunk in &chunks {
+                            if !chunk_delay.is_zero() {
+                                thread::sleep(chunk_delay);
+                            }
+                            let _ = stream.write_all(chunk);
+                            let _ = stream.flush();
+                        }
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url: format!("http://{address}"),
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for ChunkedBodyServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -1163,6 +1239,41 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
 }
 
 #[test]
+fn blocking_send_stream_respects_total_timeout_deadline() {
+    let server = ChunkedBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        vec![b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()],
+        Duration::from_millis(90),
+    );
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(220))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let streamed = client
+        .get("/v1/stream-total-timeout")
+        .send_stream()
+        .expect("stream request should return headers");
+    let error = streamed
+        .into_bytes_limited(1024)
+        .expect_err("stream read should stop at total timeout deadline");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/v1/stream-total-timeout"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_send_http_status_error_strips_decoded_encoding_headers() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
@@ -1565,6 +1676,132 @@ fn blocking_redirect_307_rejects_non_replayable_reader_body() {
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn blocking_redirect_invalid_location_redacts_sensitive_tokens_in_error() {
+    let server = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![(
+            "Location",
+            "https://example.com:invalid/v1/new?token=secret#frag",
+        )],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .send()
+        .expect_err("invalid redirect location should fail");
+    let display = error.to_string();
+    assert!(!display.contains("token=secret"));
+    assert!(!display.contains("#frag"));
+
+    match error {
+        Error::InvalidRedirectLocation { location, .. } => {
+            assert_eq!(location, "https://example.com:invalid/v1/new");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn blocking_redirect_http_location_with_userinfo_is_rejected() {
+    let server = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![(
+            "Location",
+            "https://user:pass@example.com/v1/new?token=secret",
+        )],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/userinfo-redirect")
+        .send()
+        .expect_err("redirect with userinfo should fail");
+
+    match error {
+        Error::InvalidRedirectLocation { location, .. } => {
+            assert_eq!(location, "https://example.com/v1/new");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn blocking_redirect_non_http_location_is_rejected() {
+    let server = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![("Location", "mailto:user:pass@example.com?subject=secret")],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/non-http-redirect")
+        .send()
+        .expect_err("non-http redirect location should fail");
+    let display = error.to_string();
+    assert!(!display.contains("user:pass"));
+    assert!(!display.contains("subject=secret"));
+
+    match error {
+        Error::InvalidRedirectLocation { location, .. } => {
+            assert_eq!(location, "mailto:<redacted>@example.com");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn blocking_absolute_request_uri_with_userinfo_is_rejected() {
+    let client = Client::builder("https://api.example.com")
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("https://user:pass@example.com/v1/items?token=secret")
+        .send()
+        .expect_err("absolute request URI with userinfo should be rejected");
+
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://example.com/v1/items");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
