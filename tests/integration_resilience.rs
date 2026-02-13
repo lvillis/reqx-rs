@@ -911,6 +911,70 @@ async fn max_in_flight_queue_wait_respects_total_timeout_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn total_timeout_includes_global_queue_wait_before_send_loop() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-global-permit-for-total-timeout")
+        .send_stream()
+        .await
+        .expect("first stream should acquire and hold the global permit");
+
+    let queued = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .get("/queued-total-timeout")
+                .total_timeout(Duration::from_millis(220))
+                .send()
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    drop(held_stream);
+
+    let error = queued
+        .await
+        .expect("join queued request")
+        .expect_err("request should honor total_timeout including global queue wait");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/queued-total-timeout"));
+        }
+        Error::Timeout {
+            timeout_ms, uri, ..
+        } => {
+            assert!(uri.contains("/queued-total-timeout"));
+            assert!(
+                timeout_ms < 220,
+                "remaining timeout should be bounded by elapsed queue wait"
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(400)),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adaptive_concurrency_queue_wait_respects_total_timeout_deadline() {
     let server = CountingServer::start(
         1,
@@ -1425,6 +1489,56 @@ async fn circuit_breaker_short_circuits_after_opening() {
     assert_eq!(
         server.wait_for_served_count(1, Duration::from_millis(200)),
         1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_error_mode_does_not_open_on_non_success_buffered() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            404,
+            vec![("Content-Type", "application/json")],
+            br#"{"error":"not-found"}"#.to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/error-mode-buffered")
+        .send()
+        .await
+        .expect_err("first non-success request should return an http status error");
+    match first {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 404),
+        other => panic!("unexpected first error variant: {other}"),
+    }
+
+    let second = client
+        .get("/error-mode-buffered")
+        .send()
+        .await
+        .expect_err("second non-success request should not be short-circuited");
+    match second {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 404),
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
     );
 }
 

@@ -29,6 +29,9 @@ default = ["async-tls-rustls-ring", "strict-feature-guards"]
 # Enable compile-time transport/TLS feature contract errors.
 # Downstream SDKs can disable this (via `default-features = false`) and surface custom diagnostics.
 strict-feature-guards = []
+# Internal escape hatch so local/CI `--all-features` checks can compile.
+# Do not enable this in downstream SDK builds.
+_internal-all-features = []
 
 # Internal transport mode switches (downstream crates should enable concrete TLS combos below).
 _async = [

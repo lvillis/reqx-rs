@@ -740,12 +740,15 @@ impl Client {
         };
 
         let result = self.send_request_with_retry(
-            method,
-            uri,
-            redacted_uri_text,
-            merged_headers,
-            body,
-            execution_options,
+            RetryRequestInput {
+                method,
+                uri,
+                redacted_uri_text,
+                merged_headers,
+                body,
+                execution_options,
+            },
+            request_started_at,
         );
 
         self.metrics
@@ -821,6 +824,7 @@ impl Client {
             },
             ResponseMode::Stream,
             Some(global_permit),
+            request_started_at,
         ) {
             Ok(RetryResponse::Stream(response)) => Ok(response),
             Ok(RetryResponse::Buffered(_)) => {
@@ -844,24 +848,14 @@ impl Client {
 
     fn send_request_with_retry(
         &self,
-        method: Method,
-        uri: Uri,
-        redacted_uri_text: String,
-        merged_headers: HeaderMap,
-        body: RequestBody,
-        execution_options: RequestExecutionOptions,
+        input: RetryRequestInput,
+        request_started_at: Instant,
     ) -> Result<Response, Error> {
         match self.send_request_with_retry_mode(
-            RetryRequestInput {
-                method,
-                uri,
-                redacted_uri_text,
-                merged_headers,
-                body,
-                execution_options,
-            },
+            input,
             ResponseMode::Buffered,
             None,
+            request_started_at,
         )? {
             RetryResponse::Buffered(response) => Ok(response),
             RetryResponse::Stream(_) => unreachable!("buffered mode returned stream response"),
@@ -873,6 +867,7 @@ impl Client {
         input: RetryRequestInput,
         response_mode: ResponseMode,
         stream_global_permit: Option<GlobalRequestPermit>,
+        request_started_at: Instant,
     ) -> Result<RetryResponse, Error> {
         let RetryRequestInput {
             method,
@@ -916,7 +911,6 @@ impl Client {
             1
         };
 
-        let request_started_at = Instant::now();
         let stream_total_timeout_ms = total_timeout.map(|timeout| timeout.as_millis());
         let stream_deadline_at =
             total_timeout.and_then(|timeout| request_started_at.checked_add(timeout));
@@ -1265,6 +1259,15 @@ impl Client {
                     &response_headers,
                     truncate_body(&response_body),
                 );
+                if !retry_policy.is_retryable_status(status) {
+                    if let Some(attempt_guard) = circuit_attempt.take() {
+                        attempt_guard.mark_success();
+                    }
+                    if let Some(adaptive_guard) = adaptive_attempt.take() {
+                        adaptive_guard.mark_success();
+                    }
+                    self.maybe_record_terminal_response_success(status, &retry_policy);
+                }
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
