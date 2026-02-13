@@ -53,20 +53,41 @@ impl AdaptiveConcurrencyController {
         }
     }
 
-    fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
+    fn acquire(
+        self: &Arc<Self>,
+        deadline_at: Option<Instant>,
+    ) -> Option<AdaptiveConcurrencyPermit> {
         let mut state = lock_unpoisoned(&self.state);
         while !state.try_acquire() {
-            state = match self.condvar.wait(state) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+            state = match deadline_at {
+                Some(deadline_at) => {
+                    let now = Instant::now();
+                    if now >= deadline_at {
+                        return None;
+                    }
+                    let wait_for = deadline_at.duration_since(now);
+                    let (next_state, wait_result) = match self.condvar.wait_timeout(state, wait_for)
+                    {
+                        Ok(result) => result,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if wait_result.timed_out() && Instant::now() >= deadline_at {
+                        return None;
+                    }
+                    next_state
+                }
+                None => match self.condvar.wait(state) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                },
             };
         }
         drop(state);
-        AdaptiveConcurrencyPermit {
+        Some(AdaptiveConcurrencyPermit {
             controller: Arc::clone(self),
             started_at: Instant::now(),
             completed: false,
-        }
+        })
     }
 
     fn release_and_record(&self, success: bool, latency: Duration) {

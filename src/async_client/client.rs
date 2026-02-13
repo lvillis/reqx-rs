@@ -20,7 +20,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 ))]
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::Notify;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at};
 use tracing::{debug, info_span, warn};
 
 #[cfg(any(
@@ -85,7 +85,7 @@ use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
     parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    total_timeout_expired, truncate_body, validate_base_url,
+    total_timeout_deadline, total_timeout_expired, truncate_body, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1571,9 +1571,32 @@ impl Client {
         }
     }
 
-    async fn begin_adaptive_attempt(&self) -> Option<AdaptiveConcurrencyPermit> {
-        let controller = self.adaptive_concurrency.as_ref()?;
-        Some(controller.acquire().await)
+    async fn begin_adaptive_attempt(
+        &self,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<Option<AdaptiveConcurrencyPermit>, Error> {
+        let Some(controller) = self.adaptive_concurrency.as_ref() else {
+            return Ok(None);
+        };
+        let Some(deadline_at) = total_timeout_deadline(total_timeout, request_started_at) else {
+            return Ok(Some(controller.acquire().await));
+        };
+        if Instant::now() >= deadline_at {
+            return Err(deadline_exceeded_error(total_timeout, method, uri));
+        }
+
+        match timeout_at(
+            tokio::time::Instant::from_std(deadline_at),
+            controller.acquire(),
+        )
+        .await
+        {
+            Ok(permit) => Ok(Some(permit)),
+            Err(_) => Err(deadline_exceeded_error(total_timeout, method, uri)),
+        }
     }
 
     async fn acquire_rate_limit_slot(
@@ -1909,20 +1932,60 @@ impl Client {
         Ok(Some(response_body))
     }
 
-    async fn acquire_global_request_permit(&self) -> Result<GlobalRequestPermit, Error> {
-        match &self.request_limiters {
-            Some(limiters) => limiters.acquire_global().await,
-            None => Ok(GlobalRequestPermit { _permit: None }),
+    async fn acquire_global_request_permit(
+        &self,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<GlobalRequestPermit, Error> {
+        let Some(limiters) = &self.request_limiters else {
+            return Ok(GlobalRequestPermit { _permit: None });
+        };
+        let Some(deadline_at) = total_timeout_deadline(total_timeout, request_started_at) else {
+            return limiters.acquire_global().await;
+        };
+        if Instant::now() >= deadline_at {
+            return Err(deadline_exceeded_error(total_timeout, method, uri));
+        }
+
+        match timeout_at(
+            tokio::time::Instant::from_std(deadline_at),
+            limiters.acquire_global(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(deadline_exceeded_error(total_timeout, method, uri)),
         }
     }
 
     async fn acquire_host_request_permit(
         &self,
         host: Option<&str>,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
     ) -> Result<HostRequestPermit, Error> {
-        match &self.request_limiters {
-            Some(limiters) => limiters.acquire_host(host).await,
-            None => Ok(HostRequestPermit { _permit: None }),
+        let Some(limiters) = &self.request_limiters else {
+            return Ok(HostRequestPermit { _permit: None });
+        };
+        let Some(deadline_at) = total_timeout_deadline(total_timeout, request_started_at) else {
+            return limiters.acquire_host(host).await;
+        };
+        if Instant::now() >= deadline_at {
+            return Err(deadline_exceeded_error(total_timeout, method, uri));
+        }
+
+        match timeout_at(
+            tokio::time::Instant::from_std(deadline_at),
+            limiters.acquire_host(host),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(deadline_exceeded_error(total_timeout, method, uri)),
         }
     }
 
@@ -1968,7 +2031,16 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let _global_permit = match self.acquire_global_request_permit().await {
+        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
+        let _global_permit = match self
+            .acquire_global_request_permit(
+                effective_total_timeout,
+                request_started_at,
+                &method,
+                &redacted_uri_text,
+            )
+            .await
+        {
             Ok(permit) => permit,
             Err(error) => {
                 self.metrics
@@ -2032,7 +2104,16 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let global_permit = match self.acquire_global_request_permit().await {
+        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
+        let global_permit = match self
+            .acquire_global_request_permit(
+                effective_total_timeout,
+                request_started_at,
+                &method,
+                &redacted_uri_text,
+            )
+            .await
+        {
             Ok(permit) => permit,
             Err(error) => {
                 self.metrics
@@ -2225,18 +2306,41 @@ impl Client {
                         return Err(error);
                     }
                 };
-            let mut adaptive_attempt = self.begin_adaptive_attempt().await;
-            let mut attempt_headers = current_headers.clone();
-            self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
-            self.run_request_interceptors(&context, &mut attempt_headers);
             let host_key = rate_limit_bucket_key(&current_uri);
-            let host_permit = match self.acquire_host_request_permit(host_key.as_deref()).await {
+            let host_permit = match self
+                .acquire_host_request_permit(
+                    host_key.as_deref(),
+                    total_timeout,
+                    request_started_at,
+                    &current_method,
+                    &current_redacted_uri,
+                )
+                .await
+            {
                 Ok(permit) => permit,
                 Err(error) => {
                     self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
             };
+            let mut adaptive_attempt = match self
+                .begin_adaptive_attempt(
+                    total_timeout,
+                    request_started_at,
+                    &current_method,
+                    &current_redacted_uri,
+                )
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+            };
+            let mut attempt_headers = current_headers.clone();
+            self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
+            self.run_request_interceptors(&context, &mut attempt_headers);
             let request_body = if let Some(body) = &buffered_body {
                 buffered_req_body(body.clone())
             } else {

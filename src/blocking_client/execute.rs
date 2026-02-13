@@ -20,11 +20,11 @@ use crate::retry::{RetryDecision, RetryPolicy};
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking, merge_headers,
-    phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, total_timeout_expired,
-    truncate_body,
+    phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, total_timeout_deadline,
+    total_timeout_expired, truncate_body,
 };
 
-use super::limiters::{GlobalRequestPermit, HostRequestPermit};
+use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
 use super::transport::{
     ReadBodyError, classify_ureq_transport_error, is_proxy_bypassed, read_all_body_limited,
     remove_content_encoding_headers, wrapped_ureq_error,
@@ -226,23 +226,58 @@ impl Client {
         }
     }
 
-    fn begin_adaptive_attempt(&self) -> Option<AdaptiveConcurrencyPermit> {
-        let controller = self.adaptive_concurrency.as_ref()?;
-        Some(controller.acquire())
-    }
-
-    fn acquire_global_request_permit(&self) -> Result<GlobalRequestPermit, Error> {
-        match &self.request_limiters {
-            Some(limiters) => limiters.acquire_global(),
-            None => Ok(GlobalRequestPermit::none()),
+    fn begin_adaptive_attempt(
+        &self,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<Option<AdaptiveConcurrencyPermit>, Error> {
+        let Some(controller) = self.adaptive_concurrency.as_ref() else {
+            return Ok(None);
+        };
+        let deadline_at = total_timeout_deadline(total_timeout, request_started_at);
+        match controller.acquire(deadline_at) {
+            Some(permit) => Ok(Some(permit)),
+            None => Err(deadline_exceeded_error(total_timeout, method, uri)),
         }
     }
 
-    fn acquire_host_request_permit(&self, host: Option<&str>) -> Result<HostRequestPermit, Error> {
-        match &self.request_limiters {
-            Some(limiters) => limiters.acquire_host(host),
-            None => Ok(HostRequestPermit::none()),
-        }
+    fn acquire_global_request_permit(
+        &self,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<GlobalRequestPermit, Error> {
+        let Some(limiters) = &self.request_limiters else {
+            return Ok(GlobalRequestPermit::none());
+        };
+        let deadline_at = total_timeout_deadline(total_timeout, request_started_at);
+        limiters
+            .acquire_global(deadline_at)
+            .map_err(|AcquirePermitError::Timeout| {
+                deadline_exceeded_error(total_timeout, method, uri)
+            })
+    }
+
+    fn acquire_host_request_permit(
+        &self,
+        host: Option<&str>,
+        total_timeout: Option<Duration>,
+        request_started_at: Instant,
+        method: &Method,
+        uri: &str,
+    ) -> Result<HostRequestPermit, Error> {
+        let Some(limiters) = &self.request_limiters else {
+            return Ok(HostRequestPermit::none());
+        };
+        let deadline_at = total_timeout_deadline(total_timeout, request_started_at);
+        limiters
+            .acquire_host(host, deadline_at)
+            .map_err(|AcquirePermitError::Timeout| {
+                deadline_exceeded_error(total_timeout, method, uri)
+            })
     }
 
     fn acquire_rate_limit_slot(
@@ -687,7 +722,13 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let _global_permit = match self.acquire_global_request_permit() {
+        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
+        let _global_permit = match self.acquire_global_request_permit(
+            effective_total_timeout,
+            request_started_at,
+            &method,
+            &redacted_uri_text,
+        ) {
             Ok(permit) => permit,
             Err(error) => {
                 self.metrics
@@ -752,7 +793,13 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let global_permit = match self.acquire_global_request_permit() {
+        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
+        let global_permit = match self.acquire_global_request_permit(
+            effective_total_timeout,
+            request_started_at,
+            &method,
+            &redacted_uri_text,
+        ) {
             Ok(permit) => permit,
             Err(error) => {
                 self.metrics
@@ -917,9 +964,26 @@ impl Client {
                         return Err(error);
                     }
                 };
-            let mut adaptive_attempt = self.begin_adaptive_attempt();
-            let host_permit = match self.acquire_host_request_permit(rate_limit_host.as_deref()) {
+            let host_permit = match self.acquire_host_request_permit(
+                rate_limit_host.as_deref(),
+                total_timeout,
+                request_started_at,
+                &current_method,
+                &current_redacted_uri,
+            ) {
                 Ok(permit) => permit,
+                Err(error) => {
+                    self.run_error_interceptors(&context, &error);
+                    return Err(error);
+                }
+            };
+            let mut adaptive_attempt = match self.begin_adaptive_attempt(
+                total_timeout,
+                request_started_at,
+                &current_method,
+                &current_redacted_uri,
+            ) {
+                Ok(attempt) => attempt,
                 Err(error) => {
                     self.run_error_interceptors(&context, &error);
                     return Err(error);

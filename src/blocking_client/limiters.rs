@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
-use crate::error::Error;
+use crate::core::limiters::{
+    PER_HOST_LIMITER_ENTRY_TTL, PER_HOST_LIMITER_MAX_ENTRIES,
+    PerHostLimiterEntry as PerHostLimiterEntryState, cleanup_stale_per_host_limiters,
+};
 use crate::util::lock_unpoisoned;
-
-const PER_HOST_LIMITER_ENTRY_TTL: Duration = Duration::from_secs(300);
-const PER_HOST_LIMITER_MAX_ENTRIES: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct RequestLimiters {
@@ -32,6 +34,11 @@ pub(crate) struct HostRequestPermit {
     _permit: Option<BlockingSemaphorePermit>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcquirePermitError {
+    Timeout,
+}
+
 #[derive(Debug)]
 struct BlockingSemaphore {
     state: Mutex<usize>,
@@ -46,19 +53,44 @@ impl BlockingSemaphore {
         }
     }
 
-    fn acquire(self: &Arc<Self>) -> BlockingSemaphorePermit {
+    fn acquire(
+        self: &Arc<Self>,
+        deadline_at: Option<Instant>,
+    ) -> Result<BlockingSemaphorePermit, AcquirePermitError> {
         let mut state = lock_unpoisoned(&self.state);
-        while *state == 0 {
-            state = match self.condvar.wait(state) {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+        loop {
+            if *state > 0 {
+                *state -= 1;
+                drop(state);
+                return Ok(BlockingSemaphorePermit {
+                    semaphore: Arc::clone(self),
+                    released: false,
+                });
+            }
+
+            state = match deadline_at {
+                Some(deadline_at) => {
+                    let now = Instant::now();
+                    if now >= deadline_at {
+                        return Err(AcquirePermitError::Timeout);
+                    }
+                    let wait_for = deadline_at.duration_since(now);
+                    let (next_state, wait_result) = match self.condvar.wait_timeout(state, wait_for)
+                    {
+                        Ok(result) => result,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if wait_result.timed_out() && *next_state == 0 && Instant::now() >= deadline_at
+                    {
+                        return Err(AcquirePermitError::Timeout);
+                    }
+                    next_state
+                }
+                None => match self.condvar.wait(state) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                },
             };
-        }
-        *state -= 1;
-        drop(state);
-        BlockingSemaphorePermit {
-            semaphore: Arc::clone(self),
-            released: false,
         }
     }
 
@@ -101,19 +133,34 @@ impl RequestLimiters {
         })
     }
 
-    pub(crate) fn acquire_global(&self) -> Result<GlobalRequestPermit, Error> {
-        let permit = self.global.as_ref().map(|semaphore| semaphore.acquire());
+    pub(crate) fn acquire_global(
+        &self,
+        deadline_at: Option<Instant>,
+    ) -> Result<GlobalRequestPermit, AcquirePermitError> {
+        let permit = match &self.global {
+            Some(semaphore) => Some(semaphore.acquire(deadline_at)?),
+            None => None,
+        };
         Ok(GlobalRequestPermit { _permit: permit })
     }
 
-    pub(crate) fn acquire_host(&self, host: Option<&str>) -> Result<HostRequestPermit, Error> {
+    pub(crate) fn acquire_host(
+        &self,
+        host: Option<&str>,
+        deadline_at: Option<Instant>,
+    ) -> Result<HostRequestPermit, AcquirePermitError> {
         let host = host.map(|item| item.to_ascii_lowercase());
         let permit = match (self.per_host_limit, host) {
             (Some(limit), Some(host)) => {
                 let semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
                     let now = Instant::now();
-                    cleanup_stale_per_host_limiters(&mut guard, now);
+                    cleanup_stale_per_host_limiters(
+                        &mut guard,
+                        now,
+                        PER_HOST_LIMITER_ENTRY_TTL,
+                        PER_HOST_LIMITER_MAX_ENTRIES,
+                    );
                     let entry = guard.entry(host).or_insert_with(|| PerHostLimiterEntry {
                         semaphore: Arc::new(BlockingSemaphore::new(limit)),
                         limit,
@@ -122,11 +169,21 @@ impl RequestLimiters {
                     entry.last_used_at = now;
                     Arc::clone(&entry.semaphore)
                 };
-                Some(semaphore.acquire())
+                Some(semaphore.acquire(deadline_at)?)
             }
             _ => None,
         };
         Ok(HostRequestPermit { _permit: permit })
+    }
+}
+
+impl PerHostLimiterEntryState for PerHostLimiterEntry {
+    fn is_idle(&self) -> bool {
+        self.semaphore.available_permits() == self.limit
+    }
+
+    fn last_used_at(&self) -> Instant {
+        self.last_used_at
     }
 }
 
@@ -142,28 +199,6 @@ impl HostRequestPermit {
     }
 }
 
-fn cleanup_stale_per_host_limiters(
-    entries: &mut BTreeMap<String, PerHostLimiterEntry>,
-    now: Instant,
-) {
-    entries.retain(|_, entry| {
-        entry.semaphore.available_permits() < entry.limit
-            || now.duration_since(entry.last_used_at) <= PER_HOST_LIMITER_ENTRY_TTL
-    });
-
-    while entries.len() > PER_HOST_LIMITER_MAX_ENTRIES {
-        let oldest_key = entries
-            .iter()
-            .filter(|(_, entry)| entry.semaphore.available_permits() == entry.limit)
-            .min_by_key(|(_, entry)| entry.last_used_at)
-            .map(|(host, _)| host.clone());
-        let Some(oldest_key) = oldest_key else {
-            break;
-        };
-        entries.remove(&oldest_key);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,7 +210,9 @@ mod tests {
             .checked_sub(PER_HOST_LIMITER_ENTRY_TTL + Duration::from_secs(1))
             .expect("stale instant");
         let semaphore = Arc::new(BlockingSemaphore::new(1));
-        let permit = semaphore.acquire();
+        let permit = semaphore
+            .acquire(None)
+            .expect("acquire active permit without deadline");
 
         let mut entries = BTreeMap::new();
         entries.insert(
@@ -187,11 +224,21 @@ mod tests {
             },
         );
 
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(entries.contains_key("active.example.com"));
 
         drop(permit);
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(!entries.contains_key("active.example.com"));
     }
 
@@ -199,7 +246,9 @@ mod tests {
     fn cleanup_does_not_evict_active_entries_when_over_capacity() {
         let now = Instant::now();
         let active_semaphore = Arc::new(BlockingSemaphore::new(1));
-        let _active_permit = active_semaphore.acquire();
+        let _active_permit = active_semaphore
+            .acquire(None)
+            .expect("acquire active permit without deadline");
 
         let mut entries = BTreeMap::new();
         entries.insert(
@@ -222,7 +271,12 @@ mod tests {
             );
         }
 
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(entries.contains_key("active.example.com"));
         assert_eq!(entries.len(), PER_HOST_LIMITER_MAX_ENTRIES);
     }

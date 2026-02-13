@@ -869,6 +869,104 @@ async fn max_in_flight_stream_into_response_holds_permit_until_buffering_finishe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_in_flight_queue_wait_respects_total_timeout_deadline() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-global-permit")
+        .send_stream()
+        .await
+        .expect("first stream should acquire and hold the global permit");
+
+    let error = client
+        .get("/queued-behind-global-permit")
+        .total_timeout(Duration::from_millis(80))
+        .send()
+        .await
+        .expect_err("queued request should stop waiting once total_timeout is exhausted");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/queued-behind-global-permit"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    drop(held_stream);
+    assert_eq!(server.served_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_concurrency_queue_wait_respects_total_timeout_deadline() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::from_millis(260),
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .adaptive_concurrency_policy(
+            reqx::AdaptiveConcurrencyPolicy::standard()
+                .min_limit(1)
+                .initial_limit(1)
+                .max_limit(1),
+        )
+        .request_timeout(Duration::from_millis(700))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .get("/adaptive-first")
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let error = client
+        .get("/adaptive-second")
+        .total_timeout(Duration::from_millis(80))
+        .send()
+        .await
+        .expect_err("queued adaptive request should stop waiting at total_timeout");
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/adaptive-second"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let first_status = first
+        .await
+        .expect("join first request")
+        .expect("first request should succeed");
+    assert_eq!(first_status, 200);
+    assert_eq!(server.served_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn max_in_flight_per_host_limits_each_host_independently() {
     let server_a = CountingServer::start(
         2,

@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::core::limiters::{
+    PER_HOST_LIMITER_ENTRY_TTL, PER_HOST_LIMITER_MAX_ENTRIES,
+    PerHostLimiterEntry as PerHostLimiterEntryState, cleanup_stale_per_host_limiters,
+};
 use crate::error::Error;
 use crate::util::lock_unpoisoned;
-
-const PER_HOST_LIMITER_ENTRY_TTL: Duration = Duration::from_secs(300);
-const PER_HOST_LIMITER_MAX_ENTRIES: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct RequestLimiters {
@@ -32,6 +35,16 @@ pub(crate) struct GlobalRequestPermit {
 #[derive(Debug)]
 pub(crate) struct HostRequestPermit {
     pub(crate) _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PerHostLimiterEntryState for PerHostLimiterEntry {
+    fn is_idle(&self) -> bool {
+        self.semaphore.available_permits() == self.limit
+    }
+
+    fn last_used_at(&self) -> Instant {
+        self.last_used_at
+    }
 }
 
 impl RequestLimiters {
@@ -72,7 +85,12 @@ impl RequestLimiters {
                 let semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
                     let now = Instant::now();
-                    cleanup_stale_per_host_limiters(&mut guard, now);
+                    cleanup_stale_per_host_limiters(
+                        &mut guard,
+                        now,
+                        PER_HOST_LIMITER_ENTRY_TTL,
+                        PER_HOST_LIMITER_MAX_ENTRIES,
+                    );
                     let entry = guard.entry(host).or_insert_with(|| PerHostLimiterEntry {
                         semaphore: Arc::new(Semaphore::new(limit)),
                         limit,
@@ -92,28 +110,6 @@ impl RequestLimiters {
         };
 
         Ok(HostRequestPermit { _permit: permit })
-    }
-}
-
-fn cleanup_stale_per_host_limiters(
-    entries: &mut BTreeMap<String, PerHostLimiterEntry>,
-    now: Instant,
-) {
-    entries.retain(|_, entry| {
-        entry.semaphore.available_permits() < entry.limit
-            || now.duration_since(entry.last_used_at) <= PER_HOST_LIMITER_ENTRY_TTL
-    });
-
-    while entries.len() > PER_HOST_LIMITER_MAX_ENTRIES {
-        let oldest_key = entries
-            .iter()
-            .filter(|(_, entry)| entry.semaphore.available_permits() == entry.limit)
-            .min_by_key(|(_, entry)| entry.last_used_at)
-            .map(|(host, _)| host.clone());
-        let Some(oldest_key) = oldest_key else {
-            break;
-        };
-        entries.remove(&oldest_key);
     }
 }
 
@@ -143,11 +139,21 @@ mod tests {
             },
         );
 
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(entries.contains_key("active.example.com"));
 
         drop(permit);
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(!entries.contains_key("active.example.com"));
     }
 
@@ -181,7 +187,12 @@ mod tests {
             );
         }
 
-        cleanup_stale_per_host_limiters(&mut entries, now);
+        cleanup_stale_per_host_limiters(
+            &mut entries,
+            now,
+            PER_HOST_LIMITER_ENTRY_TTL,
+            PER_HOST_LIMITER_MAX_ENTRIES,
+        );
         assert!(entries.contains_key("active.example.com"));
         assert_eq!(entries.len(), PER_HOST_LIMITER_MAX_ENTRIES);
     }

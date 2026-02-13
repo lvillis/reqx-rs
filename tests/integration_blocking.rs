@@ -989,6 +989,95 @@ fn blocking_max_in_flight_per_host_limits_each_host_independently() {
 }
 
 #[test]
+fn blocking_max_in_flight_queue_wait_respects_total_timeout_deadline() {
+    let server = CountingServer::start(
+        1,
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+        Duration::ZERO,
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .max_in_flight(1)
+        .request_timeout(Duration::from_millis(800))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-global-permit")
+        .send_stream()
+        .expect("first stream should acquire and hold the global permit");
+
+    let error = client
+        .get("/queued-behind-global-permit")
+        .total_timeout(Duration::from_millis(80))
+        .send()
+        .expect_err("queued request should stop waiting once total_timeout is exhausted");
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/queued-behind-global-permit"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    drop(held_stream);
+    assert_eq!(server.served_count(), 1);
+}
+
+#[test]
+fn blocking_adaptive_concurrency_queue_wait_respects_total_timeout_deadline() {
+    let server = CountingServer::start(
+        1,
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+        Duration::from_millis(260),
+    );
+    let client = Arc::new(
+        Client::builder(format!("http://{}", server.authority()))
+            .adaptive_concurrency_policy(
+                AdaptiveConcurrencyPolicy::standard()
+                    .min_limit(1)
+                    .initial_limit(1)
+                    .max_limit(1),
+            )
+            .request_timeout(Duration::from_millis(700))
+            .retry_policy(RetryPolicy::disabled())
+            .build()
+            .expect("client should build"),
+    );
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first_client = Arc::clone(&client);
+    let first_barrier = Arc::clone(&barrier);
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        first_client
+            .get("/adaptive-first")
+            .send()
+            .map(|response| response.status().as_u16())
+    });
+    barrier.wait();
+    thread::sleep(Duration::from_millis(20));
+
+    let error = client
+        .get("/adaptive-second")
+        .total_timeout(Duration::from_millis(80))
+        .send()
+        .expect_err("queued adaptive request should stop waiting at total_timeout");
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/adaptive-second"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let first_status = first
+        .join()
+        .expect("join first request")
+        .expect("first request should succeed");
+    assert_eq!(first_status, 200);
+    assert_eq!(server.served_count(), 1);
+}
+
+#[test]
 fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
     let server = MockServer::start(vec![
         MockResponse::new(

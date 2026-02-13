@@ -378,6 +378,13 @@ pub(crate) fn total_timeout_expired(
     total_timeout.is_some_and(|timeout| request_started_at.elapsed() >= timeout)
 }
 
+pub(crate) fn total_timeout_deadline(
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+) -> Option<Instant> {
+    total_timeout.and_then(|timeout| request_started_at.checked_add(timeout))
+}
+
 pub(crate) fn bounded_retry_delay(
     retry_delay: Duration,
     total_timeout: Option<Duration>,
