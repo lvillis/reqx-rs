@@ -189,13 +189,13 @@ fn standard_otel_path_normalizer_truncates_on_segment_boundary() {
 }
 
 #[test]
-fn redact_uri_for_logs_masks_telegram_token() {
+fn redact_uri_for_logs_keeps_path_but_removes_query() {
     let redacted = redact_uri_for_logs(
         "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates?offset=10",
     );
     assert_eq!(
         redacted,
-        "https://api.telegram.org/bot%3Credacted%3E/getUpdates"
+        "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates"
     );
 }
 
@@ -539,7 +539,11 @@ fn error_safe_request_accessors_return_method_uri_and_path() {
         Some("POST")
     );
     assert_eq!(
-        error.request_uri_redacted().as_deref(),
+        error.request_uri_redacted(),
+        Some("https://api.example.com/v1/items")
+    );
+    assert_eq!(
+        error.request_uri_redacted_owned().as_deref(),
         Some("https://api.example.com/v1/items")
     );
     assert_eq!(error.request_path().as_deref(), Some("/v1/items"));

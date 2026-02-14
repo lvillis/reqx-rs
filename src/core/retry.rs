@@ -275,12 +275,13 @@ impl RetryPolicy {
         if backoff_ms <= 1 {
             return backoff;
         }
+        let max_backoff_ms = self.max_backoff.as_millis().min(u64::MAX as u128) as u64;
 
         let jitter_span = ((backoff_ms as f64) * self.jitter_ratio).round().max(1.0) as u64;
         let low = backoff_ms.saturating_sub(jitter_span);
         let high = backoff_ms.saturating_add(jitter_span).max(low);
         let mut rng = rand::rng();
-        let sampled_ms = rng.random_range(low..=high);
+        let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
         Duration::from_millis(sampled_ms)
     }
 }
@@ -320,4 +321,22 @@ fn is_method_idempotent(method: &Method) -> bool {
         *method,
         Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetryPolicy;
+
+    #[test]
+    fn jittered_backoff_never_exceeds_configured_max_backoff() {
+        let policy = RetryPolicy::standard()
+            .base_backoff(std::time::Duration::from_millis(100))
+            .max_backoff(std::time::Duration::from_millis(120))
+            .jitter_ratio(1.0);
+
+        for _ in 0..256 {
+            let backoff = policy.backoff_for_retry(3);
+            assert!(backoff <= std::time::Duration::from_millis(120));
+        }
+    }
 }

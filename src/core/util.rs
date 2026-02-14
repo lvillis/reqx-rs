@@ -144,32 +144,6 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     parsed.set_query(None);
     parsed.set_fragment(None);
 
-    let mut path_segments = parsed
-        .path_segments()
-        .map(|segments| segments.map(ToOwned::to_owned).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if !path_segments.is_empty() {
-        for segment in &mut path_segments {
-            if let Some(rest) = segment.strip_prefix("bot")
-                && !rest.is_empty()
-                && rest.contains(':')
-            {
-                *segment = "bot<redacted>".to_owned();
-            }
-        }
-
-        let has_trailing_slash = parsed.path().ends_with('/');
-        let mut rebuilt_path = String::new();
-        for segment in &path_segments {
-            rebuilt_path.push('/');
-            rebuilt_path.push_str(segment);
-        }
-        if rebuilt_path.is_empty() || (has_trailing_slash && !rebuilt_path.ends_with('/')) {
-            rebuilt_path.push('/');
-        }
-        parsed.set_path(&rebuilt_path);
-    }
-
     let serialized = parsed.to_string();
     let authority_redacted = redact_userinfo_in_authority(&serialized);
     redact_non_authority_credentials(&authority_redacted)
@@ -302,30 +276,71 @@ fn build_query_string(existing: &[(String, String)], appended: &[(String, String
 pub(crate) fn classify_transport_error(
     error: &hyper_util::client::legacy::Error,
 ) -> TransportErrorKind {
-    if error.is_connect() {
-        let text = error.to_string().to_ascii_lowercase();
-        if text.contains("dns")
-            || text.contains("name or service not known")
-            || text.contains("failed to lookup address")
-        {
-            return TransportErrorKind::Dns;
-        }
-        if text.contains("tls") || text.contains("certificate") || text.contains("handshake") {
-            return TransportErrorKind::Tls;
-        }
-        return TransportErrorKind::Connect;
+    const DNS_MARKERS: &[&str] = &[
+        "dns",
+        "name or service not known",
+        "failed to lookup address",
+        "no such host",
+        "temporary failure in name resolution",
+        "nodename nor servname provided",
+    ];
+    const TLS_MARKERS: &[&str] = &[
+        "tls",
+        "ssl",
+        "certificate",
+        "x509",
+        "handshake",
+        "pkix",
+        "peer cert",
+    ];
+    const CONNECT_MARKERS: &[&str] = &[
+        "connection refused",
+        "connection aborted",
+        "not connected",
+        "network unreachable",
+        "host unreachable",
+        "connect error",
+        "proxy connect",
+    ];
+    const READ_MARKERS: &[&str] = &[
+        "read",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+        "incomplete message",
+    ];
+
+    let mut text = error.to_string().to_ascii_lowercase();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push(' ');
+        text.push_str(&cause.to_string().to_ascii_lowercase());
+        source = cause.source();
     }
 
-    let text = error.to_string().to_ascii_lowercase();
-    if text.contains("read")
-        || text.contains("connection reset")
-        || text.contains("broken pipe")
-        || text.contains("unexpected eof")
-    {
+    if contains_marker(&text, DNS_MARKERS) {
+        return TransportErrorKind::Dns;
+    }
+    if contains_marker(&text, TLS_MARKERS) {
+        return TransportErrorKind::Tls;
+    }
+    if contains_marker(&text, READ_MARKERS) {
         return TransportErrorKind::Read;
     }
-
+    if contains_marker(&text, CONNECT_MARKERS) {
+        return TransportErrorKind::Connect;
+    }
+    if error.is_connect() {
+        // Keep unknown connect-path failures conservative to avoid retrying
+        // configuration or handshake-class errors by mistake.
+        return TransportErrorKind::Other;
+    }
     TransportErrorKind::Other
+}
+
+#[cfg(feature = "_async")]
+fn contains_marker(text: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| text.contains(marker))
 }
 
 pub(crate) fn join_base_path(base_url: &str, path: &str) -> String {

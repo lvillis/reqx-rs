@@ -206,12 +206,13 @@ impl ResumableUploadOptions {
         if backoff_ms <= 1 {
             return backoff;
         }
+        let max_backoff_ms = self.max_backoff.as_millis().min(u64::MAX as u128) as u64;
 
         let jitter_span = ((backoff_ms as f64) * self.jitter_ratio).round().max(1.0) as u64;
         let low = backoff_ms.saturating_sub(jitter_span);
         let high = backoff_ms.saturating_add(jitter_span).max(low);
         let mut rng = rand::rng();
-        let sampled_ms = rng.random_range(low..=high);
+        let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
         Duration::from_millis(sampled_ms)
     }
 
@@ -1203,6 +1204,19 @@ mod tests {
                 assert!(checkpoint.completed_parts.is_empty());
             }
             other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn resumable_upload_jittered_backoff_never_exceeds_max_backoff() {
+        let options = ResumableUploadOptions::new()
+            .with_base_backoff(Duration::from_millis(50))
+            .with_max_backoff(Duration::from_millis(80))
+            .with_jitter_ratio(1.0);
+
+        for _ in 0..256 {
+            let backoff = options.backoff_for_retry(4);
+            assert!(backoff <= Duration::from_millis(80));
         }
     }
 

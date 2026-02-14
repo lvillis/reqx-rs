@@ -1,7 +1,7 @@
 use http::{HeaderMap, Method};
 use std::time::{Duration, SystemTime};
 
-use crate::util::{parse_retry_after, redact_uri_for_logs};
+use crate::util::parse_retry_after;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -380,7 +380,7 @@ impl Error {
         }
     }
 
-    pub fn request_uri(&self) -> Option<&str> {
+    pub fn request_uri_redacted(&self) -> Option<&str> {
         match self {
             Self::InvalidUri { uri }
             | Self::Transport { uri, .. }
@@ -399,8 +399,8 @@ impl Error {
         }
     }
 
-    pub fn request_uri_redacted(&self) -> Option<String> {
-        self.request_uri().map(redact_uri_for_logs)
+    pub fn request_uri_redacted_owned(&self) -> Option<String> {
+        self.request_uri_redacted().map(ToOwned::to_owned)
     }
 
     pub fn request_path(&self) -> Option<String> {
@@ -411,7 +411,7 @@ impl Error {
                 return Some(path.to_owned());
             }
         }
-        let without_query = uri.split_once('?').map_or(uri.as_str(), |(left, _)| left);
+        let without_query = uri.split_once('?').map_or(uri, |(left, _)| left);
         let without_fragment = without_query
             .split_once('#')
             .map_or(without_query, |(left, _)| left);

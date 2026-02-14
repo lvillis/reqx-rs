@@ -6,6 +6,7 @@ use crate::util::lock_unpoisoned;
 
 const PER_HOST_RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(300);
 const PER_HOST_RATE_LIMIT_MAX_ENTRIES: usize = 1024;
+const PER_HOST_RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ServerThrottleScope {
@@ -215,6 +216,7 @@ pub(crate) struct RateLimiter {
     global: Option<Mutex<TokenBucket>>,
     per_host_policy: Option<RateLimitPolicy>,
     per_host: Mutex<BTreeMap<String, PerHostRateLimitEntry>>,
+    per_host_last_cleanup_at: Mutex<Instant>,
 }
 
 impl RateLimiter {
@@ -231,6 +233,7 @@ impl RateLimiter {
             global: global_policy.map(|policy| Mutex::new(TokenBucket::new(policy, now))),
             per_host_policy: per_host_policy.map(RateLimitPolicy::normalize),
             per_host: Mutex::new(BTreeMap::new()),
+            per_host_last_cleanup_at: Mutex::new(now),
         })
     }
 
@@ -240,7 +243,7 @@ impl RateLimiter {
 
         let mut global_bucket = self.global.as_ref().map(lock_unpoisoned);
         let mut per_host = lock_unpoisoned(&self.per_host);
-        cleanup_stale_per_host_rate_limits(&mut per_host, now);
+        self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
 
         let global_ready = global_bucket
             .as_mut()
@@ -334,7 +337,7 @@ impl RateLimiter {
             && let (Some(policy), Some(host)) = (self.per_host_policy, host_key.clone())
         {
             let mut per_host = lock_unpoisoned(&self.per_host);
-            cleanup_stale_per_host_rate_limits(&mut per_host, now);
+            self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
             let entry = per_host
                 .entry(host)
                 .or_insert_with(|| PerHostRateLimitEntry {
@@ -349,7 +352,7 @@ impl RateLimiter {
         if !applied {
             if let (Some(policy), Some(host)) = (self.per_host_policy, host_key) {
                 let mut per_host = lock_unpoisoned(&self.per_host);
-                cleanup_stale_per_host_rate_limits(&mut per_host, now);
+                self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
                 let entry = per_host
                     .entry(host)
                     .or_insert_with(|| PerHostRateLimitEntry {
@@ -363,6 +366,26 @@ impl RateLimiter {
                 bucket.apply_throttle(now, delay);
             }
         }
+    }
+
+    fn maybe_cleanup_stale_per_host_rate_limits(
+        &self,
+        entries: &mut BTreeMap<String, PerHostRateLimitEntry>,
+        now: Instant,
+    ) {
+        if entries.len() > PER_HOST_RATE_LIMIT_MAX_ENTRIES {
+            cleanup_stale_per_host_rate_limits(entries, now);
+            *lock_unpoisoned(&self.per_host_last_cleanup_at) = now;
+            return;
+        }
+
+        let mut last_cleanup_at = lock_unpoisoned(&self.per_host_last_cleanup_at);
+        if now.saturating_duration_since(*last_cleanup_at) < PER_HOST_RATE_LIMIT_CLEANUP_INTERVAL {
+            return;
+        }
+
+        cleanup_stale_per_host_rate_limits(entries, now);
+        *last_cleanup_at = now;
     }
 
     fn resolve_server_throttle_scope(
