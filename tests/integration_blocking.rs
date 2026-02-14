@@ -8,6 +8,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use reqx::blocking::Client;
 use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
@@ -117,6 +118,69 @@ impl MockServer {
 }
 
 impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct BlockingProxyServer {
+    uri: String,
+    served: Arc<AtomicUsize>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl BlockingProxyServer {
+    fn start(expected_requests: usize, response: MockResponse) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blocking proxy server");
+        let address = listener
+            .local_addr()
+            .expect("read blocking proxy server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set blocking proxy listener nonblocking");
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_clone = Arc::clone(&served);
+
+        let join = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+
+            while served_clone.load(Ordering::SeqCst) < expected_requests
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = read_request(&mut stream);
+                        served_clone.fetch_add(1, Ordering::SeqCst);
+                        let _ = write_response(&mut stream, &response);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            uri: format!("http://{address}"),
+            served,
+            join: Some(join),
+        }
+    }
+
+    fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn served_count(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for BlockingProxyServer {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -2342,6 +2406,96 @@ fn blocking_redirect_policy_none_returns_http_status_error_without_following() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].path, "/v1/old");
+}
+
+#[test]
+fn blocking_proxy_authorization_requires_proxy_uri_credentials_for_http_proxy() {
+    let proxy_uri: Uri = "http://127.0.0.1:1".parse().expect("parse proxy uri");
+
+    let client = Client::builder("http://example.com")
+        .http_proxy(proxy_uri)
+        .try_proxy_authorization("Basic dXNlcjpwYXNz")
+        .expect("valid proxy authorization header")
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/proxy-auth")
+        .send()
+        .expect_err("http proxy auth should require proxy URI credentials in blocking mode");
+
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("proxy_authorization"));
+            assert!(message.contains("http_proxy URI"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_no_proxy_bypasses_http_proxy() {
+    let upstream = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain")],
+        b"direct-ok".to_vec(),
+    )]);
+    let proxy = BlockingProxyServer::start(
+        1,
+        MockResponse::new(
+            502,
+            vec![("Content-Type", "text/plain")],
+            b"proxy-should-not-be-used".to_vec(),
+        ),
+    );
+    let proxy_uri: Uri = proxy.uri().parse().expect("parse proxy uri");
+
+    let client = Client::builder(upstream.base_url.clone())
+        .http_proxy(proxy_uri)
+        .no_proxy(["127.0.0.1"])
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/v1/no-proxy")
+        .send()
+        .expect("request should bypass proxy and succeed");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "direct-ok");
+
+    assert_eq!(upstream.served_count(), 1);
+    assert_eq!(proxy.served_count(), 0);
+}
+
+#[test]
+fn blocking_https_proxy_authorization_requires_proxy_uri_credentials() {
+    let proxy_uri: Uri = "http://127.0.0.1:1".parse().expect("parse proxy uri");
+
+    let client = Client::builder("https://example.com")
+        .http_proxy(proxy_uri)
+        .try_proxy_authorization("Basic dXNlcjpwYXNz")
+        .expect("valid proxy authorization header")
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/secure")
+        .send()
+        .expect_err("https proxy auth should require proxy URI credentials in blocking mode");
+
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("proxy_authorization"));
+            assert!(message.contains("http_proxy URI"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 struct BlockingHeaderInterceptor {

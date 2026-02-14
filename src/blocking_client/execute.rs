@@ -8,10 +8,10 @@ use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
-    effective_status_policy, http_status_error, next_redirect_action,
-    response_body_read_retry_decision, select_base_url, should_mark_non_success_for_resilience,
-    should_return_non_success_response, status_retry_delay, status_retry_plan,
-    timeout_retry_decision, transport_retry_decision_from_error, transport_timeout_error,
+    effective_status_policy, next_redirect_action, response_body_read_retry_decision,
+    select_base_url, should_return_non_success_response, status_retry_delay, status_retry_plan,
+    terminal_non_success, timeout_retry_decision, transport_retry_decision_from_error,
+    transport_timeout_error,
 };
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
@@ -22,7 +22,7 @@ use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking, merge_headers,
     phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, total_timeout_deadline,
-    total_timeout_expired, truncate_body,
+    total_timeout_expired,
 };
 
 use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
@@ -666,7 +666,7 @@ impl Client {
         method: Method,
         uri_text: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, Error> {
-        let mut configured_request = agent
+        let configured_request = agent
             .configure_request(request)
             .timeout_global(Some(timeout_value))
             .timeout_per_call(Some(timeout_value))
@@ -674,15 +674,7 @@ impl Client {
             .timeout_recv_response(Some(timeout_value))
             .timeout_recv_body(Some(timeout_value))
             .build();
-
-        if using_proxy
-            && let Some(proxy_config) = &self.proxy_config
-            && let Some(proxy_authorization) = &proxy_config.authorization
-        {
-            configured_request
-                .headers_mut()
-                .insert("proxy-authorization", proxy_authorization.clone());
-        }
+        self.validate_proxy_authorization(using_proxy)?;
 
         agent
             .run(configured_request)
@@ -700,6 +692,32 @@ impl Client {
                     source: Box::new(other),
                 },
             })
+    }
+
+    fn validate_proxy_authorization(&self, using_proxy: bool) -> Result<(), Error> {
+        if !using_proxy {
+            return Ok(());
+        }
+        let Some(proxy_config) = &self.proxy_config else {
+            return Ok(());
+        };
+        if proxy_config.authorization.is_none() {
+            return Ok(());
+        }
+        let proxy_uri_has_credentials = proxy_config
+            .uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'));
+        if proxy_uri_has_credentials {
+            // ureq applies CONNECT proxy auth from proxy URI credentials.
+            // Avoid forwarding Proxy-Authorization on end-to-end request messages.
+            return Ok(());
+        }
+
+        Err(Error::TlsConfig {
+            backend: self.tls_backend.as_str(),
+            message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
+        })
     }
 
     pub(super) fn send_request(
@@ -1283,14 +1301,15 @@ impl Client {
                     }
                 }
 
-                let error = http_status_error(
+                let terminal = terminal_non_success(
                     status,
                     &current_method,
                     &current_redacted_uri,
                     &response_headers,
-                    truncate_body(&response_body),
+                    &response_body,
+                    &retry_policy,
                 );
-                if should_mark_non_success_for_resilience(&retry_policy, status) {
+                if terminal.should_mark_success {
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }
@@ -1299,8 +1318,8 @@ impl Client {
                     }
                     self.maybe_record_terminal_response_success(status, &retry_policy);
                 }
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
+                self.run_error_interceptors(&context, &terminal.error);
+                return Err(terminal.error);
             }
 
             if let Some(attempt_guard) = circuit_attempt.take() {

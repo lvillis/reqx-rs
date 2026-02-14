@@ -9,7 +9,7 @@ use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
 use crate::util::{
     deadline_exceeded_error, is_redirect_status, parse_retry_after, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, same_origin,
-    sanitize_headers_for_redirect, total_timeout_expired,
+    sanitize_headers_for_redirect, total_timeout_expired, truncate_body,
 };
 
 #[derive(Debug)]
@@ -185,6 +185,25 @@ pub(crate) fn should_mark_non_success_for_resilience(
     status: StatusCode,
 ) -> bool {
     !retry_policy.is_retryable_status(status)
+}
+
+pub(crate) struct TerminalNonSuccess {
+    pub(crate) error: Error,
+    pub(crate) should_mark_success: bool,
+}
+
+pub(crate) fn terminal_non_success(
+    status: StatusCode,
+    method: &Method,
+    redacted_uri: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    retry_policy: &RetryPolicy,
+) -> TerminalNonSuccess {
+    TerminalNonSuccess {
+        error: http_status_error(status, method, redacted_uri, headers, truncate_body(body)),
+        should_mark_success: should_mark_non_success_for_resilience(retry_policy, status),
+    }
 }
 
 pub(crate) fn status_retry_delay(

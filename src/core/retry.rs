@@ -251,7 +251,7 @@ impl RetryPolicy {
                     decision.attempt,
                 );
         }
-        true
+        false
     }
 
     pub(crate) fn backoff_for_retry(&self, retry_index: usize) -> Duration {
@@ -325,7 +325,8 @@ fn is_method_idempotent(method: &Method) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::RetryPolicy;
+    use super::{RetryDecision, RetryPolicy};
+    use http::Method;
 
     #[test]
     fn jittered_backoff_never_exceeds_configured_max_backoff() {
@@ -338,5 +339,22 @@ mod tests {
             let backoff = policy.backoff_for_retry(3);
             assert!(backoff <= std::time::Duration::from_millis(120));
         }
+    }
+
+    #[test]
+    fn should_retry_decision_defaults_to_no_retry_for_unclassified_outcome() {
+        let policy = RetryPolicy::standard();
+        let decision = RetryDecision {
+            attempt: 1,
+            max_attempts: 3,
+            method: Method::GET,
+            uri: "https://api.example.com/v1/items".to_owned(),
+            status: None,
+            transport_error_kind: None,
+            timeout_phase: None,
+            response_body_read_error: false,
+        };
+
+        assert!(!policy.should_retry_decision(&decision));
     }
 }

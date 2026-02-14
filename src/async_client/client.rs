@@ -38,10 +38,10 @@ use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
-    effective_status_policy, http_status_error, next_redirect_action,
-    response_body_read_retry_decision, select_base_url, should_mark_non_success_for_resilience,
-    should_return_non_success_response, status_retry_delay, status_retry_error, status_retry_plan,
-    timeout_retry_decision, transport_retry_decision_from_error, transport_timeout_error,
+    effective_status_policy, next_redirect_action, response_body_read_retry_decision,
+    select_base_url, should_return_non_success_response, status_retry_delay, status_retry_error,
+    status_retry_plan, terminal_non_success, timeout_retry_decision,
+    transport_retry_decision_from_error, transport_timeout_error,
 };
 use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
@@ -85,7 +85,7 @@ use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
     parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    total_timeout_deadline, total_timeout_expired, truncate_body, validate_base_url,
+    total_timeout_deadline, total_timeout_expired, validate_base_url,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2677,14 +2677,15 @@ impl Client {
                     }
                 }
 
-                let error = http_status_error(
+                let terminal = terminal_non_success(
                     status,
                     &current_method,
                     &current_redacted_uri,
                     &response_headers,
-                    truncate_body(&response_body),
+                    &response_body,
+                    &retry_policy,
                 );
-                if should_mark_non_success_for_resilience(&retry_policy, status) {
+                if terminal.should_mark_success {
                     if let Some(attempt_guard) = circuit_attempt.take() {
                         attempt_guard.mark_success();
                     }
@@ -2693,8 +2694,8 @@ impl Client {
                     }
                     self.maybe_record_terminal_response_success(status, &retry_policy);
                 }
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
+                self.run_error_interceptors(&context, &terminal.error);
+                return Err(terminal.error);
             }
 
             if let Some(attempt_guard) = circuit_attempt.take() {
