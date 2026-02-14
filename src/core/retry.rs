@@ -210,6 +210,10 @@ impl RetryPolicy {
         self.max_attempts
     }
 
+    pub(crate) fn configured_max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
     fn should_retry_status(&self, status: StatusCode) -> bool {
         self.retryable_status_codes.contains(&status.as_u16())
     }

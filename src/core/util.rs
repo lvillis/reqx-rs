@@ -53,6 +53,13 @@ fn invalid_base_url_error(base_url: &str) -> Error {
     }
 }
 
+fn invalid_proxy_uri_error(proxy_uri: &Uri, message: impl Into<String>) -> Error {
+    Error::InvalidProxyConfig {
+        proxy_uri: redact_uri_for_logs(&proxy_uri.to_string()),
+        message: message.into(),
+    }
+}
+
 fn uri_has_userinfo(uri: &Uri) -> bool {
     uri.authority()
         .is_some_and(|authority| authority.as_str().contains('@'))
@@ -271,6 +278,43 @@ pub(crate) fn validate_base_url(base_url: &str) -> Result<(), Error> {
         return Err(invalid_base_url_error(base_url));
     };
 
+    Ok(())
+}
+
+pub(crate) fn validate_http_proxy_uri(proxy_uri: &Uri) -> Result<(), Error> {
+    let Some(scheme) = proxy_uri.scheme_str() else {
+        return Err(invalid_proxy_uri_error(
+            proxy_uri,
+            "http_proxy URI must include an explicit scheme",
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(invalid_proxy_uri_error(
+            proxy_uri,
+            "http_proxy URI must use http scheme",
+        ));
+    }
+    if proxy_uri.host().is_none() {
+        return Err(invalid_proxy_uri_error(
+            proxy_uri,
+            "http_proxy URI must include host",
+        ));
+    }
+    if let Some(path_and_query) = proxy_uri.path_and_query() {
+        let path = path_and_query.path();
+        if !path.is_empty() && path != "/" {
+            return Err(invalid_proxy_uri_error(
+                proxy_uri,
+                "http_proxy URI must not include path segments",
+            ));
+        }
+        if path_and_query.query().is_some() {
+            return Err(invalid_proxy_uri_error(
+                proxy_uri,
+                "http_proxy URI must not include query parameters",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -533,6 +577,14 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<
         Ok(duration) => Some(duration),
         Err(_) => Some(Duration::ZERO),
     }
+}
+
+pub(crate) fn parse_retry_after_capped(
+    headers: &HeaderMap,
+    now: SystemTime,
+    max_delay: Duration,
+) -> Option<Duration> {
+    parse_retry_after(headers, now).map(|delay| delay.min(max_delay))
 }
 
 pub(crate) fn is_redirect_status(status: StatusCode) -> bool {

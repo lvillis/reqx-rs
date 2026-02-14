@@ -7,7 +7,7 @@ use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
 use crate::util::{
-    deadline_exceeded_error, is_redirect_status, parse_retry_after, redact_uri_for_logs,
+    deadline_exceeded_error, is_redirect_status, parse_retry_after_capped, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, same_origin,
     sanitize_headers_for_redirect, total_timeout_expired, truncate_body,
 };
@@ -210,8 +210,11 @@ pub(crate) fn status_retry_delay(
     clock: &dyn Clock,
     headers: &HeaderMap,
     fallback: Duration,
+    max_delay: Duration,
 ) -> Duration {
-    parse_retry_after(headers, clock.now_system()).unwrap_or(fallback)
+    const DEFAULT_RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+    let retry_after_cap = max_delay.max(DEFAULT_RETRY_AFTER_CAP).max(fallback);
+    parse_retry_after_capped(headers, clock.now_system(), retry_after_cap).unwrap_or(fallback)
 }
 
 #[cfg(feature = "_async")]
@@ -242,6 +245,7 @@ pub(crate) struct StatusRetryPlanInput<'a> {
     pub(crate) headers: &'a HeaderMap,
     pub(crate) clock: &'a dyn Clock,
     pub(crate) fallback_delay: Duration,
+    pub(crate) max_delay: Duration,
 }
 
 pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryPlan {
@@ -254,10 +258,11 @@ pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryP
         headers,
         clock,
         fallback_delay,
+        max_delay,
     } = input;
     StatusRetryPlan {
         decision: status_retry_decision(attempt, max_attempts, method, redacted_uri, status),
-        delay: status_retry_delay(clock, headers, fallback_delay),
+        delay: status_retry_delay(clock, headers, fallback_delay, max_delay),
     }
 }
 

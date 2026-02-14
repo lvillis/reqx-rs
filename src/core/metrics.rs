@@ -249,6 +249,7 @@ impl ClientMetrics {
             }
             Error::InvalidUri { .. }
             | Error::InvalidNoProxyRule { .. }
+            | Error::InvalidProxyConfig { .. }
             | Error::InvalidAdaptiveConcurrencyPolicy { .. }
             | Error::SerializeJson { .. }
             | Error::SerializeQuery { .. }

@@ -46,6 +46,7 @@ impl std::fmt::Display for TimeoutPhase {
 pub enum ErrorCode {
     InvalidUri,
     InvalidNoProxyRule,
+    InvalidProxyConfig,
     InvalidAdaptiveConcurrencyPolicy,
     SerializeJson,
     SerializeQuery,
@@ -74,9 +75,10 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
+        Self::InvalidProxyConfig,
         Self::InvalidAdaptiveConcurrencyPolicy,
         Self::SerializeJson,
         Self::SerializeQuery,
@@ -112,6 +114,7 @@ impl ErrorCode {
         match self {
             Self::InvalidUri => "invalid_uri",
             Self::InvalidNoProxyRule => "invalid_no_proxy_rule",
+            Self::InvalidProxyConfig => "invalid_proxy_config",
             Self::InvalidAdaptiveConcurrencyPolicy => "invalid_adaptive_concurrency_policy",
             Self::SerializeJson => "serialize_json",
             Self::SerializeQuery => "serialize_query",
@@ -148,6 +151,8 @@ pub enum Error {
     InvalidUri { uri: String },
     #[error("invalid no_proxy rule: {rule:?}")]
     InvalidNoProxyRule { rule: String },
+    #[error("invalid proxy configuration for {proxy_uri}: {message}")]
+    InvalidProxyConfig { proxy_uri: String, message: String },
     #[error(
         "invalid adaptive concurrency policy (min={min_limit}, initial={initial_limit}, max={max_limit}): {message}"
     )]
@@ -304,6 +309,7 @@ impl Error {
         match self {
             Self::InvalidUri { .. } => ErrorCode::InvalidUri,
             Self::InvalidNoProxyRule { .. } => ErrorCode::InvalidNoProxyRule,
+            Self::InvalidProxyConfig { .. } => ErrorCode::InvalidProxyConfig,
             Self::InvalidAdaptiveConcurrencyPolicy { .. } => {
                 ErrorCode::InvalidAdaptiveConcurrencyPolicy
             }
@@ -383,6 +389,7 @@ impl Error {
     pub fn request_uri_redacted(&self) -> Option<&str> {
         match self {
             Self::InvalidUri { uri }
+            | Self::InvalidProxyConfig { proxy_uri: uri, .. }
             | Self::Transport { uri, .. }
             | Self::Timeout { uri, .. }
             | Self::DeadlineExceeded { uri, .. }

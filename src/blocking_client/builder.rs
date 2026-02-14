@@ -18,7 +18,10 @@ use crate::retry::{
     PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
 };
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
-use crate::util::{parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url};
+use crate::util::{
+    parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url,
+    validate_http_proxy_uri,
+};
 use crate::{AdvancedConfig, ClientProfile};
 use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer, OtelPathNormalizer};
 use crate::{PolicyBackoffSource, PrimaryEndpointSelector, StandardBodyCodec, SystemClock};
@@ -467,6 +470,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(proxy_uri) = self.http_proxy.as_ref() {
+            validate_http_proxy_uri(proxy_uri)?;
+        }
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
         }
@@ -497,10 +503,12 @@ impl ClientBuilder {
         )?;
 
         let proxied = if let Some(proxy_config) = &proxy_config {
-            let proxy =
-                ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| Error::InvalidUri {
-                    uri: redact_uri_for_logs(&proxy_config.uri.to_string()),
-                })?;
+            let proxy = ureq::Proxy::new(&proxy_config.uri.to_string()).map_err(|_| {
+                Error::InvalidProxyConfig {
+                    proxy_uri: redact_uri_for_logs(&proxy_config.uri.to_string()),
+                    message: "failed to initialize blocking proxy from http_proxy URI".to_owned(),
+                }
+            })?;
 
             Some(make_agent(
                 self.tls_backend,

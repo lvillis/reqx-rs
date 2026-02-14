@@ -2427,7 +2427,7 @@ fn blocking_proxy_authorization_requires_proxy_uri_credentials_for_http_proxy() 
         .expect_err("http proxy auth should require proxy URI credentials in blocking mode");
 
     match error {
-        Error::TlsConfig { message, .. } => {
+        Error::InvalidProxyConfig { message, .. } => {
             assert!(message.contains("proxy_authorization"));
             assert!(message.contains("http_proxy URI"));
         }
@@ -2490,7 +2490,7 @@ fn blocking_https_proxy_authorization_requires_proxy_uri_credentials() {
         .expect_err("https proxy auth should require proxy URI credentials in blocking mode");
 
     match error {
-        Error::TlsConfig { message, .. } => {
+        Error::InvalidProxyConfig { message, .. } => {
             assert!(message.contains("proxy_authorization"));
             assert!(message.contains("http_proxy URI"));
         }

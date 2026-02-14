@@ -323,6 +323,7 @@ impl Client {
         headers: &HeaderMap,
         host: Option<&str>,
         fallback_delay: Duration,
+        max_retry_delay: Duration,
     ) {
         if status != http::StatusCode::TOO_MANY_REQUESTS {
             return;
@@ -330,7 +331,12 @@ impl Client {
         let Some(rate_limiter) = &self.rate_limiter else {
             return;
         };
-        let throttle_delay = status_retry_delay(self.clock.as_ref(), headers, fallback_delay);
+        let throttle_delay = status_retry_delay(
+            self.clock.as_ref(),
+            headers,
+            fallback_delay,
+            max_retry_delay,
+        );
         rate_limiter.observe_server_throttle(
             host,
             throttle_delay,
@@ -410,6 +416,7 @@ impl Client {
             fallback_delay: self
                 .backoff_source
                 .backoff_for_retry(retry_policy, *attempt),
+            max_delay: retry_policy.configured_max_backoff(),
         });
         self.schedule_retry(
             RetryScheduleContext {
@@ -714,8 +721,8 @@ impl Client {
             return Ok(());
         }
 
-        Err(Error::TlsConfig {
-            backend: self.tls_backend.as_str(),
+        Err(Error::InvalidProxyConfig {
+            proxy_uri: redact_uri_for_logs(&proxy_config.uri.to_string()),
             message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
         })
     }
@@ -1185,6 +1192,7 @@ impl Client {
                     rate_limit_host.as_deref(),
                     self.backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
+                    retry_policy.configured_max_backoff(),
                 );
                 observed_server_throttle = true;
                 evaluated_status_retry = true;
@@ -1264,6 +1272,7 @@ impl Client {
                         rate_limit_host.as_deref(),
                         self.backoff_source
                             .backoff_for_retry(&retry_policy, attempt),
+                        retry_policy.configured_max_backoff(),
                     );
                 }
                 if !evaluated_status_retry {

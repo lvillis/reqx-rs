@@ -85,7 +85,7 @@ use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
     parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    total_timeout_deadline, total_timeout_expired, validate_base_url,
+    total_timeout_deadline, total_timeout_expired, validate_base_url, validate_http_proxy_uri,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -782,6 +782,9 @@ impl AdaptiveConcurrencyController {
 
     async fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
         loop {
+            // Register interest before checking capacity to avoid missed wakeups
+            // between `try_acquire` and awaiting the notifier.
+            let notified = self.notify.notified();
             {
                 let mut state = lock_unpoisoned(&self.state);
                 if state.try_acquire() {
@@ -792,7 +795,7 @@ impl AdaptiveConcurrencyController {
                     };
                 }
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 
@@ -824,6 +827,39 @@ impl Drop for AdaptiveConcurrencyPermit {
                 .release_and_record(false, self.started_at.elapsed());
             self.completed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy};
+
+    #[tokio::test]
+    async fn adaptive_controller_unblocks_waiter_after_release() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(1)
+            .initial_limit(1)
+            .max_limit(1);
+        let controller = Arc::new(AdaptiveConcurrencyController::new(policy));
+
+        let first_permit = controller.acquire().await;
+        let waiter = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(300), controller.acquire())
+                    .await
+                    .is_ok()
+            })
+        };
+
+        tokio::task::yield_now().await;
+        drop(first_permit);
+
+        let completed = waiter.await.expect("waiter task should join");
+        assert!(completed, "waiter should acquire after permit release");
     }
 }
 
@@ -1315,6 +1351,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
+        if let Some(proxy_uri) = self.http_proxy.as_ref() {
+            validate_http_proxy_uri(proxy_uri)?;
+        }
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
         }
@@ -1641,6 +1680,7 @@ impl Client {
         headers: &HeaderMap,
         host: Option<&str>,
         fallback_delay: Duration,
+        max_retry_delay: Duration,
     ) {
         if status != http::StatusCode::TOO_MANY_REQUESTS {
             return;
@@ -1648,7 +1688,12 @@ impl Client {
         let Some(rate_limiter) = &self.rate_limiter else {
             return;
         };
-        let throttle_delay = status_retry_delay(self.clock.as_ref(), headers, fallback_delay);
+        let throttle_delay = status_retry_delay(
+            self.clock.as_ref(),
+            headers,
+            fallback_delay,
+            max_retry_delay,
+        );
         rate_limiter.observe_server_throttle(
             host,
             throttle_delay,
@@ -1772,6 +1817,7 @@ impl Client {
             fallback_delay: self
                 .backoff_source
                 .backoff_for_retry(retry_policy, *attempt),
+            max_delay: retry_policy.configured_max_backoff(),
         });
         let retry_error = status_retry_error(status, method, redacted_uri, headers);
         self.schedule_retry(
@@ -2542,6 +2588,7 @@ impl Client {
                     rate_limit_host.as_deref(),
                     self.backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
+                    retry_policy.configured_max_backoff(),
                 );
                 observed_server_throttle = true;
 
@@ -2637,6 +2684,7 @@ impl Client {
                         rate_limit_host.as_deref(),
                         self.backoff_source
                             .backoff_for_retry(&retry_policy, attempt),
+                        retry_policy.configured_max_backoff(),
                     );
                 }
                 if !evaluated_status_retry {

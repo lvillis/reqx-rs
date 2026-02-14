@@ -9,7 +9,8 @@ use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limite
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
-use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer};
+use crate::execution::status_retry_delay;
+use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
@@ -522,6 +523,42 @@ fn parse_retry_after_header_http_date() {
 }
 
 #[test]
+fn status_retry_delay_caps_retry_after_to_max_delay() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("120"),
+    );
+
+    let clock = SystemClock;
+    let delay = status_retry_delay(
+        &clock,
+        &headers,
+        Duration::from_millis(200),
+        Duration::from_secs(45),
+    );
+    assert_eq!(delay, Duration::from_secs(45));
+}
+
+#[test]
+fn status_retry_delay_uses_default_cap_when_configured_cap_is_too_small() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("120"),
+    );
+
+    let clock = SystemClock;
+    let delay = status_retry_delay(
+        &clock,
+        &headers,
+        Duration::from_millis(200),
+        Duration::from_secs(2),
+    );
+    assert_eq!(delay, Duration::from_secs(30));
+}
+
+#[test]
 fn bounded_retry_delay_respects_total_timeout() {
     let start = std::time::Instant::now();
     let retry_delay = Duration::from_millis(100);
@@ -582,7 +619,7 @@ fn error_safe_request_accessors_return_method_uri_and_path() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 27);
+    assert_eq!(codes.len(), 28);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -590,6 +627,7 @@ fn error_code_contract_table_is_stable() {
         vec![
             "invalid_uri",
             "invalid_no_proxy_rule",
+            "invalid_proxy_config",
             "invalid_adaptive_concurrency_policy",
             "serialize_json",
             "serialize_query",
@@ -630,6 +668,16 @@ fn error_code_maps_tls_config_variant() {
     };
     assert_eq!(error.code(), ErrorCode::TlsConfig);
     assert_eq!(error.code().as_str(), "tls_config");
+}
+
+#[test]
+fn error_code_maps_invalid_proxy_config_variant() {
+    let error = Error::InvalidProxyConfig {
+        proxy_uri: "http://proxy.example.com:8080".to_owned(),
+        message: "bad proxy configuration".to_owned(),
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidProxyConfig);
+    assert_eq!(error.code().as_str(), "invalid_proxy_config");
 }
 
 #[test]
@@ -716,6 +764,27 @@ fn build_rejects_non_http_base_url_scheme() {
     match error {
         Error::InvalidUri { uri } => {
             assert_eq!(uri, "ftp://api.example.com/");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_non_http_proxy_scheme() {
+    let proxy_uri: http::Uri = "https://proxy.example.com:8443"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("non-http proxy scheme should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "https://proxy.example.com:8443/");
+            assert!(message.contains("http scheme"));
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -1057,6 +1126,28 @@ fn blocking_no_proxy_records_invalid_rule_and_build_fails() {
         Err(error) => error,
     };
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_build_rejects_non_http_proxy_scheme() {
+    let proxy_uri: http::Uri = "https://proxy.example.com:8443"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("non-http proxy scheme should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "https://proxy.example.com:8443/");
+            assert!(message.contains("http scheme"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
