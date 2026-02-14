@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::util::lock_unpoisoned;
@@ -216,7 +217,8 @@ pub(crate) struct RateLimiter {
     global: Option<Mutex<TokenBucket>>,
     per_host_policy: Option<RateLimitPolicy>,
     per_host: Mutex<BTreeMap<String, PerHostRateLimitEntry>>,
-    per_host_last_cleanup_at: Mutex<Instant>,
+    per_host_cleanup_origin: Instant,
+    per_host_last_cleanup_ms: AtomicU64,
 }
 
 impl RateLimiter {
@@ -233,7 +235,8 @@ impl RateLimiter {
             global: global_policy.map(|policy| Mutex::new(TokenBucket::new(policy, now))),
             per_host_policy: per_host_policy.map(RateLimitPolicy::normalize),
             per_host: Mutex::new(BTreeMap::new()),
-            per_host_last_cleanup_at: Mutex::new(now),
+            per_host_cleanup_origin: now,
+            per_host_last_cleanup_ms: AtomicU64::new(0),
         })
     }
 
@@ -373,19 +376,41 @@ impl RateLimiter {
         entries: &mut BTreeMap<String, PerHostRateLimitEntry>,
         now: Instant,
     ) {
+        let now_ms = now
+            .saturating_duration_since(self.per_host_cleanup_origin)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
         if entries.len() > PER_HOST_RATE_LIMIT_MAX_ENTRIES {
             cleanup_stale_per_host_rate_limits(entries, now);
-            *lock_unpoisoned(&self.per_host_last_cleanup_at) = now;
+            self.per_host_last_cleanup_ms
+                .store(now_ms, Ordering::Relaxed);
             return;
         }
 
-        let mut last_cleanup_at = lock_unpoisoned(&self.per_host_last_cleanup_at);
-        if now.saturating_duration_since(*last_cleanup_at) < PER_HOST_RATE_LIMIT_CLEANUP_INTERVAL {
-            return;
+        let cleanup_interval_ms = PER_HOST_RATE_LIMIT_CLEANUP_INTERVAL
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+
+        loop {
+            let last_cleanup_ms = self.per_host_last_cleanup_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_cleanup_ms) < cleanup_interval_ms {
+                return;
+            }
+            if self
+                .per_host_last_cleanup_ms
+                .compare_exchange(
+                    last_cleanup_ms,
+                    now_ms,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
         }
 
         cleanup_stale_per_host_rate_limits(entries, now);
-        *last_cleanup_at = now;
     }
 
     fn resolve_server_throttle_scope(

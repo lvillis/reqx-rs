@@ -14,6 +14,8 @@ use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
+#[cfg(feature = "_async")]
+use crate::util::classify_transport_error_text_for_test;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
@@ -189,13 +191,13 @@ fn standard_otel_path_normalizer_truncates_on_segment_boundary() {
 }
 
 #[test]
-fn redact_uri_for_logs_keeps_path_but_removes_query() {
+fn redact_uri_for_logs_masks_credential_like_path_segments_and_removes_query() {
     let redacted = redact_uri_for_logs(
         "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates?offset=10",
     );
     assert_eq!(
         redacted,
-        "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates"
+        "https://api.telegram.org/bot123456:redacted/getUpdates"
     );
 }
 
@@ -342,6 +344,34 @@ fn retry_policy_standard_skips_tls_and_other_transport_errors() {
 
     assert!(!retry_policy.should_retry_decision(&tls_decision));
     assert!(!retry_policy.should_retry_decision(&other_decision));
+}
+
+#[test]
+fn classify_transport_error_text_detects_dns_tls_and_connect() {
+    assert_eq!(
+        classify_transport_error_text_for_test("failed to lookup address", true),
+        TransportErrorKind::Dns
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test("tls handshake eof", true),
+        TransportErrorKind::Tls
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test("connection refused", true),
+        TransportErrorKind::Connect
+    );
+}
+
+#[test]
+fn classify_transport_error_text_avoids_over_broad_read_matches() {
+    assert_eq!(
+        classify_transport_error_text_for_test("request already sent", false),
+        TransportErrorKind::Other
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test("connection reset by peer", false),
+        TransportErrorKind::Read
+    );
 }
 
 #[test]

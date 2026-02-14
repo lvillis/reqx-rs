@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">reqx transport banner</title>
+  <desc id="desc">Adaptive theme banner for reqx: SDK request flow, retry core, and TLS transport.</desc>
+  <style>
+    :root {
+      --bg-start: #f8fbff;
+      --bg-end: #edf4ff;
+      --flow-start: #1d4ed8;
+      --flow-end: #0891b2;
+      --shield-start: #67e8f9;
+      --shield-end: #0ea5e9;
+      --grid-stroke: #d7e2f4;
+      --arrow-fill: #0284c7;
+      --title-color: #0f172a;
+      --subtitle-color: #0c4a6e;
+      --panel-fill: #ffffff;
+      --panel-sdk-stroke: #3b82f6;
+      --panel-retry-stroke: #d97706;
+      --panel-tls-stroke: #0ea5e9;
+      --sdk-title: #1e3a8a;
+      --body-text: #475569;
+      --retry-ring-outer: #f59e0b;
+      --retry-ring-inner: #d97706;
+      --retry-arrow: #b45309;
+      --retry-title: #92400e;
+      --retry-subtitle: #a16207;
+      --tls-divider: #bae6fd;
+      --tls-title: #0c4a6e;
+      --shield-frame-fill: #dff3ff;
+      --shield-frame-stroke: #0284c7;
+      --shield-lock-body: #f8fafc;
+      --shield-lock-stroke: #075985;
+      --footer: #1d4ed8;
+      --grid-opacity: 0.52;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-start: #08101c;
+        --bg-end: #13263b;
+        --flow-start: #60a5fa;
+        --flow-end: #22d3ee;
+        --grid-stroke: #21344e;
+        --arrow-fill: #38bdf8;
+        --title-color: #e2e8f0;
+        --subtitle-color: #7dd3fc;
+        --panel-fill: #0f1e31;
+        --panel-sdk-stroke: #3b82f6;
+        --panel-retry-stroke: #f59e0b;
+        --panel-tls-stroke: #22d3ee;
+        --sdk-title: #bfdbfe;
+        --body-text: #94a3b8;
+        --retry-ring-outer: #f59e0b;
+        --retry-ring-inner: #f59e0b;
+        --retry-arrow: #f59e0b;
+        --retry-title: #fde68a;
+        --retry-subtitle: #fcd34d;
+        --tls-divider: #164e63;
+        --tls-title: #a5f3fc;
+        --shield-frame-fill: #0a304b;
+        --shield-frame-stroke: #22d3ee;
+        --shield-lock-body: #e0f2fe;
+        --shield-lock-stroke: #0369a1;
+        --footer: #93c5fd;
+        --grid-opacity: 0.34;
+      }
+    }
+  </style>
+
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--bg-start)"/>
+      <stop offset="100%" stop-color="var(--bg-end)"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="var(--flow-start)"/>
+      <stop offset="100%" stop-color="var(--flow-end)"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--shield-start)"/>
+      <stop offset="100%" stop-color="var(--shield-end)"/>
+    </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0 L0 0 0 28" fill="none" stroke="var(--grid-stroke)" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="24" markerHeight="24" refX="21" refY="12" orient="auto">
+      <path d="M0 0 L24 12 L0 24 Z" fill="var(--arrow-fill)"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="360" fill="url(#bg)"/>
+  <rect width="1200" height="360" fill="url(#grid)" opacity="var(--grid-opacity)"/>
+
+  <text x="56" y="74" fill="var(--title-color)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="54" font-weight="700">reqx</text>
+  <text x="236" y="74" fill="var(--subtitle-color)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="26" font-weight="500">Resilient HTTP Transport for Rust SDKs</text>
+
+  <rect x="56" y="108" width="320" height="184" rx="20" fill="var(--panel-fill)" stroke="var(--panel-sdk-stroke)" stroke-width="2"/>
+  <text x="86" y="154" fill="var(--sdk-title)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="30" font-weight="650">SDK Request</text>
+  <text x="86" y="188" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Builder + Defaults</text>
+  <text x="86" y="216" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Headers / Query / Body</text>
+  <text x="86" y="244" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="18">Structured Error Codes</text>
+
+  <line x1="388" y1="200" x2="436" y2="200" stroke="url(#flow)" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <rect x="448" y="108" width="304" height="184" rx="20" fill="var(--panel-fill)" stroke="var(--panel-retry-stroke)" stroke-width="2"/>
+  <circle cx="600" cy="180" r="62" fill="var(--panel-fill)" stroke="var(--retry-ring-outer)" stroke-width="3"/>
+  <circle cx="600" cy="180" r="44" fill="none" stroke="var(--retry-ring-inner)" stroke-width="4.5" stroke-dasharray="96 16" transform="rotate(-18 600 180)"/>
+  <path d="M638 160 L652 180 L624 182 Z" fill="var(--retry-arrow)"/>
+  <text x="600" y="187" text-anchor="middle" fill="var(--retry-title)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="22" font-weight="700">Retry Core</text>
+  <text x="600" y="252" text-anchor="middle" fill="var(--retry-subtitle)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="15">adaptive backoff</text>
+  <text x="600" y="272" text-anchor="middle" fill="var(--retry-subtitle)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="15">timeout-aware + idempotency-safe</text>
+
+  <line x1="764" y1="200" x2="812" y2="200" stroke="url(#flow)" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <rect x="824" y="108" width="320" height="184" rx="20" fill="var(--panel-fill)" stroke="var(--panel-tls-stroke)" stroke-width="2"/>
+  <line x1="1038" y1="124" x2="1038" y2="276" stroke="var(--tls-divider)" stroke-width="2"/>
+  <text x="848" y="154" fill="var(--tls-title)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="30" font-weight="650">TLS Transport</text>
+  <text x="848" y="188" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">rustls / native-tls</text>
+  <text x="848" y="216" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Custom root CA support</text>
+  <text x="848" y="244" fill="var(--body-text)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Proxy + no_proxy + metrics</text>
+
+  <g>
+    <path d="M1090 130 L1122 142 V198 C1122 224 1109 246 1090 259 C1071 246 1058 224 1058 198 V142 Z" fill="var(--shield-frame-fill)" stroke="var(--shield-frame-stroke)" stroke-width="2.2" stroke-linejoin="round"/>
+    <path d="M1090 140 L1114 149 V197 C1114 217 1104 234 1090 244 C1076 234 1066 217 1066 197 V149 Z" fill="url(#shield)"/>
+    <rect x="1078" y="184" width="24" height="24" rx="6" ry="6" fill="var(--shield-lock-body)"/>
+    <path d="M1083 184 V176 C1083 167 1086 160 1090 160 C1094 160 1097 167 1097 176 V184" fill="none" stroke="var(--shield-lock-stroke)" stroke-width="3.6" stroke-linecap="round"/>
+    <circle cx="1090" cy="196" r="3" fill="var(--shield-lock-stroke)"/>
+    <path d="M1090 199 V203" fill="none" stroke="var(--shield-lock-stroke)" stroke-width="2.4" stroke-linecap="round"/>
+  </g>
+
+  <text x="56" y="336" fill="var(--footer)" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="17">Built for SDK transport concerns: retries, deadlines, proxy behavior, and stable error semantics.</text>
+</svg>

@@ -132,6 +132,62 @@ fn redact_non_authority_credentials(uri_text: &str) -> String {
     format!("{scheme}:<redacted>@{suffix}")
 }
 
+fn is_token_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~' | '+' | '=')
+}
+
+fn is_token_like(segment: &str) -> bool {
+    !segment.is_empty() && segment.chars().all(is_token_char)
+}
+
+fn split_credential_like_segment(segment: &str) -> Option<(&str, &str)> {
+    let (left, right) = segment.split_once(':')?;
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    if left.len() < 3 || right.len() < 6 {
+        return None;
+    }
+    if !is_token_like(left) || !is_token_like(right) {
+        return None;
+    }
+    Some((left, right))
+}
+
+fn redact_sensitive_path_segments(parsed: &mut url::Url) {
+    let Some(mut path_segments) = parsed
+        .path_segments()
+        .map(|segments| segments.map(ToOwned::to_owned).collect::<Vec<_>>())
+    else {
+        return;
+    };
+    if path_segments.is_empty() {
+        return;
+    }
+
+    let mut redacted = false;
+    for segment in &mut path_segments {
+        if let Some((left, _)) = split_credential_like_segment(segment) {
+            *segment = format!("{left}:redacted");
+            redacted = true;
+        }
+    }
+    if !redacted {
+        return;
+    }
+
+    let has_trailing_slash = parsed.path().ends_with('/');
+    let mut rebuilt_path = String::new();
+    for segment in &path_segments {
+        rebuilt_path.push('/');
+        rebuilt_path.push_str(segment);
+    }
+    if rebuilt_path.is_empty() || (has_trailing_slash && !rebuilt_path.ends_with('/')) {
+        rebuilt_path.push('/');
+    }
+    parsed.set_path(&rebuilt_path);
+}
+
 pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(uri_text) else {
         let stripped = strip_query_and_fragment(uri_text);
@@ -143,6 +199,7 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     let _ = parsed.set_password(None);
     parsed.set_query(None);
     parsed.set_fragment(None);
+    redact_sensitive_path_segments(&mut parsed);
 
     let serialized = parsed.to_string();
     let authority_redacted = redact_userinfo_in_authority(&serialized);
@@ -276,22 +333,35 @@ fn build_query_string(existing: &[(String, String)], appended: &[(String, String
 pub(crate) fn classify_transport_error(
     error: &hyper_util::client::legacy::Error,
 ) -> TransportErrorKind {
+    let mut text = error.to_string().to_ascii_lowercase();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push(' ');
+        text.push_str(&cause.to_string().to_ascii_lowercase());
+        source = cause.source();
+    }
+    classify_transport_error_text(&text, error.is_connect())
+}
+
+#[cfg(feature = "_async")]
+fn classify_transport_error_text(text: &str, is_connect_path: bool) -> TransportErrorKind {
     const DNS_MARKERS: &[&str] = &[
-        "dns",
         "name or service not known",
         "failed to lookup address",
         "no such host",
         "temporary failure in name resolution",
         "nodename nor servname provided",
+        "dns lookup failed",
     ];
     const TLS_MARKERS: &[&str] = &[
-        "tls",
-        "ssl",
-        "certificate",
+        "tls handshake",
+        "certificate verify",
+        "certificate unknown",
+        "invalid certificate",
+        "self signed certificate",
         "x509",
-        "handshake",
         "pkix",
-        "peer cert",
+        "peer certificate",
     ];
     const CONNECT_MARKERS: &[&str] = &[
         "connection refused",
@@ -301,38 +371,41 @@ pub(crate) fn classify_transport_error(
         "host unreachable",
         "connect error",
         "proxy connect",
+        "timed out while connecting",
+        "connection timeout",
+        "connect timeout",
     ];
     const READ_MARKERS: &[&str] = &[
-        "read",
         "connection reset",
         "broken pipe",
         "unexpected eof",
         "incomplete message",
+        "connection closed before message completed",
+        "body write aborted",
     ];
 
-    let mut text = error.to_string().to_ascii_lowercase();
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        text.push(' ');
-        text.push_str(&cause.to_string().to_ascii_lowercase());
-        source = cause.source();
-    }
-
-    if contains_marker(&text, DNS_MARKERS) {
+    if contains_marker(text, DNS_MARKERS) || contains_word(text, "dns") {
         return TransportErrorKind::Dns;
     }
-    if contains_marker(&text, TLS_MARKERS) {
+    if contains_marker(text, TLS_MARKERS)
+        || contains_word(text, "tls")
+        || contains_word(text, "ssl")
+        || contains_word(text, "certificate")
+    {
         return TransportErrorKind::Tls;
     }
-    if contains_marker(&text, READ_MARKERS) {
-        return TransportErrorKind::Read;
-    }
-    if contains_marker(&text, CONNECT_MARKERS) {
+    if contains_marker(text, CONNECT_MARKERS) {
         return TransportErrorKind::Connect;
     }
-    if error.is_connect() {
-        // Keep unknown connect-path failures conservative to avoid retrying
-        // configuration or handshake-class errors by mistake.
+    if contains_marker(text, READ_MARKERS) {
+        return TransportErrorKind::Read;
+    }
+    if is_connect_path && contains_marker(text, &["timed out", "timeout"]) {
+        return TransportErrorKind::Connect;
+    }
+    if is_connect_path {
+        // Unknown connect-path failures stay conservative to avoid retrying
+        // configuration, policy, or handshake-class problems by mistake.
         return TransportErrorKind::Other;
     }
     TransportErrorKind::Other
@@ -341,6 +414,20 @@ pub(crate) fn classify_transport_error(
 #[cfg(feature = "_async")]
 fn contains_marker(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| text.contains(marker))
+}
+
+#[cfg(feature = "_async")]
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+#[cfg(all(test, feature = "_async"))]
+pub(crate) fn classify_transport_error_text_for_test(
+    text: &str,
+    is_connect_path: bool,
+) -> TransportErrorKind {
+    classify_transport_error_text(text, is_connect_path)
 }
 
 pub(crate) fn join_base_path(base_url: &str, path: &str) -> String {

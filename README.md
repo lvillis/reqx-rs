@@ -5,11 +5,7 @@
 [![CI](https://github.com/lvillis/reqx-rs/actions/workflows/ci.yaml/badge.svg)](https://github.com/lvillis/reqx-rs/actions/workflows/ci.yaml)
 [![license](https://img.shields.io/crates/l/reqx.svg)](LICENSE)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/reqx-banner-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/reqx-banner-light.svg">
-  <img alt="reqx transport banner" src="assets/reqx-banner-light.svg">
-</picture>
+![reqx transport banner](assets/reqx-banner.svg)
 
 `reqx` is an HTTP transport client for Rust API SDK libraries.
 
