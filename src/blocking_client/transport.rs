@@ -154,7 +154,11 @@ fn build_sync_tls_config(
     }
 
     match tls_options.root_store {
-        TlsRootStore::BackendDefault => {}
+        TlsRootStore::BackendDefault => {
+            if matches!(backend, TlsBackend::RustlsRing | TlsBackend::RustlsAwsLcRs) {
+                tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+            }
+        }
         TlsRootStore::WebPki => {
             tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
         }

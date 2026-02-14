@@ -367,6 +367,7 @@ mod stream {
         where
             W: AsyncWrite + Unpin + Send + ?Sized,
         {
+            // Stream raw wire bytes (content-encoding is not decoded on this path).
             let mut copied = 0_u64;
 
             while let Some(frame) = self.next_frame_with_timeout().await? {
@@ -394,6 +395,7 @@ mod stream {
         where
             W: AsyncWrite + Unpin + Send + ?Sized,
         {
+            // Stream raw wire bytes with a hard byte cap.
             let max_bytes = max_bytes.max(1);
             let mut copied = 0_u64;
 
@@ -789,6 +791,7 @@ mod blocking_stream {
         where
             W: Write + ?Sized,
         {
+            // Stream raw wire bytes (content-encoding is not decoded on this path).
             let mut chunk = [0_u8; 8192];
             let mut copied = 0_u64;
             loop {
@@ -817,6 +820,7 @@ mod blocking_stream {
         where
             W: Write + ?Sized,
         {
+            // Stream raw wire bytes with a hard byte cap.
             let max_bytes = max_bytes.max(1);
             let mut chunk = [0_u8; 8192];
             let mut copied = 0_u64;

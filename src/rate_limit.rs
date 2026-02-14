@@ -352,7 +352,7 @@ impl RateLimiter {
             applied = true;
         }
 
-        if !applied {
+        if !applied && matches!(configured_scope, ServerThrottleScope::Auto) {
             if let (Some(policy), Some(host)) = (self.per_host_policy, host_key) {
                 let mut per_host = lock_unpoisoned(&self.per_host);
                 self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
@@ -591,5 +591,51 @@ mod tests {
             server_throttle_scope_from_headers(&headers),
             Some(ServerThrottleScope::Global)
         );
+    }
+
+    #[test]
+    fn explicit_host_scope_does_not_fallback_to_global_bucket() {
+        let limiter = RateLimiter::new(
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+            None,
+        )
+        .expect("limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api.example.com"),
+            std::time::Duration::from_millis(120),
+            ServerThrottleScope::Host,
+            None,
+        );
+
+        let global_wait = limiter.acquire_delay(None);
+        assert!(global_wait <= std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn explicit_global_scope_does_not_fallback_to_host_bucket() {
+        let limiter = RateLimiter::new(
+            None,
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+        )
+        .expect("limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api.example.com"),
+            std::time::Duration::from_millis(120),
+            ServerThrottleScope::Global,
+            None,
+        );
+
+        let host_wait = limiter.acquire_delay(Some("api.example.com"));
+        assert!(host_wait <= std::time::Duration::from_millis(20));
     }
 }
