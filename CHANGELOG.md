@@ -1,8 +1,20 @@
+## [0.1.20] - 2026-02-14
+
+### 🐛 Bug Fixes
+
+- Harden retry/transport semantics and unify safe URI accessors
+- Harden URI redaction, transport error classification, and rate limiter cleanup path
+- Harden blocking proxy auth and unify terminal failure handling
+- Harden adaptive concurrency, proxy validation, and retry-after capping
 ## [0.1.19] - 2026-02-13
 
 ### 🐛 Bug Fixes
 
 - Harden redirect semantics and remove internal panic paths
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.19
 ## [0.1.18] - 2026-02-13
 
 ### 🐛 Bug Fixes
