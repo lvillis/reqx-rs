@@ -681,6 +681,13 @@ fn error_code_maps_invalid_proxy_config_variant() {
 }
 
 #[test]
+fn error_code_maps_proxy_authorization_requires_http_proxy_variant() {
+    let error = Error::ProxyAuthorizationRequiresHttpProxy;
+    assert_eq!(error.code(), ErrorCode::InvalidProxyConfig);
+    assert_eq!(error.code().as_str(), "invalid_proxy_config");
+}
+
+#[test]
 fn error_code_maps_invalid_adaptive_concurrency_policy_variant() {
     let error = Error::InvalidAdaptiveConcurrencyPolicy {
         min_limit: 10,
@@ -786,6 +793,22 @@ fn build_rejects_non_http_proxy_scheme() {
             assert_eq!(proxy_uri, "https://proxy.example.com:8443/");
             assert!(message.contains("http scheme"));
         }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_proxy_authorization_without_http_proxy() {
+    let result = Client::builder("https://api.example.com")
+        .try_proxy_authorization("Basic dXNlcjpwYXNz")
+        .expect("proxy authorization header should parse")
+        .build();
+    let error = match result {
+        Ok(_) => panic!("proxy authorization without http_proxy should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::ProxyAuthorizationRequiresHttpProxy => {}
         other => panic!("unexpected error: {other}"),
     }
 }

@@ -1354,6 +1354,9 @@ impl ClientBuilder {
         if let Some(proxy_uri) = self.http_proxy.as_ref() {
             validate_http_proxy_uri(proxy_uri)?;
         }
+        if self.proxy_authorization.is_some() && self.http_proxy.is_none() {
+            return Err(Error::ProxyAuthorizationRequiresHttpProxy);
+        }
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
         }

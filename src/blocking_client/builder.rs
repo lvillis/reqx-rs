@@ -475,10 +475,7 @@ impl ClientBuilder {
         }
         if self.proxy_authorization.is_some() {
             let Some(proxy_uri) = self.http_proxy.as_ref() else {
-                return Err(Error::InvalidProxyConfig {
-                    proxy_uri: "<not-configured>".to_owned(),
-                    message: "blocking proxy_authorization(...) requires http_proxy URI credentials (e.g. http://user:pass@proxy:port)".to_owned(),
-                });
+                return Err(Error::ProxyAuthorizationRequiresHttpProxy);
             };
             let proxy_uri_has_credentials = proxy_uri
                 .authority()

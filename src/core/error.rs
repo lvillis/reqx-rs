@@ -153,6 +153,8 @@ pub enum Error {
     InvalidNoProxyRule { rule: String },
     #[error("invalid proxy configuration for {proxy_uri}: {message}")]
     InvalidProxyConfig { proxy_uri: String, message: String },
+    #[error("proxy_authorization requires http_proxy to be configured")]
+    ProxyAuthorizationRequiresHttpProxy,
     #[error(
         "invalid adaptive concurrency policy (min={min_limit}, initial={initial_limit}, max={max_limit}): {message}"
     )]
@@ -309,7 +311,9 @@ impl Error {
         match self {
             Self::InvalidUri { .. } => ErrorCode::InvalidUri,
             Self::InvalidNoProxyRule { .. } => ErrorCode::InvalidNoProxyRule,
-            Self::InvalidProxyConfig { .. } => ErrorCode::InvalidProxyConfig,
+            Self::InvalidProxyConfig { .. } | Self::ProxyAuthorizationRequiresHttpProxy => {
+                ErrorCode::InvalidProxyConfig
+            }
             Self::InvalidAdaptiveConcurrencyPolicy { .. } => {
                 ErrorCode::InvalidAdaptiveConcurrencyPolicy
             }

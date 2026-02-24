@@ -2447,10 +2447,7 @@ fn blocking_proxy_authorization_without_http_proxy_is_rejected_at_build() {
     };
 
     match error {
-        Error::InvalidProxyConfig { message, .. } => {
-            assert!(message.contains("proxy_authorization"));
-            assert!(message.contains("http_proxy URI"));
-        }
+        Error::ProxyAuthorizationRequiresHttpProxy => {}
         other => panic!("unexpected error: {other}"),
     }
 }
