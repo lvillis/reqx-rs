@@ -212,8 +212,9 @@ pub(crate) fn status_retry_delay(
     fallback: Duration,
     max_delay: Duration,
 ) -> Duration {
-    const DEFAULT_RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
-    let retry_after_cap = max_delay.max(DEFAULT_RETRY_AFTER_CAP).max(fallback);
+    // Keep Retry-After and fallback aligned with the configured retry delay ceiling.
+    let retry_after_cap = max_delay.max(Duration::from_millis(1));
+    let fallback = fallback.min(retry_after_cap);
     parse_retry_after_capped(headers, clock.now_system(), retry_after_cap).unwrap_or(fallback)
 }
 
@@ -379,4 +380,43 @@ pub(crate) fn apply_redirect_transition(
         *max_attempts = retry_policy.configured_max_attempts();
     }
     method_changed_to_get
+}
+
+#[cfg(test)]
+mod tests {
+    use http::HeaderMap;
+    use http::header::{HeaderName, HeaderValue};
+
+    use super::status_retry_delay;
+    use crate::extensions::SystemClock;
+
+    #[test]
+    fn status_retry_delay_caps_retry_after_to_max_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("120"),
+        );
+
+        let delay = status_retry_delay(
+            &SystemClock,
+            &headers,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(250),
+        );
+
+        assert_eq!(delay, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn status_retry_delay_fallback_is_clamped_to_max_delay() {
+        let delay = status_retry_delay(
+            &SystemClock,
+            &HeaderMap::new(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(delay, std::time::Duration::from_secs(1));
+    }
 }

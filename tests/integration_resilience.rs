@@ -1265,7 +1265,7 @@ async fn total_timeout_interrupts_retry_loop_with_retry_after() {
             RetryPolicy::standard()
                 .max_attempts(3)
                 .base_backoff(Duration::from_millis(1))
-                .max_backoff(Duration::from_millis(3))
+                .max_backoff(Duration::from_secs(2))
                 .jitter_ratio(0.0),
         )
         .build()

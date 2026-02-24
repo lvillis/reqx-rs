@@ -473,6 +473,23 @@ impl ClientBuilder {
         if let Some(proxy_uri) = self.http_proxy.as_ref() {
             validate_http_proxy_uri(proxy_uri)?;
         }
+        if self.proxy_authorization.is_some() {
+            let Some(proxy_uri) = self.http_proxy.as_ref() else {
+                return Err(Error::InvalidProxyConfig {
+                    proxy_uri: "<not-configured>".to_owned(),
+                    message: "blocking proxy_authorization(...) requires http_proxy URI credentials (e.g. http://user:pass@proxy:port)".to_owned(),
+                });
+            };
+            let proxy_uri_has_credentials = proxy_uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'));
+            if !proxy_uri_has_credentials {
+                return Err(Error::InvalidProxyConfig {
+                    proxy_uri: redact_uri_for_logs(&proxy_uri.to_string()),
+                    message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
+                });
+            }
+        }
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
         }

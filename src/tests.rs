@@ -541,7 +541,7 @@ fn status_retry_delay_caps_retry_after_to_max_delay() {
 }
 
 #[test]
-fn status_retry_delay_uses_default_cap_when_configured_cap_is_too_small() {
+fn status_retry_delay_uses_configured_cap_when_small() {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::RETRY_AFTER,
@@ -555,7 +555,7 @@ fn status_retry_delay_uses_default_cap_when_configured_cap_is_too_small() {
         Duration::from_millis(200),
         Duration::from_secs(2),
     );
-    assert_eq!(delay, Duration::from_secs(30));
+    assert_eq!(delay, Duration::from_secs(2));
 }
 
 #[test]

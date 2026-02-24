@@ -2412,19 +2412,39 @@ fn blocking_redirect_policy_none_returns_http_status_error_without_following() {
 fn blocking_proxy_authorization_requires_proxy_uri_credentials_for_http_proxy() {
     let proxy_uri: Uri = "http://127.0.0.1:1".parse().expect("parse proxy uri");
 
-    let client = Client::builder("http://example.com")
+    let build_result = Client::builder("http://example.com")
         .http_proxy(proxy_uri)
         .try_proxy_authorization("Basic dXNlcjpwYXNz")
         .expect("valid proxy authorization header")
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
-        .build()
-        .expect("client should build");
+        .build();
+    let error = match build_result {
+        Ok(_) => panic!("http proxy auth should fail at build time in blocking mode"),
+        Err(error) => error,
+    };
 
-    let error = client
-        .get("/v1/proxy-auth")
-        .send()
-        .expect_err("http proxy auth should require proxy URI credentials in blocking mode");
+    match error {
+        Error::InvalidProxyConfig { message, .. } => {
+            assert!(message.contains("proxy_authorization"));
+            assert!(message.contains("http_proxy URI"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_proxy_authorization_without_http_proxy_is_rejected_at_build() {
+    let build_result = Client::builder("http://example.com")
+        .try_proxy_authorization("Basic dXNlcjpwYXNz")
+        .expect("valid proxy authorization header")
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+    let error = match build_result {
+        Ok(_) => panic!("proxy authorization without http_proxy should fail at build time"),
+        Err(error) => error,
+    };
 
     match error {
         Error::InvalidProxyConfig { message, .. } => {
@@ -2475,19 +2495,17 @@ fn blocking_no_proxy_bypasses_http_proxy() {
 fn blocking_https_proxy_authorization_requires_proxy_uri_credentials() {
     let proxy_uri: Uri = "http://127.0.0.1:1".parse().expect("parse proxy uri");
 
-    let client = Client::builder("https://example.com")
+    let build_result = Client::builder("https://example.com")
         .http_proxy(proxy_uri)
         .try_proxy_authorization("Basic dXNlcjpwYXNz")
         .expect("valid proxy authorization header")
         .request_timeout(Duration::from_millis(500))
         .retry_policy(RetryPolicy::disabled())
-        .build()
-        .expect("client should build");
-
-    let error = client
-        .get("/v1/secure")
-        .send()
-        .expect_err("https proxy auth should require proxy URI credentials in blocking mode");
+        .build();
+    let error = match build_result {
+        Ok(_) => panic!("https proxy auth should fail at build time in blocking mode"),
+        Err(error) => error,
+    };
 
     match error {
         Error::InvalidProxyConfig { message, .. } => {
