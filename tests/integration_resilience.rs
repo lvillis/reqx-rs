@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -136,6 +136,13 @@ fn update_max(max: &AtomicUsize, value: usize) {
             Err(observed) => current = observed,
         }
     }
+}
+
+fn install_test_tracing_registry() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
 }
 
 struct CountingServer {
@@ -743,6 +750,62 @@ async fn max_in_flight_enforces_single_active_request() {
     assert!(started.elapsed() >= Duration::from_millis(300));
     assert_eq!(server.served_count(), 3);
     assert_eq!(server.max_active(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tracing_instrumentation_does_not_panic_under_concurrent_abort() {
+    install_test_tracing_registry();
+
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let unused_port = reserved.local_addr().expect("read local address").port();
+    drop(reserved);
+
+    let client = Client::builder(format!("http://127.0.0.1:{unused_port}"))
+        .request_timeout(Duration::from_millis(250))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(6)
+                .base_backoff(Duration::from_millis(10))
+                .max_backoff(Duration::from_millis(10))
+                .jitter_ratio(0.0),
+        )
+        .build()
+        .expect("client should build");
+
+    let total_tasks = 96usize;
+    let mut tasks = Vec::with_capacity(total_tasks);
+    for index in 0..total_tasks {
+        let cloned = client.clone();
+        tasks.push((
+            index,
+            tokio::spawn(async move {
+                cloned
+                    .get(format!("/tracing-span-panic-regression-{index}"))
+                    .send()
+                    .await
+            }),
+        ));
+    }
+
+    tokio::time::sleep(Duration::from_millis(8)).await;
+    for (index, task) in &tasks {
+        if index % 3 == 0 {
+            task.abort();
+        }
+    }
+
+    for (index, task) in tasks {
+        match task.await {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(join_error) if index % 3 == 0 && join_error.is_cancelled() => {}
+            Err(join_error) if join_error.is_panic() => {
+                panic!("request task panicked under tracing load: {join_error}")
+            }
+            Err(join_error) => {
+                panic!("unexpected join error for task {index}: {join_error}")
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -140,6 +140,7 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["met
 [dev-dependencies]
 # Benchmark framework.
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
 
 [[bench]]
 name = "transport"
