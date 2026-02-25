@@ -1,3 +1,12 @@
+## [0.1.22] - 2026-02-25
+
+### 🐛 Bug Fixes
+
+- Adopt async-safe tracing instrumentation across request loop
+
+### 🧪 Testing
+
+- Add async tracing abort regression coverage
 ## [0.1.21] - 2026-02-24
 
 ### 🐛 Bug Fixes
@@ -5,6 +14,10 @@
 - Tighten throttle scope behavior and rustls backend-default roots
 - Enforce retry-after cap and fail fast proxy auth config
 - Align proxy auth validation across async and blocking
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.21
 ## [0.1.20] - 2026-02-14
 
 ### 🐛 Bug Fixes
