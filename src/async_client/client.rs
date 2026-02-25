@@ -21,7 +21,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, timeout_at};
-use tracing::{debug, info_span, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 #[cfg(any(
     feature = "async-tls-rustls-ring",
@@ -2323,7 +2323,6 @@ impl Client {
                     max_attempts = max_attempts
                 )
             };
-            let _enter = span.enter();
             let started = Instant::now();
             let context = RequestContext::new(
                 current_method.clone(),
@@ -2332,9 +2331,8 @@ impl Client {
                 max_attempts,
                 redirect_count,
             );
-            self.run_request_start_observers(&context);
-
-            debug!("sending request");
+            span.in_scope(|| self.run_request_start_observers(&context));
+            debug!(parent: &span, "sending request");
             let rate_limit_host = rate_limit_bucket_key(&current_uri);
             if let Err(error) = self
                 .acquire_rate_limit_slot(
@@ -2344,6 +2342,7 @@ impl Client {
                     &current_method,
                     &current_redacted_uri,
                 )
+                .instrument(span.clone())
                 .await
             {
                 self.run_error_interceptors(&context, &error);
@@ -2374,6 +2373,7 @@ impl Client {
                     &current_method,
                     &current_redacted_uri,
                 )
+                .instrument(span.clone())
                 .await
             {
                 Ok(permit) => permit,
@@ -2389,6 +2389,7 @@ impl Client {
                     &current_method,
                     &current_redacted_uri,
                 )
+                .instrument(span.clone())
                 .await
             {
                 Ok(attempt) => attempt,
@@ -2413,6 +2414,7 @@ impl Client {
             )?;
             let response = match self
                 .send_transport_request(transport_timeout, request)
+                .instrument(span.clone())
                 .await
             {
                 Ok(response) => response,
@@ -2451,6 +2453,7 @@ impl Client {
                             &mut attempt,
                             &error,
                         )
+                        .instrument(span.clone())
                         .await?
                     {
                         continue;
@@ -2493,6 +2496,7 @@ impl Client {
                             &mut attempt,
                             &error,
                         )
+                        .instrument(span.clone())
                         .await?
                     {
                         continue;
@@ -2611,6 +2615,7 @@ impl Client {
                         },
                         &mut attempt,
                     )
+                    .instrument(span.clone())
                     .await?
                 {
                     continue;
@@ -2661,6 +2666,7 @@ impl Client {
                         attempt: &mut attempt,
                     },
                 )
+                .instrument(span.clone())
                 .await?
             {
                 Some(body) => body,
@@ -2669,6 +2675,7 @@ impl Client {
 
             if matches!(response_mode, ResponseMode::Buffered) {
                 debug!(
+                    parent: &span,
                     status = status.as_u16(),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "request completed"
@@ -2706,6 +2713,7 @@ impl Client {
                             },
                             &mut attempt,
                         )
+                        .instrument(span.clone())
                         .await?
                     {
                         continue;
