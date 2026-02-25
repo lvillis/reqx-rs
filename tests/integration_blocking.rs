@@ -1724,6 +1724,7 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(80))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build()
         .expect("client should build");
 
@@ -1745,6 +1746,12 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
         }
         other => panic!("unexpected error: {other}"),
     }
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 1);
+    assert_eq!(metrics.requests_succeeded, 0);
+    assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.timeout_response_body, 1);
 }
 
 #[test]

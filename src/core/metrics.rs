@@ -2,17 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::Method;
 
 use crate::error::{Error, TimeoutPhase};
 use crate::otel::{OtelRequestSpan, OtelTelemetry};
-#[cfg(feature = "_blocking")]
-use crate::response::BlockingResponseStream;
 use crate::response::Response;
-#[cfg(feature = "_async")]
-use crate::response::ResponseStream;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Debug)]
@@ -64,6 +60,15 @@ struct ClientMetricsInner {
 
 pub(crate) struct InFlightGuard {
     inner: Option<Arc<ClientMetricsInner>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamCompletion {
+    metrics: ClientMetrics,
+    request_span: Option<OtelRequestSpan>,
+    request_started_at: Instant,
+    status: u16,
+    completed: bool,
 }
 
 impl ClientMetrics {
@@ -132,66 +137,27 @@ impl ClientMetrics {
     ) {
         match result {
             Ok(response) => {
-                if let Some(inner) = &self.inner {
-                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
-                }
-                self.add_status_count(response.status().as_u16());
-                self.otel
-                    .record_request_succeeded(response.status().as_u16());
+                self.record_request_completed_success(response.status().as_u16(), latency)
             }
             Err(error) => {
                 self.record_request_completed_error(error, latency);
-                return;
             }
         }
-
-        self.record_latency(latency);
     }
 
-    #[cfg(feature = "_async")]
-    pub(crate) fn record_request_completed_stream(
+    pub(crate) fn stream_completion(
         &self,
-        result: &Result<ResponseStream, Error>,
-        latency: Duration,
-    ) {
-        match result {
-            Ok(response) => {
-                if let Some(inner) = &self.inner {
-                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
-                }
-                self.add_status_count(response.status().as_u16());
-                self.otel
-                    .record_request_succeeded(response.status().as_u16());
-            }
-            Err(error) => {
-                self.record_request_completed_error(error, latency);
-                return;
-            }
+        request_span: Option<OtelRequestSpan>,
+        request_started_at: Instant,
+        status: u16,
+    ) -> StreamCompletion {
+        StreamCompletion {
+            metrics: self.clone(),
+            request_span,
+            request_started_at,
+            status,
+            completed: false,
         }
-        self.record_latency(latency);
-    }
-
-    #[cfg(feature = "_blocking")]
-    pub(crate) fn record_request_completed_blocking_stream(
-        &self,
-        result: &Result<BlockingResponseStream, Error>,
-        latency: Duration,
-    ) {
-        match result {
-            Ok(response) => {
-                if let Some(inner) = &self.inner {
-                    inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
-                }
-                self.add_status_count(response.status().as_u16());
-                self.otel
-                    .record_request_succeeded(response.status().as_u16());
-            }
-            Err(error) => {
-                self.record_request_completed_error(error, latency);
-                return;
-            }
-        }
-        self.record_latency(latency);
     }
 
     pub(crate) fn record_request_completed_error(&self, error: &Error, latency: Duration) {
@@ -271,6 +237,15 @@ impl ClientMetrics {
             | Error::RedirectLimitExceeded { .. }
             | Error::RedirectBodyNotReplayable { .. } => {}
         }
+    }
+
+    fn record_request_completed_success(&self, status: u16, latency: Duration) {
+        if let Some(inner) = &self.inner {
+            inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+        }
+        self.add_status_count(status);
+        self.otel.record_request_succeeded(status);
+        self.record_latency(latency);
     }
 
     pub(crate) fn snapshot(&self) -> MetricsSnapshot {
@@ -374,5 +349,39 @@ impl Drop for InFlightGuard {
         if let Some(inner) = &self.inner {
             inner.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+impl StreamCompletion {
+    pub(crate) fn complete_success(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let latency = self.request_started_at.elapsed();
+        self.metrics
+            .record_request_completed_success(self.status, latency);
+        if let Some(span) = self.request_span.take() {
+            self.metrics
+                .finish_otel_request_span_success(span, self.status);
+        }
+    }
+
+    pub(crate) fn complete_error(&mut self, error: &Error) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let latency = self.request_started_at.elapsed();
+        self.metrics.record_request_completed_error(error, latency);
+        if let Some(span) = self.request_span.take() {
+            self.metrics.finish_otel_request_span_error(span, error);
+        }
+    }
+}
+
+impl Drop for StreamCompletion {
+    fn drop(&mut self) {
+        self.complete_success();
     }
 }

@@ -1557,6 +1557,7 @@ async fn send_stream_copy_to_writer_reports_response_body_timeout() {
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_millis(20))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build()
         .expect("client should build");
 
@@ -1597,6 +1598,11 @@ async fn send_stream_copy_to_writer_reports_response_body_timeout() {
     }
 
     assert_eq!(server.served_count(), 2);
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 2);
+    assert_eq!(metrics.requests_succeeded, 0);
+    assert_eq!(metrics.requests_failed, 2);
+    assert_eq!(metrics.timeout_response_body, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

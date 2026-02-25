@@ -474,7 +474,7 @@ enum ResponseMode {
 
 enum RetryResponse {
     Buffered(Response),
-    Stream(ResponseStream),
+    Stream(Box<ResponseStream>),
 }
 
 fn response_mode_mismatch_error(method: &Method, redacted_uri: &str, expected_mode: &str) -> Error {
@@ -2161,9 +2161,11 @@ impl Client {
             ensure_accept_encoding_async(&method, &mut merged_headers);
         }
         let body = body.unwrap_or_else(RequestBody::empty);
-        let otel_span = self
-            .metrics
-            .start_otel_request_span(&method, &redacted_uri_text, true);
+        let mut otel_span = Some(self.metrics.start_otel_request_span(
+            &method,
+            &redacted_uri_text,
+            true,
+        ));
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
@@ -2181,15 +2183,17 @@ impl Client {
             Err(error) => {
                 self.metrics
                     .record_request_completed_error(&error, request_started_at.elapsed());
-                self.metrics
-                    .finish_otel_request_span_error(otel_span, &error);
+                if let Some(otel_span) = otel_span.take() {
+                    self.metrics
+                        .finish_otel_request_span_error(otel_span, &error);
+                }
                 return Err(error);
             }
         };
         let expected_method = method.clone();
         let expected_redacted_uri = redacted_uri_text.clone();
 
-        let result = match self
+        match self
             .send_request_with_retry_mode(
                 RetryRequestInput {
                     method,
@@ -2205,25 +2209,40 @@ impl Client {
             )
             .await
         {
-            Ok(RetryResponse::Stream(response)) => Ok(response),
-            Ok(RetryResponse::Buffered(_)) => Err(response_mode_mismatch_error(
-                &expected_method,
-                &expected_redacted_uri,
-                "stream",
-            )),
-            Err(error) => Err(error),
-        };
-        self.metrics
-            .record_request_completed_stream(&result, request_started_at.elapsed());
-        match &result {
-            Ok(response) => self
-                .metrics
-                .finish_otel_request_span_success(otel_span, response.status().as_u16()),
-            Err(error) => self
-                .metrics
-                .finish_otel_request_span_error(otel_span, error),
+            Ok(RetryResponse::Stream(response)) => {
+                let mut response = *response;
+                let completion = self.metrics.stream_completion(
+                    otel_span.take(),
+                    request_started_at,
+                    response.status().as_u16(),
+                );
+                response.attach_completion(completion);
+                Ok(response)
+            }
+            Ok(RetryResponse::Buffered(_)) => {
+                let error = response_mode_mismatch_error(
+                    &expected_method,
+                    &expected_redacted_uri,
+                    "stream",
+                );
+                self.metrics
+                    .record_request_completed_error(&error, request_started_at.elapsed());
+                if let Some(otel_span) = otel_span.take() {
+                    self.metrics
+                        .finish_otel_request_span_error(otel_span, &error);
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.metrics
+                    .record_request_completed_error(&error, request_started_at.elapsed());
+                if let Some(otel_span) = otel_span.take() {
+                    self.metrics
+                        .finish_otel_request_span_error(otel_span, &error);
+                }
+                Err(error)
+            }
         }
-        result
     }
 
     async fn send_request_with_retry(
@@ -2569,7 +2588,7 @@ impl Client {
                         adaptive_guard.mark_success();
                     }
                     self.record_successful_request_for_resilience();
-                    return Ok(RetryResponse::Stream(ResponseStream::new(
+                    return Ok(RetryResponse::Stream(Box::new(ResponseStream::new(
                         status,
                         response_headers,
                         response.into_body(),
@@ -2585,7 +2604,7 @@ impl Client {
                                 Some(host_permit),
                             ),
                         },
-                    )));
+                    ))));
                 }
 
                 self.observe_server_throttle(
@@ -2628,7 +2647,7 @@ impl Client {
                     if let Some(adaptive_guard) = adaptive_attempt.take() {
                         adaptive_guard.mark_success();
                     }
-                    return Ok(RetryResponse::Stream(ResponseStream::new(
+                    return Ok(RetryResponse::Stream(Box::new(ResponseStream::new(
                         status,
                         response_headers,
                         response.into_body(),
@@ -2644,7 +2663,7 @@ impl Client {
                                 Some(host_permit),
                             ),
                         },
-                    )));
+                    ))));
                 }
             }
 

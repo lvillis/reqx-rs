@@ -69,6 +69,7 @@ mod stream {
     use crate::content_encoding::should_decode_content_encoded_body;
     use crate::error::{Error, TimeoutPhase};
     use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
+    use crate::metrics::StreamCompletion;
     use crate::response::Response;
 
     fn map_decode_body_error(
@@ -104,6 +105,7 @@ mod stream {
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
         frame_timeout: Option<Pin<Box<Sleep>>>,
+        completion: Option<StreamCompletion>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -127,9 +129,15 @@ mod stream {
                 total_timeout_ms,
                 deadline_at,
                 frame_timeout: None,
+                completion: None,
                 _global_permit: permits.global,
                 _host_permit: permits.host,
             }
+        }
+
+        fn with_completion(mut self, completion: Option<StreamCompletion>) -> Self {
+            self.completion = completion;
+            self
         }
 
         fn response_body_timeout_error(&self) -> Error {
@@ -171,6 +179,18 @@ mod stream {
             }
             Ok(())
         }
+
+        fn complete_success(&mut self) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_success();
+            }
+        }
+
+        fn complete_error(&mut self, error: &Error) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_error(error);
+            }
+        }
     }
 
     impl HyperBody for StreamBody {
@@ -188,16 +208,20 @@ mod stream {
                 }
                 Poll::Ready(Some(Err(source))) => {
                     self.frame_timeout = None;
-                    Poll::Ready(Some(Err(Error::ReadBody {
+                    let error = Error::ReadBody {
                         source: Box::new(source),
-                    })))
+                    };
+                    self.complete_error(&error);
+                    Poll::Ready(Some(Err(error)))
                 }
                 Poll::Ready(None) => {
                     self.frame_timeout = None;
+                    self.complete_success();
                     Poll::Ready(None)
                 }
                 Poll::Pending => {
                     if let Err(error) = self.ensure_frame_timeout() {
+                        self.complete_error(&error);
                         return Poll::Ready(Some(Err(error)));
                     }
                     if let Some(timer) = self.frame_timeout.as_mut()
@@ -212,6 +236,7 @@ mod stream {
                         } else {
                             self.response_body_timeout_error()
                         };
+                        self.complete_error(&error);
                         return Poll::Ready(Some(Err(error)));
                     }
                     Poll::Pending
@@ -265,6 +290,7 @@ mod stream {
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
+        completion: Option<StreamCompletion>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -295,9 +321,14 @@ mod stream {
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
+                completion: None,
                 _global_permit: permits.global,
                 _host_permit: permits.host,
             }
+        }
+
+        pub(crate) fn attach_completion(&mut self, completion: StreamCompletion) {
+            self.completion = Some(completion);
         }
 
         pub fn status(&self) -> StatusCode {
@@ -339,6 +370,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                completion,
                 _global_permit,
                 _host_permit,
                 ..
@@ -355,12 +387,22 @@ mod stream {
                     permits: StreamPermits::new(_global_permit, _host_permit),
                 },
             )
+            .with_completion(completion)
         }
 
         pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
             let max_bytes = max_bytes.max(1);
             let mut this = self;
-            this.read_raw_bytes_limited(max_bytes).await
+            match this.read_raw_bytes_limited(max_bytes).await {
+                Ok(body) => {
+                    this.complete_success();
+                    Ok(body)
+                }
+                Err(error) => {
+                    this.complete_error(&error);
+                    Err(error)
+                }
+            }
         }
 
         pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
@@ -370,20 +412,32 @@ mod stream {
             // Stream raw wire bytes (content-encoding is not decoded on this path).
             let mut copied = 0_u64;
 
-            while let Some(frame) = self.next_frame_with_timeout().await? {
+            while let Some(frame) = match self.next_frame_with_timeout().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            } {
                 if let Some(data) = frame.data_ref() {
-                    writer
-                        .write_all(data)
-                        .await
-                        .map_err(|source| Error::ReadBody {
+                    if let Err(source) = writer.write_all(data).await {
+                        let error = Error::ReadBody {
                             source: Box::new(source),
-                        })?;
+                        };
+                        self.complete_error(&error);
+                        return Err(error);
+                    }
                     copied = copied.saturating_add(data.len() as u64);
                 }
             }
-            writer.flush().await.map_err(|source| Error::ReadBody {
-                source: Box::new(source),
-            })?;
+            if let Err(source) = writer.flush().await {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
             Ok(copied)
         }
 
@@ -399,28 +453,42 @@ mod stream {
             let max_bytes = max_bytes.max(1);
             let mut copied = 0_u64;
 
-            while let Some(frame) = self.next_frame_with_timeout().await? {
+            while let Some(frame) = match self.next_frame_with_timeout().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            } {
                 if let Some(data) = frame.data_ref() {
                     copied = copied.saturating_add(data.len() as u64);
                     if copied > max_bytes as u64 {
-                        return Err(Error::ResponseBodyTooLarge {
+                        let error = Error::ResponseBodyTooLarge {
                             limit_bytes: max_bytes,
                             actual_bytes: copied as usize,
                             method: self.method.clone(),
                             uri: self.uri_redacted.clone(),
-                        });
+                        };
+                        self.complete_error(&error);
+                        return Err(error);
                     }
-                    writer
-                        .write_all(data)
-                        .await
-                        .map_err(|source| Error::ReadBody {
+                    if let Err(source) = writer.write_all(data).await {
+                        let error = Error::ReadBody {
                             source: Box::new(source),
-                        })?;
+                        };
+                        self.complete_error(&error);
+                        return Err(error);
+                    }
                 }
             }
-            writer.flush().await.map_err(|source| Error::ReadBody {
-                source: Box::new(source),
-            })?;
+            if let Err(source) = writer.flush().await {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
             Ok(copied)
         }
 
@@ -435,6 +503,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                completion,
                 _global_permit,
                 _host_permit,
             } = self;
@@ -449,15 +518,27 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                completion,
                 _global_permit,
                 _host_permit,
             };
-            let body = stream.read_raw_bytes_limited(max_bytes).await?;
+            let body = match stream.read_raw_bytes_limited(max_bytes).await {
+                Ok(body) => body,
+                Err(error) => {
+                    stream.complete_error(&error);
+                    return Err(error);
+                }
+            };
             let should_decode = should_decode_content_encoded_body(&method, status, body.len());
             let body = if should_decode {
-                decode_content_encoded_body_limited(body, &headers, max_bytes).map_err(|error| {
-                    map_decode_body_error(error, &method, &uri_redacted, max_bytes)
-                })?
+                match decode_content_encoded_body_limited(body, &headers, max_bytes) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let error = map_decode_body_error(error, &method, &uri_redacted, max_bytes);
+                        stream.complete_error(&error);
+                        return Err(error);
+                    }
+                }
             } else {
                 body
             };
@@ -465,6 +546,7 @@ mod stream {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }
+            stream.complete_success();
             Ok(Response::new(status, headers, body))
         }
 
@@ -497,6 +579,18 @@ mod stream {
                     .unwrap_or_else(|| self.timeout_ms.max(1)),
                 method: self.method.clone(),
                 uri: self.uri_redacted.clone(),
+            }
+        }
+
+        fn complete_success(&mut self) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_success();
+            }
+        }
+
+        fn complete_error(&mut self, error: &Error) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_error(error);
             }
         }
 
@@ -573,6 +667,7 @@ mod blocking_stream {
         should_decode_content_encoded_body,
     };
     use crate::error::{Error, TimeoutPhase};
+    use crate::metrics::StreamCompletion;
     use crate::response::Response;
 
     fn map_read_error(
@@ -685,6 +780,7 @@ mod blocking_stream {
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
+        completion: Option<StreamCompletion>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -728,9 +824,14 @@ mod blocking_stream {
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
+                completion: None,
                 _global_permit: global_permit,
                 _host_permit: host_permit,
             }
+        }
+
+        pub(crate) fn attach_completion(&mut self, completion: StreamCompletion) {
+            self.completion = Some(completion);
         }
 
         pub fn status(&self) -> StatusCode {
@@ -775,7 +876,7 @@ mod blocking_stream {
                 self.timeout_ms,
                 self.total_timeout_ms,
             )?;
-            self.body.as_reader().read(buffer).map_err(|source| {
+            let read = self.body.as_reader().read(buffer).map_err(|source| {
                 map_read_error_with_deadline(
                     source,
                     &self.method,
@@ -784,7 +885,11 @@ mod blocking_stream {
                     self.deadline_at,
                     self.total_timeout_ms,
                 )
-            })
+            });
+            if let Err(error) = &read {
+                self.complete_error(error);
+            }
+            read
         }
 
         pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
@@ -799,16 +904,23 @@ mod blocking_stream {
                 if read == 0 {
                     break;
                 }
-                writer
-                    .write_all(&chunk[..read])
-                    .map_err(|source| Error::ReadBody {
+                if let Err(source) = writer.write_all(&chunk[..read]) {
+                    let error = Error::ReadBody {
                         source: Box::new(source),
-                    })?;
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
                 copied = copied.saturating_add(read as u64);
             }
-            writer.flush().map_err(|source| Error::ReadBody {
-                source: Box::new(source),
-            })?;
+            if let Err(source) = writer.flush() {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
             Ok(copied)
         }
 
@@ -831,22 +943,31 @@ mod blocking_stream {
                 }
                 copied = copied.saturating_add(read as u64);
                 if copied > max_bytes as u64 {
-                    return Err(Error::ResponseBodyTooLarge {
+                    let error = Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: copied as usize,
                         method: self.method.clone(),
                         uri: self.uri_redacted.clone(),
-                    });
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
                 }
-                writer
-                    .write_all(&chunk[..read])
-                    .map_err(|source| Error::ReadBody {
+                if let Err(source) = writer.write_all(&chunk[..read]) {
+                    let error = Error::ReadBody {
                         source: Box::new(source),
-                    })?;
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
             }
-            writer.flush().map_err(|source| Error::ReadBody {
-                source: Box::new(source),
-            })?;
+            if let Err(source) = writer.flush() {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
             Ok(copied)
         }
 
@@ -863,75 +984,57 @@ mod blocking_stream {
                 }
                 total_len = total_len.saturating_add(read);
                 if total_len > max_bytes {
-                    return Err(Error::ResponseBodyTooLarge {
+                    let error = Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
                         method: self.method.clone(),
                         uri: self.uri_redacted.clone(),
-                    });
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
                 }
                 collected.extend_from_slice(&chunk[..read]);
             }
-
+            self.complete_success();
             Ok(Bytes::from(collected))
         }
 
-        pub fn into_response_limited(self, max_bytes: usize) -> crate::Result<Response> {
-            let BlockingResponseStream {
-                status,
-                mut headers,
-                mut body,
-                method,
-                uri_raw: _,
-                uri_redacted,
-                timeout_ms,
-                total_timeout_ms,
-                deadline_at,
-                _global_permit,
-                _host_permit,
-            } = self;
+        pub fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
             let max_bytes = max_bytes.max(1);
             let mut chunk = [0_u8; 8192];
             let mut collected = Vec::new();
             let mut total_len = 0_usize;
 
             loop {
-                ensure_within_deadline(
-                    deadline_at,
-                    &method,
-                    &uri_redacted,
-                    timeout_ms,
-                    total_timeout_ms,
-                )?;
-                let read = body.as_reader().read(&mut chunk).map_err(|source| {
-                    map_read_error_with_deadline(
-                        source,
-                        &method,
-                        &uri_redacted,
-                        timeout_ms,
-                        deadline_at,
-                        total_timeout_ms,
-                    )
-                })?;
+                let read = self.read_chunk(&mut chunk)?;
                 if read == 0 {
                     break;
                 }
                 total_len = total_len.saturating_add(read);
                 if total_len > max_bytes {
-                    return Err(Error::ResponseBodyTooLarge {
+                    let error = Error::ResponseBodyTooLarge {
                         limit_bytes: max_bytes,
                         actual_bytes: total_len,
-                        method: method.clone(),
-                        uri: uri_redacted.clone(),
-                    });
+                        method: self.method.clone(),
+                        uri: self.uri_redacted.clone(),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
                 }
                 collected.extend_from_slice(&chunk[..read]);
             }
             let body = Bytes::from(collected);
+            let status = self.status;
+            let method = self.method.clone();
+            let uri_redacted = self.uri_redacted.clone();
+            let mut headers = std::mem::take(&mut self.headers);
             let should_decode = should_decode_content_encoded_body(&method, status, body.len());
             let body = if should_decode {
-                decode_content_encoded_body_limited(body, &headers, max_bytes)
-                    .map_err(|error| map_decode_error(error, &method, &uri_redacted, max_bytes))?
+                decode_content_encoded_body_limited(body, &headers, max_bytes).map_err(|error| {
+                    let error = map_decode_error(error, &method, &uri_redacted, max_bytes);
+                    self.complete_error(&error);
+                    error
+                })?
             } else {
                 body
             };
@@ -939,6 +1042,7 @@ mod blocking_stream {
                 headers.remove(super::CONTENT_ENCODING);
                 headers.remove(super::CONTENT_LENGTH);
             }
+            self.complete_success();
             Ok(Response::new(status, headers, body))
         }
 
@@ -953,6 +1057,18 @@ mod blocking_stream {
         {
             let response = self.into_response_limited(max_bytes)?;
             response.json()
+        }
+
+        fn complete_success(&mut self) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_success();
+            }
+        }
+
+        fn complete_error(&mut self, error: &Error) {
+            if let Some(completion) = &mut self.completion {
+                completion.complete_error(error);
+            }
         }
     }
 }
