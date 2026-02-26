@@ -158,6 +158,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - explicit buffered conversion (`send()`, `into_response_limited`, `into_json_limited`) decodes
   `gzip`, `br`, `deflate`, `zstd` for both async and blocking
 - proxy support with auth and `no_proxy`
+- blocking mode proxy auth contract: for `blocking-*` features, configure proxy credentials in
+  `http_proxy` URI (`http://user:pass@proxy:port`); direct `proxy_authorization(...)` forwarding
+  is intentionally rejected by `ureq` transport
 - interceptor hooks for SDK concerns (`Interceptor`)
 - response body size limit
 - structured error variants + machine error codes

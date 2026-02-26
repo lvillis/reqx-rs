@@ -1108,6 +1108,50 @@ async fn send_stream_uri_exposes_raw_and_redacted_variants() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_drop_marks_canceled_and_releases_in_flight() {
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"stream-body".to_vec(),
+        Duration::ZERO,
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-drop")
+        .send_stream()
+        .await
+        .expect("stream request should succeed");
+
+    let in_flight_metrics = client.metrics_snapshot();
+    assert_eq!(in_flight_metrics.requests_started, 1);
+    assert_eq!(in_flight_metrics.requests_succeeded, 0);
+    assert_eq!(in_flight_metrics.requests_failed, 0);
+    assert_eq!(in_flight_metrics.requests_canceled, 0);
+    assert_eq!(in_flight_metrics.in_flight, 1);
+
+    drop(stream);
+    tokio::task::yield_now().await;
+
+    let canceled_metrics = client.metrics_snapshot();
+    assert_eq!(canceled_metrics.requests_started, 1);
+    assert_eq!(canceled_metrics.requests_succeeded, 0);
+    assert_eq!(canceled_metrics.requests_failed, 0);
+    assert_eq!(canceled_metrics.requests_canceled, 1);
+    assert_eq!(canceled_metrics.in_flight, 0);
+    assert_eq!(
+        canceled_metrics.error_counts.get("request_canceled"),
+        Some(&1_u64)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_auto_accept_encoding_can_be_enabled_at_client_level() {
     let server = MockServer::start(vec![MockResponse::new_bytes(
         200,
@@ -1812,6 +1856,7 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     assert_eq!(metrics.requests_started, 3);
     assert_eq!(metrics.requests_succeeded, 1);
     assert_eq!(metrics.requests_failed, 2);
+    assert_eq!(metrics.requests_canceled, 0);
     assert_eq!(metrics.retries, 0);
     assert_eq!(metrics.http_status_errors, 1);
     assert_eq!(metrics.response_body_too_large, 1);
@@ -1850,6 +1895,7 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
     assert_eq!(metrics.requests_started, 0);
     assert_eq!(metrics.requests_succeeded, 0);
     assert_eq!(metrics.requests_failed, 0);
+    assert_eq!(metrics.requests_canceled, 0);
     assert_eq!(metrics.retries, 0);
     assert_eq!(metrics.latency_samples, 0);
     assert!(metrics.status_counts.is_empty());

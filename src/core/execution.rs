@@ -237,6 +237,11 @@ pub(crate) struct StatusRetryPlan {
     pub(crate) delay: Duration,
 }
 
+pub(crate) struct StreamTiming {
+    pub(crate) total_timeout_ms: Option<u128>,
+    pub(crate) deadline_at: Option<Instant>,
+}
+
 pub(crate) struct StatusRetryPlanInput<'a> {
     pub(crate) attempt: usize,
     pub(crate) max_attempts: usize,
@@ -264,6 +269,16 @@ pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryP
     StatusRetryPlan {
         decision: status_retry_decision(attempt, max_attempts, method, redacted_uri, status),
         delay: status_retry_delay(clock, headers, fallback_delay, max_delay),
+    }
+}
+
+pub(crate) fn stream_timing(
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+) -> StreamTiming {
+    StreamTiming {
+        total_timeout_ms: total_timeout.map(|timeout| timeout.as_millis()),
+        deadline_at: total_timeout.and_then(|timeout| request_started_at.checked_add(timeout)),
     }
 }
 

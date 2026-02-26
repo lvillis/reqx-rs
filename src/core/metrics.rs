@@ -16,6 +16,7 @@ pub struct MetricsSnapshot {
     pub requests_started: u64,
     pub requests_succeeded: u64,
     pub requests_failed: u64,
+    pub requests_canceled: u64,
     pub retries: u64,
     pub timeout_transport: u64,
     pub timeout_response_body: u64,
@@ -43,6 +44,7 @@ struct ClientMetricsInner {
     requests_started: AtomicU64,
     requests_succeeded: AtomicU64,
     requests_failed: AtomicU64,
+    requests_canceled: AtomicU64,
     retries: AtomicU64,
     timeout_transport: AtomicU64,
     timeout_response_body: AtomicU64,
@@ -58,6 +60,7 @@ struct ClientMetricsInner {
     error_counts: Mutex<BTreeMap<String, u64>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct InFlightGuard {
     inner: Option<Arc<ClientMetricsInner>>,
 }
@@ -68,7 +71,16 @@ pub(crate) struct StreamCompletion {
     request_span: Option<OtelRequestSpan>,
     request_started_at: Instant,
     status: u16,
-    completed: bool,
+    in_flight_guard: Option<InFlightGuard>,
+    state: StreamCompletionState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamCompletionState {
+    Pending,
+    Success,
+    Error,
+    Canceled,
 }
 
 impl ClientMetrics {
@@ -102,6 +114,10 @@ impl ClientMetrics {
         error: &Error,
     ) {
         self.otel.finish_request_span_error(request_span, error);
+    }
+
+    pub(crate) fn finish_otel_request_span_canceled(&self, request_span: OtelRequestSpan) {
+        self.otel.finish_request_span_canceled(request_span);
     }
 
     pub(crate) fn record_request_started(&self) {
@@ -150,13 +166,15 @@ impl ClientMetrics {
         request_span: Option<OtelRequestSpan>,
         request_started_at: Instant,
         status: u16,
+        in_flight_guard: InFlightGuard,
     ) -> StreamCompletion {
         StreamCompletion {
             metrics: self.clone(),
             request_span,
             request_started_at,
             status,
-            completed: false,
+            in_flight_guard: Some(in_flight_guard),
+            state: StreamCompletionState::Pending,
         }
     }
 
@@ -239,6 +257,15 @@ impl ClientMetrics {
         }
     }
 
+    pub(crate) fn record_request_completed_canceled(&self, latency: Duration) {
+        if let Some(inner) = &self.inner {
+            inner.requests_canceled.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_latency(latency);
+        self.add_error_count("request_canceled".to_owned());
+        self.otel.record_request_canceled();
+    }
+
     fn record_request_completed_success(&self, status: u16, latency: Duration) {
         if let Some(inner) = &self.inner {
             inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -254,6 +281,7 @@ impl ClientMetrics {
                 requests_started: 0,
                 requests_succeeded: 0,
                 requests_failed: 0,
+                requests_canceled: 0,
                 retries: 0,
                 timeout_transport: 0,
                 timeout_response_body: 0,
@@ -274,6 +302,7 @@ impl ClientMetrics {
         let requests_started = inner.requests_started.load(Ordering::Relaxed);
         let requests_succeeded = inner.requests_succeeded.load(Ordering::Relaxed);
         let requests_failed = inner.requests_failed.load(Ordering::Relaxed);
+        let requests_canceled = inner.requests_canceled.load(Ordering::Relaxed);
         let retries = inner.retries.load(Ordering::Relaxed);
         let timeout_transport = inner.timeout_transport.load(Ordering::Relaxed);
         let timeout_response_body = inner.timeout_response_body.load(Ordering::Relaxed);
@@ -297,6 +326,7 @@ impl ClientMetrics {
             requests_started,
             requests_succeeded,
             requests_failed,
+            requests_canceled,
             retries,
             timeout_transport,
             timeout_response_body,
@@ -354,10 +384,10 @@ impl Drop for InFlightGuard {
 
 impl StreamCompletion {
     pub(crate) fn complete_success(&mut self) {
-        if self.completed {
+        if self.state != StreamCompletionState::Pending {
             return;
         }
-        self.completed = true;
+        self.state = StreamCompletionState::Success;
         let latency = self.request_started_at.elapsed();
         self.metrics
             .record_request_completed_success(self.status, latency);
@@ -365,23 +395,38 @@ impl StreamCompletion {
             self.metrics
                 .finish_otel_request_span_success(span, self.status);
         }
+        let _ = self.in_flight_guard.take();
     }
 
     pub(crate) fn complete_error(&mut self, error: &Error) {
-        if self.completed {
+        if self.state != StreamCompletionState::Pending {
             return;
         }
-        self.completed = true;
+        self.state = StreamCompletionState::Error;
         let latency = self.request_started_at.elapsed();
         self.metrics.record_request_completed_error(error, latency);
         if let Some(span) = self.request_span.take() {
             self.metrics.finish_otel_request_span_error(span, error);
         }
+        let _ = self.in_flight_guard.take();
+    }
+
+    pub(crate) fn complete_canceled(&mut self) {
+        if self.state != StreamCompletionState::Pending {
+            return;
+        }
+        self.state = StreamCompletionState::Canceled;
+        let latency = self.request_started_at.elapsed();
+        self.metrics.record_request_completed_canceled(latency);
+        if let Some(span) = self.request_span.take() {
+            self.metrics.finish_otel_request_span_canceled(span);
+        }
+        let _ = self.in_flight_guard.take();
     }
 }
 
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
-        self.complete_success();
+        self.complete_canceled();
     }
 }

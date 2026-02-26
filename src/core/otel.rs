@@ -25,6 +25,7 @@ mod enabled {
         requests_started: Counter<u64>,
         requests_succeeded: Counter<u64>,
         requests_failed: Counter<u64>,
+        requests_canceled: Counter<u64>,
         retries: Counter<u64>,
         request_latency_ms: Histogram<f64>,
     }
@@ -67,6 +68,10 @@ mod enabled {
                     requests_failed: meter
                         .u64_counter("reqx.request.failed")
                         .with_description("Total failed HTTP requests")
+                        .build(),
+                    requests_canceled: meter
+                        .u64_counter("reqx.request.canceled")
+                        .with_description("Total canceled HTTP requests")
                         .build(),
                     retries: meter
                         .u64_counter("reqx.request.retries")
@@ -112,6 +117,13 @@ mod enabled {
                 KeyValue::new("error.type", error.code().as_str().to_owned()),
             ];
             inner.requests_failed.add(1, &attributes);
+        }
+
+        pub(crate) fn record_request_canceled(&self) {
+            let Some(inner) = &self.inner else {
+                return;
+            };
+            inner.requests_canceled.add(1, &base_attributes(inner));
         }
 
         pub(crate) fn record_retry(&self) {
@@ -190,6 +202,16 @@ mod enabled {
             for attribute in error_span_attributes(error) {
                 span.set_attribute(attribute);
             }
+            if let Some(mut span) = request_span.span.take() {
+                span.end();
+            }
+        }
+
+        pub(crate) fn finish_request_span_canceled(&self, mut request_span: OtelRequestSpan) {
+            let Some(span) = request_span.span.as_mut() else {
+                return;
+            };
+            span.set_attribute(KeyValue::new("reqx.request.canceled", true));
             if let Some(mut span) = request_span.span.take() {
                 span.end();
             }
@@ -337,6 +359,8 @@ mod enabled {
 
         pub(crate) fn record_request_failed(&self, _error: &Error) {}
 
+        pub(crate) fn record_request_canceled(&self) {}
+
         pub(crate) fn record_retry(&self) {}
 
         pub(crate) fn record_request_latency(&self, _latency: Duration) {}
@@ -363,6 +387,8 @@ mod enabled {
             _error: &Error,
         ) {
         }
+
+        pub(crate) fn finish_request_span_canceled(&self, _request_span: OtelRequestSpan) {}
     }
 }
 

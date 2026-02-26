@@ -40,7 +40,7 @@ use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, next_redirect_action, response_body_read_retry_decision,
     select_base_url, should_return_non_success_response, status_retry_delay, status_retry_error,
-    status_retry_plan, terminal_non_success, timeout_retry_decision,
+    status_retry_plan, stream_timing, terminal_non_success, timeout_retry_decision,
     transport_retry_decision_from_error, transport_timeout_error,
 };
 use crate::extensions::{
@@ -491,6 +491,50 @@ fn response_mode_mismatch_error(method: &Method, redacted_uri: &str, expected_mo
 fn remove_content_encoding_headers(headers: &mut HeaderMap) {
     headers.remove(CONTENT_ENCODING);
     headers.remove(CONTENT_LENGTH);
+}
+
+struct StreamResponseInput {
+    status: http::StatusCode,
+    response_headers: HeaderMap,
+    response_body: Incoming,
+    method: Method,
+    uri: Uri,
+    redacted_uri: String,
+    transport_timeout: Duration,
+    stream_total_timeout_ms: Option<u128>,
+    stream_deadline_at: Option<Instant>,
+    stream_global_permit: Option<GlobalRequestPermit>,
+    host_permit: HostRequestPermit,
+}
+
+fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
+    let StreamResponseInput {
+        status,
+        response_headers,
+        response_body,
+        method,
+        uri,
+        redacted_uri,
+        transport_timeout,
+        stream_total_timeout_ms,
+        stream_deadline_at,
+        stream_global_permit,
+        host_permit,
+    } = input;
+    RetryResponse::Stream(Box::new(ResponseStream::new(
+        status,
+        response_headers,
+        response_body,
+        ResponseStreamContext {
+            method,
+            uri_raw: uri.to_string(),
+            uri_redacted: redacted_uri,
+            timeout_ms: transport_timeout.as_millis(),
+            total_timeout_ms: stream_total_timeout_ms,
+            deadline_at: stream_deadline_at,
+            permits: StreamPermits::new(stream_global_permit, Some(host_permit)),
+        },
+    )))
 }
 
 #[cfg(feature = "async-tls-rustls-ring")]
@@ -2167,7 +2211,7 @@ impl Client {
             true,
         ));
         self.metrics.record_request_started();
-        let _in_flight = self.metrics.enter_in_flight();
+        let in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
         let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
         let global_permit = match self
@@ -2215,6 +2259,7 @@ impl Client {
                     otel_span.take(),
                     request_started_at,
                     response.status().as_u16(),
+                    in_flight,
                 );
                 response.attach_completion(completion);
                 Ok(response)
@@ -2311,9 +2356,9 @@ impl Client {
         } else {
             1
         };
-        let stream_total_timeout_ms = total_timeout.map(|timeout| timeout.as_millis());
-        let stream_deadline_at =
-            total_timeout.and_then(|timeout| request_started_at.checked_add(timeout));
+        let stream_timing = stream_timing(total_timeout, request_started_at);
+        let stream_total_timeout_ms = stream_timing.total_timeout_ms;
+        let stream_deadline_at = stream_timing.deadline_at;
         let mut attempt = 1_usize;
         let mut redirect_count = 0_usize;
         let mut current_method = method;
@@ -2588,23 +2633,19 @@ impl Client {
                         adaptive_guard.mark_success();
                     }
                     self.record_successful_request_for_resilience();
-                    return Ok(RetryResponse::Stream(Box::new(ResponseStream::new(
+                    return Ok(stream_retry_response(StreamResponseInput {
                         status,
                         response_headers,
-                        response.into_body(),
-                        ResponseStreamContext {
-                            method: current_method.clone(),
-                            uri_raw: current_uri.to_string(),
-                            uri_redacted: current_redacted_uri.clone(),
-                            timeout_ms: transport_timeout.as_millis(),
-                            total_timeout_ms: stream_total_timeout_ms,
-                            deadline_at: stream_deadline_at,
-                            permits: StreamPermits::new(
-                                stream_global_permit.take(),
-                                Some(host_permit),
-                            ),
-                        },
-                    ))));
+                        response_body: response.into_body(),
+                        method: current_method.clone(),
+                        uri: current_uri.clone(),
+                        redacted_uri: current_redacted_uri.clone(),
+                        transport_timeout,
+                        stream_total_timeout_ms,
+                        stream_deadline_at,
+                        stream_global_permit: stream_global_permit.take(),
+                        host_permit,
+                    }));
                 }
 
                 self.observe_server_throttle(
@@ -2647,23 +2688,19 @@ impl Client {
                     if let Some(adaptive_guard) = adaptive_attempt.take() {
                         adaptive_guard.mark_success();
                     }
-                    return Ok(RetryResponse::Stream(Box::new(ResponseStream::new(
+                    return Ok(stream_retry_response(StreamResponseInput {
                         status,
                         response_headers,
-                        response.into_body(),
-                        ResponseStreamContext {
-                            method: current_method.clone(),
-                            uri_raw: current_uri.to_string(),
-                            uri_redacted: current_redacted_uri.clone(),
-                            timeout_ms: transport_timeout.as_millis(),
-                            total_timeout_ms: stream_total_timeout_ms,
-                            deadline_at: stream_deadline_at,
-                            permits: StreamPermits::new(
-                                stream_global_permit.take(),
-                                Some(host_permit),
-                            ),
-                        },
-                    ))));
+                        response_body: response.into_body(),
+                        method: current_method.clone(),
+                        uri: current_uri.clone(),
+                        redacted_uri: current_redacted_uri.clone(),
+                        transport_timeout,
+                        stream_total_timeout_ms,
+                        stream_deadline_at,
+                        stream_global_permit: stream_global_permit.take(),
+                        host_permit,
+                    }));
                 }
             }
 

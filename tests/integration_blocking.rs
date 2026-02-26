@@ -1675,6 +1675,47 @@ fn blocking_send_stream_uri_exposes_raw_and_redacted_variants() {
 }
 
 #[test]
+fn blocking_send_stream_drop_marks_canceled_and_releases_in_flight() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"stream-body".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-drop")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let in_flight_metrics = client.metrics_snapshot();
+    assert_eq!(in_flight_metrics.requests_started, 1);
+    assert_eq!(in_flight_metrics.requests_succeeded, 0);
+    assert_eq!(in_flight_metrics.requests_failed, 0);
+    assert_eq!(in_flight_metrics.requests_canceled, 0);
+    assert_eq!(in_flight_metrics.in_flight, 1);
+
+    drop(stream);
+
+    let canceled_metrics = client.metrics_snapshot();
+    assert_eq!(canceled_metrics.requests_started, 1);
+    assert_eq!(canceled_metrics.requests_succeeded, 0);
+    assert_eq!(canceled_metrics.requests_failed, 0);
+    assert_eq!(canceled_metrics.requests_canceled, 1);
+    assert_eq!(canceled_metrics.in_flight, 0);
+    assert_eq!(
+        canceled_metrics.error_counts.get("request_canceled"),
+        Some(&1_u64)
+    );
+}
+
+#[test]
 fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -1751,6 +1792,7 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
     assert_eq!(metrics.requests_started, 1);
     assert_eq!(metrics.requests_succeeded, 0);
     assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.requests_canceled, 0);
     assert_eq!(metrics.timeout_response_body, 1);
 }
 
