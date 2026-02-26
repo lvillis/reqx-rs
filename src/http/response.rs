@@ -864,7 +864,12 @@ mod blocking_stream {
             &self.uri_redacted
         }
 
-        pub fn into_body(self) -> ureq::Body {
+        /// Consumes the stream and hands the raw blocking body to the caller.
+        ///
+        /// Metrics and spans are completed at handoff time because the
+        /// downstream `ureq::Body` read lifecycle is not observable by reqx.
+        pub fn into_body(mut self) -> ureq::Body {
+            self.complete_success();
             self.body
         }
 
@@ -888,6 +893,9 @@ mod blocking_stream {
             });
             if let Err(error) = &read {
                 self.complete_error(error);
+            }
+            if matches!(read, Ok(0)) {
+                self.complete_success();
             }
             read
         }

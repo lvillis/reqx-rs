@@ -1716,6 +1716,83 @@ fn blocking_send_stream_drop_marks_canceled_and_releases_in_flight() {
 }
 
 #[test]
+fn blocking_read_chunk_eof_marks_success_not_canceled() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"chunk-body".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/stream-read-chunk")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let mut out = Vec::new();
+    let mut buffer = [0_u8; 3];
+    loop {
+        let read = stream
+            .read_chunk(&mut buffer)
+            .expect("chunk read should succeed");
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buffer[..read]);
+    }
+    assert_eq!(out, b"chunk-body".to_vec());
+    drop(stream);
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 1);
+    assert_eq!(metrics.requests_succeeded, 1);
+    assert_eq!(metrics.requests_failed, 0);
+    assert_eq!(metrics.requests_canceled, 0);
+    assert_eq!(metrics.in_flight, 0);
+}
+
+#[test]
+fn blocking_into_body_handoff_marks_success_not_canceled() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"handoff-body".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-into-body")
+        .send_stream()
+        .expect("stream request should succeed");
+    let mut body = stream.into_body();
+
+    let mut out = Vec::new();
+    body.as_reader()
+        .read_to_end(&mut out)
+        .expect("body read should succeed");
+    assert_eq!(out, b"handoff-body".to_vec());
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 1);
+    assert_eq!(metrics.requests_succeeded, 1);
+    assert_eq!(metrics.requests_failed, 0);
+    assert_eq!(metrics.requests_canceled, 0);
+    assert_eq!(metrics.in_flight, 0);
+}
+
+#[test]
 fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
