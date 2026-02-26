@@ -1939,6 +1939,53 @@ fn blocking_send_stream_respects_total_timeout_deadline() {
 }
 
 #[test]
+fn blocking_read_chunk_returns_deadline_exceeded_when_read_crosses_total_timeout() {
+    let server = ChunkedBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        vec![b"late".to_vec()],
+        Duration::from_millis(180),
+    );
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(120))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/v1/stream-read-chunk-total-timeout")
+        .send_stream()
+        .expect("stream request should return headers");
+
+    let mut buffer = [0_u8; 16];
+    let error = stream
+        .read_chunk(&mut buffer)
+        .expect_err("read_chunk should fail when read crosses total timeout");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/v1/stream-read-chunk-total-timeout"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    drop(stream);
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_started, 1);
+    assert_eq!(metrics.requests_succeeded, 0);
+    assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.requests_canceled, 0);
+    assert_eq!(metrics.in_flight, 0);
+}
+
+#[test]
 fn blocking_send_http_status_error_strips_decoded_encoding_headers() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder

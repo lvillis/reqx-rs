@@ -891,13 +891,28 @@ mod blocking_stream {
                     self.total_timeout_ms,
                 )
             });
-            if let Err(error) = &read {
-                self.complete_error(error);
+            match read {
+                Ok(read) => {
+                    if let Err(error) = ensure_within_deadline(
+                        self.deadline_at,
+                        &self.method,
+                        &self.uri_redacted,
+                        self.timeout_ms,
+                        self.total_timeout_ms,
+                    ) {
+                        self.complete_error(&error);
+                        return Err(error);
+                    }
+                    if read == 0 {
+                        self.complete_success();
+                    }
+                    Ok(read)
+                }
+                Err(error) => {
+                    self.complete_error(&error);
+                    Err(error)
+                }
             }
-            if matches!(read, Ok(0)) {
-                self.complete_success();
-            }
-            read
         }
 
         pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
