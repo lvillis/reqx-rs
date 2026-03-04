@@ -1,3 +1,11 @@
+## [0.1.23] - 2026-03-04
+
+### 🐛 Bug Fixes
+
+- Finalize stream metrics and otel spans on body completion
+- Correct stream in-flight and cancel metrics
+- Correct blocking stream success/cancel metrics
+- Enforce post-read total-timeout in blocking stream
 ## [0.1.22] - 2026-02-25
 
 ### 🐛 Bug Fixes
@@ -7,6 +15,10 @@
 ### 🧪 Testing
 
 - Add async tracing abort regression coverage
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.22
 ## [0.1.21] - 2026-02-24
 
 ### 🐛 Bug Fixes
