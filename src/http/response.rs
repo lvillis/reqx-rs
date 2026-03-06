@@ -83,6 +83,15 @@ pub(crate) fn deadline_elapsed(deadline_at: Instant, now: Instant) -> bool {
 }
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) fn deadline_limits_wait(
+    phase_timeout: Duration,
+    deadline_at: Instant,
+    now: Instant,
+) -> bool {
+    deadline_at.saturating_duration_since(now) <= phase_timeout
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 pub(crate) fn deadline_within_slack(
     deadline_at: Instant,
     now: Instant,

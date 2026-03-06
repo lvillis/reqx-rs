@@ -149,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - request-level and client-level status handling (`StatusPolicy`)
 - bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
-- `stream_deadline_slack(...)` tunes only near-deadline streaming error classification; it does not shorten actual I/O waits
+- `stream_deadline_slack(...)` tunes only near-deadline streaming error classification when total deadline is already tighter than the body-read timeout; it does not shorten actual I/O waits
 - separate connect timeout (`connect_timeout(...)`)
 - streaming upload plus `ResponseStream: AsyncRead` / `blocking::ResponseStream: Read`
 - stream `copy_to_writer*` / `into_bytes_limited` keep raw bytes (wire semantics)

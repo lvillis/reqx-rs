@@ -1878,6 +1878,40 @@ async fn send_stream_large_deadline_slack_does_not_shorten_total_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_large_deadline_slack_does_not_reclassify_body_timeout() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        b"slow".to_vec(),
+        Duration::from_millis(180),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(100))
+        .total_timeout(Duration::from_millis(500))
+        .stream_deadline_slack(Duration::from_millis(450))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/stream-large-deadline-slack-timeout")
+        .send_stream()
+        .await
+        .expect("stream request should return headers")
+        .into_bytes_limited(64)
+        .await
+        .expect_err("body timeout should remain classified as response body timeout");
+
+    match error {
+        Error::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::ResponseBody),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_stream_into_body_collect_reports_response_body_timeout() {
     let server = SplitBodyServer::start(
         200,

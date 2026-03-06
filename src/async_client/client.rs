@@ -1100,7 +1100,8 @@ impl ClientBuilder {
     /// Tunes near-deadline classification for streaming body reads.
     ///
     /// This only affects how ambiguous boundary cases are classified between
-    /// `Timeout(ResponseBody)` and `DeadlineExceeded`; it does not shorten the
+    /// `Timeout(ResponseBody)` and `DeadlineExceeded` when the total deadline is
+    /// already the tighter bound for the current read; it does not shorten the
     /// actual time spent waiting on the runtime's transport timers.
     pub fn stream_deadline_slack(mut self, stream_deadline_slack: Duration) -> Self {
         self.stream_deadline_slack = stream_deadline_slack;

@@ -14,7 +14,10 @@ use crate::content_encoding::{
 use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
 
-use super::{Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_within_slack};
+use super::{
+    Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
+    deadline_within_slack,
+};
 
 fn map_read_error(
     source: std::io::Error,
@@ -170,11 +173,25 @@ impl BlockingResponseStream {
         super::write_body_error(&self.method, &self.uri_redacted, source)
     }
 
-    fn map_read_error(&self, source: std::io::Error) -> Error {
+    fn current_read_is_deadline_limited(&self) -> bool {
+        let Some(deadline_at) = self.deadline_at else {
+            return false;
+        };
+        deadline_limits_wait(
+            Duration::from_millis(self.timeout_ms.max(1) as u64),
+            deadline_at,
+            self.clock.now_monotonic(),
+        )
+    }
+
+    fn map_read_error(&self, source: std::io::Error, deadline_limited: bool) -> Error {
         let mapped = map_read_error(source, &self.method, &self.uri_redacted, self.timeout_ms);
+        let now = self.clock.now_monotonic();
         if matches!(mapped, Error::Timeout { .. })
             && self.deadline_at.is_some_and(|deadline_at| {
-                deadline_within_slack(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
+                deadline_elapsed(deadline_at, now)
+                    || (deadline_limited
+                        && deadline_within_slack(deadline_at, now, self.deadline_slack))
             })
         {
             return deadline_exceeded_error(
@@ -206,11 +223,12 @@ impl BlockingResponseStream {
             self.complete_error(&error);
             return Err(error);
         }
+        let deadline_limited = self.current_read_is_deadline_limited();
         let read = self
             .body
             .as_reader()
             .read(buffer)
-            .map_err(|source| self.map_read_error(source));
+            .map_err(|source| self.map_read_error(source, deadline_limited));
         match read {
             Ok(read) => {
                 if let Err(error) = self.ensure_within_deadline() {

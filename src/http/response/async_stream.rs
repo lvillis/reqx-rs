@@ -18,7 +18,10 @@ use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
 
-use super::{Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_within_slack};
+use super::{
+    Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
+    deadline_within_slack,
+};
 
 #[derive(Debug)]
 pub(crate) struct StreamPermits {
@@ -58,6 +61,7 @@ struct StreamBody {
     deadline_slack: Duration,
     clock: Arc<dyn Clock>,
     frame_timeout: Option<Pin<Box<Sleep>>>,
+    frame_timeout_deadline_limited: bool,
     read_buffer: Bytes,
     lifecycle: Option<StreamLifecycle>,
     _global_permit: Option<GlobalRequestPermit>,
@@ -88,6 +92,7 @@ impl StreamBody {
             deadline_slack,
             clock,
             frame_timeout: None,
+            frame_timeout_deadline_limited: false,
             read_buffer: Bytes::new(),
             lifecycle,
             _global_permit: permits.global,
@@ -139,23 +144,27 @@ impl StreamBody {
         super::write_body_error(&self.method, &self.uri_redacted, source)
     }
 
-    fn effective_frame_timeout(&self) -> crate::Result<Duration> {
+    fn effective_frame_timeout(&self) -> crate::Result<(Duration, bool)> {
         let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
         let Some(deadline_at) = self.deadline_at else {
-            return Ok(phase_timeout);
+            return Ok((phase_timeout, false));
         };
         let now = self.clock.now_monotonic();
         if deadline_elapsed(deadline_at, now) {
             return Err(self.deadline_exceeded_error());
         }
         let remaining = deadline_at.saturating_duration_since(now);
-        Ok(phase_timeout.min(remaining))
+        Ok((
+            phase_timeout.min(remaining),
+            deadline_limits_wait(phase_timeout, deadline_at, now),
+        ))
     }
 
     fn ensure_frame_timeout(&mut self) -> crate::Result<()> {
         if self.frame_timeout.is_none() {
-            let timeout = self.effective_frame_timeout()?;
+            let (timeout, deadline_limited) = self.effective_frame_timeout()?;
             self.frame_timeout = Some(Box::pin(tokio::time::sleep(timeout)));
+            self.frame_timeout_deadline_limited = deadline_limited;
         }
         Ok(())
     }
@@ -168,6 +177,7 @@ impl StreamBody {
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     self.frame_timeout = None;
+                    self.frame_timeout_deadline_limited = false;
                     match frame.into_data() {
                         Ok(data) if data.is_empty() => continue,
                         Ok(data) => return Poll::Ready(Some(Ok(data))),
@@ -176,12 +186,14 @@ impl StreamBody {
                 }
                 Poll::Ready(Some(Err(source))) => {
                     self.frame_timeout = None;
+                    self.frame_timeout_deadline_limited = false;
                     return Poll::Ready(Some(Err(Error::ReadBody {
                         source: Box::new(source),
                     })));
                 }
                 Poll::Ready(None) => {
                     self.frame_timeout = None;
+                    self.frame_timeout_deadline_limited = false;
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -192,17 +204,17 @@ impl StreamBody {
                         && timer.as_mut().poll(cx).is_ready()
                     {
                         self.frame_timeout = None;
+                        let now = self.clock.now_monotonic();
                         let error = if self.deadline_at.is_some_and(|deadline_at| {
-                            deadline_within_slack(
-                                deadline_at,
-                                self.clock.now_monotonic(),
-                                self.deadline_slack,
-                            )
+                            deadline_elapsed(deadline_at, now)
+                                || (self.frame_timeout_deadline_limited
+                                    && deadline_within_slack(deadline_at, now, self.deadline_slack))
                         }) {
                             self.deadline_exceeded_error()
                         } else {
                             self.response_body_timeout_error()
                         };
+                        self.frame_timeout_deadline_limited = false;
                         return Poll::Ready(Some(Err(error)));
                     }
                     return Poll::Pending;
@@ -361,6 +373,10 @@ impl std::fmt::Debug for StreamBody {
             .field("deadline_at", &self.deadline_at)
             .field("deadline_slack", &self.deadline_slack)
             .field("has_frame_timeout", &self.frame_timeout.is_some())
+            .field(
+                "frame_timeout_deadline_limited",
+                &self.frame_timeout_deadline_limited,
+            )
             .field("read_buffer_len", &self.read_buffer.len())
             .field("has_lifecycle", &self.lifecycle.is_some())
             .finish()
