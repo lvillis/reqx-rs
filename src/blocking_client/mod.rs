@@ -95,6 +95,12 @@ impl AdaptiveConcurrencyController {
         state.release_and_record(self.policy, success, latency);
         self.condvar.notify_all();
     }
+
+    fn release_without_record(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.release_without_record();
+        self.condvar.notify_all();
+    }
 }
 
 struct AdaptiveConcurrencyPermit {
@@ -107,6 +113,17 @@ impl AdaptiveConcurrencyPermit {
     fn mark_success(mut self) {
         self.controller
             .release_and_record(true, self.started_at.elapsed());
+        self.completed = true;
+    }
+
+    fn mark_failure(mut self) {
+        self.controller
+            .release_and_record(false, self.started_at.elapsed());
+        self.completed = true;
+    }
+
+    fn cancel(mut self) {
+        self.controller.release_without_record();
         self.completed = true;
     }
 }

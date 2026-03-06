@@ -146,6 +146,22 @@ impl Drop for MockServer {
     }
 }
 
+#[derive(Clone)]
+struct ThrottleObserver {
+    scopes: Arc<Mutex<Vec<ServerThrottleScope>>>,
+}
+
+impl reqx::Observer for ThrottleObserver {
+    fn on_server_throttle(
+        &self,
+        _context: &reqx::RequestContext,
+        scope: ServerThrottleScope,
+        _delay: Duration,
+    ) {
+        self.scopes.lock().expect("lock scopes").push(scope);
+    }
+}
+
 struct SplitBodyServer {
     base_url: String,
     join: Option<JoinHandle<()>>,
@@ -1514,6 +1530,51 @@ async fn retry_after_429_global_scope_backpressures_other_hosts() {
         cross_host_started.elapsed() >= Duration::from_millis(900),
         "global scope should backpressure requests for other hosts"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_after_429_observer_receives_resolved_scope() {
+    let server = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1"), ("X-RateLimit-Scope", "global")],
+        "busy",
+        Duration::ZERO,
+    )]);
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let observer = ThrottleObserver {
+        scopes: Arc::clone(&scopes),
+    };
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .server_throttle_scope(ServerThrottleScope::Auto)
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/throttled-scope")
+        .send()
+        .await
+        .expect_err("request should return 429");
+    match error {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let recorded = scopes.lock().expect("lock scopes").clone();
+    assert_eq!(recorded, vec![ServerThrottleScope::Global]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

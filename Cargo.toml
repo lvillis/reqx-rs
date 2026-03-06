@@ -84,20 +84,14 @@ blocking-tls-rustls-aws-lc-rs = [
 ]
 blocking-tls-native = ["_blocking", "dep:rustls-native-certs", "ureq/native-tls"]
 
-# Ergonomic aliases for downstream SDKs.
-async-rustls = ["async-tls-rustls-ring"]
-async-native-tls = ["async-tls-native"]
-blocking-rustls = ["blocking-tls-rustls-ring"]
-blocking-native-tls = ["blocking-tls-native"]
-
 otel = ["dep:opentelemetry"]
 
 [dependencies]
 # Async runtime and stream primitives.
 tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-util = { version = "0.7.18", default-features = false, features = ["io"], optional = true }
-futures-core = { version = "0.3.31", default-features = false, features = ["alloc", "std"], optional = true }
-futures-util = { version = "0.3.31", default-features = false, features = ["alloc", "std"], optional = true }
+futures-core = { version = "0.3.32", default-features = false, features = ["alloc", "std"], optional = true }
+futures-util = { version = "0.3.32", default-features = false, features = ["alloc", "std"], optional = true }
 bytes = { version = "1.11.1", default-features = false, features = ["std"] }
 
 # HTTP stack.
@@ -112,7 +106,7 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 # TLS backends (feature-gated).
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
 rustls = { version = "0.23.36", default-features = false, features = ["std"], optional = true }
-rustls-native-certs = { version = "0.8.2", optional = true }
+rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 

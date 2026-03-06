@@ -29,13 +29,13 @@ cargo add reqx
 Use `native-tls`:
 
 ```bash
-cargo add reqx --no-default-features -F async-native-tls
+cargo add reqx --no-default-features -F async-tls-native
 ```
 
-Use `rustls` (alias to `async-tls-rustls-ring`):
+Use `rustls (ring)`:
 
 ```bash
-cargo add reqx --no-default-features -F async-rustls
+cargo add reqx --no-default-features -F async-tls-rustls-ring
 ```
 
 Use `rustls + aws-lc-rs`:
@@ -47,13 +47,13 @@ cargo add reqx --no-default-features -F async-tls-rustls-aws-lc-rs
 Use blocking client with `ureq + rustls(ring)`:
 
 ```bash
-cargo add reqx --no-default-features -F blocking-rustls
+cargo add reqx --no-default-features -F blocking-tls-rustls-ring
 ```
 
 Use blocking client with `ureq + native-tls`:
 
 ```bash
-cargo add reqx --no-default-features -F blocking-native-tls
+cargo add reqx --no-default-features -F blocking-tls-native
 ```
 
 ## TLS Backends
@@ -70,11 +70,6 @@ cargo add reqx --no-default-features -F blocking-native-tls
   - `blocking-tls-rustls-ring`
   - `blocking-tls-rustls-aws-lc-rs`
   - `blocking-tls-native`
-- ergonomic aliases:
-  - `async-rustls` -> `async-tls-rustls-ring`
-  - `async-native-tls` -> `async-tls-native`
-  - `blocking-rustls` -> `blocking-tls-rustls-ring`
-  - `blocking-native-tls` -> `blocking-tls-native`
 - runtime selection via `tls_backend(TlsBackend::...)`
 - build-time mismatch returns structured error from `build()`
 - trust store selection via `tls_root_store(TlsRootStore::BackendDefault | WebPki | System | Specific)`

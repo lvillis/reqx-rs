@@ -16,7 +16,10 @@ use crate::execution::{
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
 use crate::rate_limit::server_throttle_scope_from_headers;
-use crate::response::{BlockingResponseStream, BlockingResponseStreamContext, Response};
+use crate::response::{
+    BlockingResponseStream, BlockingResponseStreamContext, Response, StreamLifecycle,
+    StreamOutcomeHooks,
+};
 use crate::retry::{RetryDecision, RetryPolicy};
 use crate::tls::TlsBackend;
 use crate::util::{
@@ -112,8 +115,52 @@ struct StreamResponseInput {
     transport_timeout: Duration,
     stream_total_timeout_ms: Option<u128>,
     stream_deadline_at: Option<Instant>,
+    stream_lifecycle: Option<StreamLifecycle>,
     stream_global_permit: Option<GlobalRequestPermit>,
     host_permit: HostRequestPermit,
+}
+
+struct StreamResilienceHooks {
+    retry_budget: Option<std::sync::Arc<crate::resilience::RetryBudget>>,
+    record_retry_budget_success: bool,
+    circuit_attempt: Option<crate::resilience::CircuitAttempt>,
+    adaptive_attempt: Option<AdaptiveConcurrencyPermit>,
+}
+
+impl StreamOutcomeHooks for StreamResilienceHooks {
+    fn complete_success(&mut self) {
+        if self.record_retry_budget_success
+            && let Some(retry_budget) = self.retry_budget.take()
+        {
+            retry_budget.record_success();
+        }
+        if let Some(circuit_attempt) = self.circuit_attempt.take() {
+            circuit_attempt.mark_success();
+        }
+        if let Some(adaptive_attempt) = self.adaptive_attempt.take() {
+            adaptive_attempt.mark_success();
+        }
+    }
+
+    fn complete_error(&mut self, _error: &Error) {
+        self.retry_budget = None;
+        if let Some(circuit_attempt) = self.circuit_attempt.take() {
+            circuit_attempt.mark_failure();
+        }
+        if let Some(adaptive_attempt) = self.adaptive_attempt.take() {
+            adaptive_attempt.mark_failure();
+        }
+    }
+
+    fn complete_canceled(&mut self) {
+        self.retry_budget = None;
+        if let Some(circuit_attempt) = self.circuit_attempt.take() {
+            circuit_attempt.cancel();
+        }
+        if let Some(adaptive_attempt) = self.adaptive_attempt.take() {
+            adaptive_attempt.cancel();
+        }
+    }
 }
 
 fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
@@ -127,6 +174,7 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
         transport_timeout,
         stream_total_timeout_ms,
         stream_deadline_at,
+        stream_lifecycle,
         stream_global_permit,
         host_permit,
     } = input;
@@ -141,6 +189,7 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
             timeout_ms: transport_timeout.as_millis(),
             total_timeout_ms: stream_total_timeout_ms,
             deadline_at: stream_deadline_at,
+            lifecycle: stream_lifecycle,
             global_permit: stream_global_permit,
             host_permit: Some(host_permit),
         },
@@ -228,9 +277,14 @@ impl Client {
         }
     }
 
-    fn run_server_throttle_observers(&self, context: &RequestContext, delay: Duration) {
+    fn run_server_throttle_observers(
+        &self,
+        context: &RequestContext,
+        scope: crate::rate_limit::ServerThrottleScope,
+        delay: Duration,
+    ) {
         for observer in &self.observers {
-            observer.on_server_throttle(context, self.server_throttle_scope, delay);
+            observer.on_server_throttle(context, scope, delay);
         }
     }
 
@@ -248,6 +302,26 @@ impl Client {
         if !retry_policy.is_retryable_status(status) {
             self.record_successful_request_for_resilience();
         }
+    }
+
+    fn stream_lifecycle(
+        &self,
+        record_retry_budget_success: bool,
+        circuit_attempt: Option<crate::resilience::CircuitAttempt>,
+        adaptive_attempt: Option<AdaptiveConcurrencyPermit>,
+    ) -> Option<StreamLifecycle> {
+        if self.retry_budget.is_none() && circuit_attempt.is_none() && adaptive_attempt.is_none() {
+            return None;
+        }
+
+        Some(StreamLifecycle::new(Some(Box::new(
+            StreamResilienceHooks {
+                retry_budget: self.retry_budget.clone(),
+                record_retry_budget_success,
+                circuit_attempt,
+                adaptive_attempt,
+            },
+        ))))
     }
 
     fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
@@ -382,13 +456,13 @@ impl Client {
             fallback_delay,
             max_retry_delay,
         );
-        rate_limiter.observe_server_throttle(
+        let resolved_scope = rate_limiter.observe_server_throttle(
             host,
             throttle_delay,
             self.server_throttle_scope,
             server_throttle_scope_from_headers(headers),
         );
-        self.run_server_throttle_observers(context, throttle_delay);
+        self.run_server_throttle_observers(context, resolved_scope, throttle_delay);
     }
 
     fn schedule_retry(
@@ -1225,13 +1299,11 @@ impl Client {
                 ran_response_interceptors = true;
 
                 if status.is_success() {
-                    if let Some(attempt_guard) = circuit_attempt.take() {
-                        attempt_guard.mark_success();
-                    }
-                    if let Some(adaptive_guard) = adaptive_attempt.take() {
-                        adaptive_guard.mark_success();
-                    }
-                    self.record_successful_request_for_resilience();
+                    let stream_lifecycle = self.stream_lifecycle(
+                        true,
+                        circuit_attempt.take(),
+                        adaptive_attempt.take(),
+                    );
                     return Ok(stream_retry_response(StreamResponseInput {
                         status,
                         response_headers,
@@ -1242,6 +1314,7 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,
                     }));
@@ -1275,13 +1348,11 @@ impl Client {
                     continue;
                 }
                 if should_return_non_success_response(status_policy) {
-                    self.maybe_record_terminal_response_success(status, &retry_policy);
-                    if let Some(attempt_guard) = circuit_attempt.take() {
-                        attempt_guard.mark_success();
-                    }
-                    if let Some(adaptive_guard) = adaptive_attempt.take() {
-                        adaptive_guard.mark_success();
-                    }
+                    let stream_lifecycle = self.stream_lifecycle(
+                        !retry_policy.is_retryable_status(status),
+                        circuit_attempt.take(),
+                        adaptive_attempt.take(),
+                    );
                     return Ok(stream_retry_response(StreamResponseInput {
                         status,
                         response_headers,
@@ -1292,6 +1363,7 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,
                     }));

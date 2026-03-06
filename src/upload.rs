@@ -481,6 +481,12 @@ where
                 options_checksum_algorithm: options_algorithm.as_str(),
             });
         }
+        (Some(checkpoint_algorithm), None) => {
+            return Err(ResumableUploadError::CheckpointChecksumAlgorithmMismatch {
+                checkpoint_checksum_algorithm: checkpoint_algorithm.as_str(),
+                options_checksum_algorithm: "none",
+            });
+        }
         (None, Some(options_algorithm)) => {
             checkpoint.checksum_algorithm = Some(options_algorithm);
         }
@@ -1173,6 +1179,36 @@ mod tests {
 
         match error {
             ResumableUploadError::CheckpointChecksumAlgorithmMismatch { .. } => {}
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn blocking_checkpoint_checksum_algorithm_downgrade_is_rejected() {
+        let backend = BlockingMockBackend::default();
+        let uploader = BlockingResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+
+        let mut reader = std::io::Cursor::new(b"abcd".to_vec());
+        let error = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .expect_err("resume should reject checksum algorithm downgrade");
+
+        match error {
+            ResumableUploadError::CheckpointChecksumAlgorithmMismatch {
+                checkpoint_checksum_algorithm,
+                options_checksum_algorithm,
+            } => {
+                assert_eq!(checkpoint_checksum_algorithm, "md5");
+                assert_eq!(options_checksum_algorithm, "none");
+            }
             other => panic!("unexpected error variant: {other}"),
         }
     }

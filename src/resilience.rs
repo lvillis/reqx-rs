@@ -311,6 +311,15 @@ impl CircuitAttempt {
         self.breaker.record_success(self.kind);
         self.completed = true;
     }
+
+    pub(crate) fn mark_failure(mut self) {
+        self.breaker.record_failure(self.kind);
+        self.completed = true;
+    }
+
+    pub(crate) fn cancel(mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for CircuitAttempt {
@@ -498,6 +507,10 @@ impl AdaptiveConcurrencyState {
                 .saturating_add(policy.configured_increase_step())
                 .min(policy.configured_max_limit());
         }
+    }
+
+    pub(crate) fn release_without_record(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
     }
 }
 

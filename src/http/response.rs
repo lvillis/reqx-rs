@@ -5,6 +5,8 @@ use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::error::Error;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+use crate::metrics::StreamCompletion;
 use crate::util::truncate_body;
 
 #[derive(Clone, Debug)]
@@ -50,6 +52,104 @@ impl Response {
     }
 }
 
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) trait StreamOutcomeHooks {
+    fn complete_success(&mut self);
+
+    fn complete_error(&mut self, error: &Error);
+
+    fn complete_canceled(&mut self);
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamLifecycleState {
+    Pending,
+    Success,
+    Error,
+    Canceled,
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) struct StreamLifecycle {
+    completion: Option<StreamCompletion>,
+    hooks: Option<Box<dyn StreamOutcomeHooks + Send>>,
+    state: StreamLifecycleState,
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+impl StreamLifecycle {
+    pub(crate) fn new(hooks: Option<Box<dyn StreamOutcomeHooks + Send>>) -> Self {
+        Self {
+            completion: None,
+            hooks,
+            state: StreamLifecycleState::Pending,
+        }
+    }
+
+    pub(crate) fn attach_completion(&mut self, completion: StreamCompletion) {
+        self.completion = Some(completion);
+    }
+
+    pub(crate) fn complete_success(&mut self) {
+        if self.state != StreamLifecycleState::Pending {
+            return;
+        }
+        self.state = StreamLifecycleState::Success;
+        if let Some(hooks) = &mut self.hooks {
+            hooks.complete_success();
+        }
+        if let Some(completion) = &mut self.completion {
+            completion.complete_success();
+        }
+    }
+
+    pub(crate) fn complete_error(&mut self, error: &Error) {
+        if self.state != StreamLifecycleState::Pending {
+            return;
+        }
+        self.state = StreamLifecycleState::Error;
+        if let Some(hooks) = &mut self.hooks {
+            hooks.complete_error(error);
+        }
+        if let Some(completion) = &mut self.completion {
+            completion.complete_error(error);
+        }
+    }
+
+    pub(crate) fn complete_canceled(&mut self) {
+        if self.state != StreamLifecycleState::Pending {
+            return;
+        }
+        self.state = StreamLifecycleState::Canceled;
+        if let Some(hooks) = &mut self.hooks {
+            hooks.complete_canceled();
+        }
+        if let Some(completion) = &mut self.completion {
+            completion.complete_canceled();
+        }
+    }
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+impl std::fmt::Debug for StreamLifecycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamLifecycle")
+            .field("has_completion", &self.completion.is_some())
+            .field("has_hooks", &self.hooks.is_some())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+impl Drop for StreamLifecycle {
+    fn drop(&mut self) {
+        self.complete_canceled();
+    }
+}
+
 #[cfg(feature = "_async")]
 mod stream {
     use std::future::Future;
@@ -69,7 +169,6 @@ mod stream {
     use crate::content_encoding::should_decode_content_encoded_body;
     use crate::error::{Error, TimeoutPhase};
     use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
-    use crate::metrics::StreamCompletion;
     use crate::response::Response;
 
     fn map_decode_body_error(
@@ -105,7 +204,7 @@ mod stream {
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
         frame_timeout: Option<Pin<Box<Sleep>>>,
-        completion: Option<StreamCompletion>,
+        lifecycle: Option<super::StreamLifecycle>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -119,6 +218,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                lifecycle,
                 permits,
             } = context;
             Self {
@@ -129,14 +229,14 @@ mod stream {
                 total_timeout_ms,
                 deadline_at,
                 frame_timeout: None,
-                completion: None,
+                lifecycle,
                 _global_permit: permits.global,
                 _host_permit: permits.host,
             }
         }
 
-        fn with_completion(mut self, completion: Option<StreamCompletion>) -> Self {
-            self.completion = completion;
+        fn with_lifecycle(mut self, lifecycle: Option<super::StreamLifecycle>) -> Self {
+            self.lifecycle = lifecycle;
             self
         }
 
@@ -181,14 +281,14 @@ mod stream {
         }
 
         fn complete_success(&mut self) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_success();
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_success();
             }
         }
 
         fn complete_error(&mut self, error: &Error) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_error(error);
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_error(error);
             }
         }
     }
@@ -276,6 +376,7 @@ mod stream {
         pub(crate) timeout_ms: u128,
         pub(crate) total_timeout_ms: Option<u128>,
         pub(crate) deadline_at: Option<Instant>,
+        pub(crate) lifecycle: Option<super::StreamLifecycle>,
         pub(crate) permits: StreamPermits,
     }
 
@@ -290,7 +391,7 @@ mod stream {
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
-        completion: Option<StreamCompletion>,
+        lifecycle: Option<super::StreamLifecycle>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -309,6 +410,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                lifecycle,
                 permits,
             } = context;
             Self {
@@ -321,14 +423,20 @@ mod stream {
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
-                completion: None,
+                lifecycle,
                 _global_permit: permits.global,
                 _host_permit: permits.host,
             }
         }
 
-        pub(crate) fn attach_completion(&mut self, completion: StreamCompletion) {
-            self.completion = Some(completion);
+        pub(crate) fn attach_completion(&mut self, completion: super::StreamCompletion) {
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.attach_completion(completion);
+            } else {
+                let mut lifecycle = super::StreamLifecycle::new(None);
+                lifecycle.attach_completion(completion);
+                self.lifecycle = Some(lifecycle);
+            }
         }
 
         pub fn status(&self) -> StatusCode {
@@ -370,7 +478,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
-                completion,
+                lifecycle,
                 _global_permit,
                 _host_permit,
                 ..
@@ -384,10 +492,11 @@ mod stream {
                     timeout_ms,
                     total_timeout_ms,
                     deadline_at,
+                    lifecycle: None,
                     permits: StreamPermits::new(_global_permit, _host_permit),
                 },
             )
-            .with_completion(completion)
+            .with_lifecycle(lifecycle)
         }
 
         pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
@@ -503,7 +612,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
-                completion,
+                lifecycle,
                 _global_permit,
                 _host_permit,
             } = self;
@@ -518,7 +627,7 @@ mod stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
-                completion,
+                lifecycle,
                 _global_permit,
                 _host_permit,
             };
@@ -583,14 +692,14 @@ mod stream {
         }
 
         fn complete_success(&mut self) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_success();
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_success();
             }
         }
 
         fn complete_error(&mut self, error: &Error) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_error(error);
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_error(error);
             }
         }
 
@@ -667,7 +776,6 @@ mod blocking_stream {
         should_decode_content_encoded_body,
     };
     use crate::error::{Error, TimeoutPhase};
-    use crate::metrics::StreamCompletion;
     use crate::response::Response;
 
     fn map_read_error(
@@ -780,7 +888,7 @@ mod blocking_stream {
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
-        completion: Option<StreamCompletion>,
+        lifecycle: Option<super::StreamLifecycle>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
@@ -793,6 +901,7 @@ mod blocking_stream {
         pub(crate) timeout_ms: u128,
         pub(crate) total_timeout_ms: Option<u128>,
         pub(crate) deadline_at: Option<Instant>,
+        pub(crate) lifecycle: Option<super::StreamLifecycle>,
         pub(crate) global_permit: Option<GlobalRequestPermit>,
         pub(crate) host_permit: Option<HostRequestPermit>,
     }
@@ -811,6 +920,7 @@ mod blocking_stream {
                 timeout_ms,
                 total_timeout_ms,
                 deadline_at,
+                lifecycle,
                 global_permit,
                 host_permit,
             } = context;
@@ -824,14 +934,20 @@ mod blocking_stream {
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
-                completion: None,
+                lifecycle,
                 _global_permit: global_permit,
                 _host_permit: host_permit,
             }
         }
 
-        pub(crate) fn attach_completion(&mut self, completion: StreamCompletion) {
-            self.completion = Some(completion);
+        pub(crate) fn attach_completion(&mut self, completion: super::StreamCompletion) {
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.attach_completion(completion);
+            } else {
+                let mut lifecycle = super::StreamLifecycle::new(None);
+                lifecycle.attach_completion(completion);
+                self.lifecycle = Some(lifecycle);
+            }
         }
 
         pub fn status(&self) -> StatusCode {
@@ -864,23 +980,17 @@ mod blocking_stream {
             &self.uri_redacted
         }
 
-        /// Consumes the stream and hands the raw blocking body to the caller.
-        ///
-        /// Metrics and spans are completed at handoff time because the
-        /// downstream `ureq::Body` read lifecycle is not observable by reqx.
-        pub fn into_body(mut self) -> ureq::Body {
-            self.complete_success();
-            self.body
-        }
-
         pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
-            ensure_within_deadline(
+            if let Err(error) = ensure_within_deadline(
                 self.deadline_at,
                 &self.method,
                 &self.uri_redacted,
                 self.timeout_ms,
                 self.total_timeout_ms,
-            )?;
+            ) {
+                self.complete_error(&error);
+                return Err(error);
+            }
             let read = self.body.as_reader().read(buffer).map_err(|source| {
                 map_read_error_with_deadline(
                     source,
@@ -1083,15 +1193,22 @@ mod blocking_stream {
         }
 
         fn complete_success(&mut self) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_success();
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_success();
             }
         }
 
         fn complete_error(&mut self, error: &Error) {
-            if let Some(completion) = &mut self.completion {
-                completion.complete_error(error);
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_error(error);
             }
+        }
+    }
+
+    impl Read for BlockingResponseStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.read_chunk(buffer)
+                .map_err(std::io::Error::other)
         }
     }
 }

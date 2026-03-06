@@ -1507,6 +1507,78 @@ async fn retry_budget_exhausted_stops_retry_loop_early() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_budget_stream_body_failure_does_not_credit_success() {
+    let delayed_server = DelayedBodyServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"delayed".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let busy_server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", delayed_server.authority()))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(60))
+                .retry_ratio(1.0)
+                .min_retries_per_window(0),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-budget-credit")
+        .timeout(Duration::from_millis(20))
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let error = stream
+        .into_body()
+        .collect()
+        .await
+        .expect_err("stream body should time out");
+    match error {
+        Error::Timeout { phase, .. } => assert_eq!(phase, reqx::TimeoutPhase::ResponseBody),
+        other => panic!("unexpected stream error: {other}"),
+    }
+
+    let error = client
+        .get(format!(
+            "http://{}/budget-after-stream",
+            busy_server.authority()
+        ))
+        .send()
+        .await
+        .expect_err("stream body failure must not credit retry budget");
+    match error {
+        Error::RetryBudgetExhausted { .. } => {}
+        other => panic!("unexpected retry budget error: {other}"),
+    }
+    assert_eq!(
+        busy_server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn circuit_breaker_short_circuits_after_opening() {
     let server = CountingServer::start(
         1,
@@ -1553,6 +1625,73 @@ async fn circuit_breaker_short_circuits_after_opening() {
     assert_eq!(
         server.wait_for_served_count(1, Duration::from_millis(200)),
         1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_stream_body_failure_opens_circuit() {
+    let delayed_server = DelayedBodyServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"delayed".to_vec(),
+            Duration::from_millis(120),
+        ),
+    );
+    let success_server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", delayed_server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-open-circuit")
+        .timeout(Duration::from_millis(20))
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let error = stream
+        .into_body()
+        .collect()
+        .await
+        .expect_err("stream body should time out");
+    match error {
+        Error::Timeout { phase, .. } => assert_eq!(phase, reqx::TimeoutPhase::ResponseBody),
+        other => panic!("unexpected stream error: {other}"),
+    }
+
+    let error = client
+        .get(format!(
+            "http://{}/after-stream-open",
+            success_server.authority()
+        ))
+        .send()
+        .await
+        .expect_err("circuit should open after stream body failure");
+    match error {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected circuit error: {other}"),
+    }
+    assert_eq!(
+        success_server.wait_for_served_count(1, Duration::from_millis(100)),
+        0
     );
 }
 

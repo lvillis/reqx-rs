@@ -313,18 +313,18 @@ impl RateLimiter {
         delay: Duration,
         configured_scope: ServerThrottleScope,
         header_scope_hint: Option<ServerThrottleScope>,
-    ) {
-        if delay.is_zero() {
-            return;
-        }
-
-        let now = Instant::now();
+    ) -> ServerThrottleScope {
         let host_key = host.map(|item| item.to_ascii_lowercase());
         let resolved_scope = self.resolve_server_throttle_scope(
             configured_scope,
             header_scope_hint,
             host_key.is_some(),
         );
+        if delay.is_zero() {
+            return resolved_scope;
+        }
+
+        let now = Instant::now();
 
         let mut applied = false;
 
@@ -369,6 +369,8 @@ impl RateLimiter {
                 bucket.apply_throttle(now, delay);
             }
         }
+
+        resolved_scope
     }
 
     fn maybe_cleanup_stale_per_host_rate_limits(

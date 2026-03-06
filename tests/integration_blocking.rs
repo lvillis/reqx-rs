@@ -125,6 +125,22 @@ impl Drop for MockServer {
     }
 }
 
+#[derive(Clone)]
+struct ThrottleObserver {
+    scopes: Arc<Mutex<Vec<ServerThrottleScope>>>,
+}
+
+impl reqx::Observer for ThrottleObserver {
+    fn on_server_throttle(
+        &self,
+        _context: &reqx::RequestContext,
+        scope: ServerThrottleScope,
+        _delay: Duration,
+    ) {
+        self.scopes.lock().expect("lock scopes").push(scope);
+    }
+}
+
 struct BlockingProxyServer {
     uri: String,
     served: Arc<AtomicUsize>,
@@ -946,6 +962,49 @@ fn blocking_retry_after_429_global_scope_backpressures_other_hosts() {
 }
 
 #[test]
+fn blocking_retry_after_429_observer_receives_resolved_scope() {
+    let server = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1"), ("X-RateLimit-Scope", "global")],
+        b"busy".to_vec(),
+    )]);
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let observer = ThrottleObserver {
+        scopes: Arc::clone(&scopes),
+    };
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .global_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .per_host_rate_limit_policy(
+            RateLimitPolicy::standard()
+                .requests_per_second(500.0)
+                .burst(50),
+        )
+        .server_throttle_scope(ServerThrottleScope::Auto)
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/throttled-scope")
+        .send()
+        .expect_err("request should return 429");
+    match error {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let recorded = scopes.lock().expect("lock scopes").clone();
+    assert_eq!(recorded, vec![ServerThrottleScope::Global]);
+}
+
+#[test]
 fn blocking_max_in_flight_enforces_single_active_request() {
     let server = CountingServer::start(
         3,
@@ -1241,6 +1300,62 @@ fn blocking_retry_budget_exhausted_stops_retry_loop_early() {
 }
 
 #[test]
+fn blocking_retry_budget_stream_body_failure_does_not_credit_success() {
+    let delayed_server = SplitBodyServer::start(
+        200,
+        Vec::<(String, String)>::new(),
+        b"delayed".to_vec(),
+        Duration::from_millis(120),
+    );
+    let busy_server = MockServer::start(vec![MockResponse::new(
+        503,
+        vec![("Content-Type", "application/json")],
+        b"{}".to_vec(),
+    )]);
+
+    let client = Client::builder(delayed_server.base_url.clone())
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(1))
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .retry_budget_policy(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_secs(60))
+                .retry_ratio(1.0)
+                .min_retries_per_window(0),
+        )
+        .request_timeout(Duration::from_secs(1))
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/v1/stream-budget-credit")
+        .timeout(Duration::from_millis(20))
+        .send_stream()
+        .expect("stream request should return headers");
+    let error = stream
+        .into_bytes_limited(1024)
+        .expect_err("stream body should time out");
+    match error {
+        Error::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::ResponseBody),
+        other => panic!("unexpected stream error: {other}"),
+    }
+
+    let error = client
+        .get(format!("{}/v1/budget-after-stream", busy_server.base_url))
+        .send()
+        .expect_err("stream body failure must not credit retry budget");
+    match error {
+        Error::RetryBudgetExhausted { .. } => {}
+        other => panic!("unexpected retry budget error: {other}"),
+    }
+    assert_eq!(busy_server.served_count(), 1);
+}
+
+#[test]
 fn blocking_retry_budget_is_credited_by_non_retryable_status_response_mode() {
     let server = MockServer::start(vec![
         MockResponse::new(404, Vec::<(String, String)>::new(), b"not-found".to_vec()),
@@ -1352,6 +1467,57 @@ fn blocking_circuit_breaker_short_circuits_after_opening() {
     }
 
     assert_eq!(server.served_count(), 1);
+}
+
+#[test]
+fn blocking_circuit_breaker_stream_body_failure_opens_circuit() {
+    let delayed_server = SplitBodyServer::start(
+        200,
+        Vec::<(String, String)>::new(),
+        b"delayed".to_vec(),
+        Duration::from_millis(120),
+    );
+    let success_server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(delayed_server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_secs(1))
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/v1/stream-open-circuit")
+        .timeout(Duration::from_millis(20))
+        .send_stream()
+        .expect("stream request should return headers");
+    let error = stream
+        .into_bytes_limited(1024)
+        .expect_err("stream body should time out");
+    match error {
+        Error::Timeout { phase, .. } => assert_eq!(phase, TimeoutPhase::ResponseBody),
+        other => panic!("unexpected stream error: {other}"),
+    }
+
+    let error = client
+        .get(format!("{}/v1/after-stream-open", success_server.base_url))
+        .send()
+        .expect_err("circuit should open after stream body failure");
+    match error {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected circuit error: {other}"),
+    }
+    assert_eq!(success_server.served_count(), 0);
 }
 
 #[test]
@@ -1759,7 +1925,7 @@ fn blocking_read_chunk_eof_marks_success_not_canceled() {
 }
 
 #[test]
-fn blocking_into_body_handoff_marks_success_not_canceled() {
+fn blocking_read_trait_eof_marks_success_not_canceled() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
         vec![("Content-Type", "application/octet-stream")],
@@ -1773,14 +1939,13 @@ fn blocking_into_body_handoff_marks_success_not_canceled() {
         .build()
         .expect("client should build");
 
-    let stream = client
+    let mut stream = client
         .get("/stream-into-body")
         .send_stream()
         .expect("stream request should succeed");
-    let mut body = stream.into_body();
 
     let mut out = Vec::new();
-    body.as_reader()
+    stream
         .read_to_end(&mut out)
         .expect("body read should succeed");
     assert_eq!(out, b"handoff-body".to_vec());
