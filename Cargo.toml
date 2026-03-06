@@ -146,6 +146,10 @@ name = "basic_json"
 required-features = ["_async"]
 
 [[example]]
+name = "advanced_time_controls"
+required-features = ["_async"]
+
+[[example]]
 name = "concurrency_limits"
 required-features = ["_async"]
 

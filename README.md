@@ -20,6 +20,7 @@ It focuses on SDK transport concerns: retries, timeout phases, idempotency, prox
 - For multi-endpoint SDKs, plug in an `EndpointSelector` (for example `RoundRobinEndpointSelector`).
 - Hook transport events through `Observer` for retries and server-throttle telemetry.
 - Use `control_clock(...)` only when you need deterministic Retry-After or control-loop behavior in tests.
+- See `advanced_time_controls` for the minimal expert-only setup of `control_clock(...)` and `stream_deadline_slack(...)`.
 - Reach for `reqx::advanced::{...}` when you need non-default transport controls.
 
 ## Install
@@ -170,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - Full index: `examples/README.md`
 - `cargo run --example basic_json`
+- `cargo run --example advanced_time_controls`
 - `cargo run --example request_helpers`
 - `cargo run --example request_overrides`
 - `cargo run --example profile_and_observer`

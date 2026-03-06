@@ -13,29 +13,31 @@ Note: examples that perform real HTTP calls use `https://postman-echo.com`.
 ## Recommended Learning Path
 
 1. `basic_json` - Base client, retries, JSON send/receive.
-2. `request_helpers` - Query, form, and header helpers.
-3. `request_overrides` - Per-request timeout and retry overrides.
-4. `profile_and_observer` - Profile presets, direct builder overrides, and observer events.
-5. `error_handling` - Pattern match `Error` + stable `error.code()`.
-6. `metrics_snapshot` - Read runtime metrics counters.
-7. `streaming` - `body_reader()` plus direct `AsyncRead` and `download_to_writer_limited()`.
-8. `concurrency_limits` - `max_in_flight` behavior under parallel load.
-9. `resilience_controls` - Retry budget, circuit breaker, and adaptive concurrency.
-10. `rate_limit_429` - Global/per-host rate limiting with `429 Retry-After` backpressure.
-11. `retry_classifier` - Custom `RetryClassifier`.
-12. `proxy_and_no_proxy` - Proxy routing and bypass rules.
-13. `tls_backends` - Runtime TLS backend selection.
-14. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
-15. `interceptor_redirect` - Interceptor hooks with bounded redirect following.
-16. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
-17. `blocking_streaming` - Blocking `body_reader_with_length()` + `download_to_writer_limited()`.
-18. `resumable_upload` - Protocol-agnostic resumable multipart upload with checkpoint resume.
+2. `advanced_time_controls` - Expert-only `control_clock(...)` and `stream_deadline_slack(...)`.
+3. `request_helpers` - Query, form, and header helpers.
+4. `request_overrides` - Per-request timeout and retry overrides.
+5. `profile_and_observer` - Profile presets, direct builder overrides, and observer events.
+6. `error_handling` - Pattern match `Error` + stable `error.code()`.
+7. `metrics_snapshot` - Read runtime metrics counters.
+8. `streaming` - `body_reader()` plus direct `AsyncRead` and `download_to_writer_limited()`.
+9. `concurrency_limits` - `max_in_flight` behavior under parallel load.
+10. `resilience_controls` - Retry budget, circuit breaker, and adaptive concurrency.
+11. `rate_limit_429` - Global/per-host rate limiting with `429 Retry-After` backpressure.
+12. `retry_classifier` - Custom `RetryClassifier`.
+13. `proxy_and_no_proxy` - Proxy routing and bypass rules.
+14. `tls_backends` - Runtime TLS backend selection.
+15. `custom_ca_mtls` - Custom root CA and mTLS identity setup.
+16. `interceptor_redirect` - Interceptor lifecycle hooks + redirect policy.
+17. `blocking_basic` - Blocking client (`reqx::blocking`) on top of `ureq`.
+18. `blocking_streaming` - Blocking `body_reader_with_length()` + `download_to_writer_limited()`.
+19. `resumable_upload` - Protocol-agnostic resumable multipart upload with checkpoint resume.
 
 ## Example Index
 
 | Example                   | Focus                                                             | Run                                                                                    |
 |---------------------------|-------------------------------------------------------------------|----------------------------------------------------------------------------------------|
 | `basic_json.rs`           | Standard SDK request flow with JSON                               | `cargo run --example basic_json`                                                       |
+| `advanced_time_controls.rs` | Expert-only `control_clock(...)` and `stream_deadline_slack(...)` | `cargo run --example advanced_time_controls`                                            |
 | `request_helpers.rs`      | `.query()`, `.form()`, default/request headers                    | `cargo run --example request_helpers`                                                  |
 | `request_overrides.rs`    | Override timeout/retry at request level                           | `cargo run --example request_overrides`                                                |
 | `profile_and_observer.rs` | Use profile presets, direct builder overrides, and observer hooks | `cargo run --example profile_and_observer`                                             |
