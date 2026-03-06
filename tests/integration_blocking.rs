@@ -1908,22 +1908,22 @@ fn blocking_send_stream_drop_marks_canceled_and_releases_in_flight() {
         .expect("stream request should succeed");
 
     let in_flight_metrics = client.metrics_snapshot();
-    assert_eq!(in_flight_metrics.requests_started, 1);
-    assert_eq!(in_flight_metrics.requests_succeeded, 0);
-    assert_eq!(in_flight_metrics.requests_failed, 0);
-    assert_eq!(in_flight_metrics.requests_canceled, 0);
-    assert_eq!(in_flight_metrics.in_flight, 1);
+    assert_eq!(in_flight_metrics.requests.started, 1);
+    assert_eq!(in_flight_metrics.requests.succeeded, 0);
+    assert_eq!(in_flight_metrics.requests.failed, 0);
+    assert_eq!(in_flight_metrics.requests.canceled, 0);
+    assert_eq!(in_flight_metrics.requests.in_flight, 1);
 
     drop(stream);
 
     let canceled_metrics = client.metrics_snapshot();
-    assert_eq!(canceled_metrics.requests_started, 1);
-    assert_eq!(canceled_metrics.requests_succeeded, 0);
-    assert_eq!(canceled_metrics.requests_failed, 0);
-    assert_eq!(canceled_metrics.requests_canceled, 1);
-    assert_eq!(canceled_metrics.in_flight, 0);
+    assert_eq!(canceled_metrics.requests.started, 1);
+    assert_eq!(canceled_metrics.requests.succeeded, 0);
+    assert_eq!(canceled_metrics.requests.failed, 0);
+    assert_eq!(canceled_metrics.requests.canceled, 1);
+    assert_eq!(canceled_metrics.requests.in_flight, 0);
     assert_eq!(
-        canceled_metrics.error_counts.get("request_canceled"),
+        canceled_metrics.errors.counts.get("request_canceled"),
         Some(&1_u64)
     );
 }
@@ -1963,11 +1963,11 @@ fn blocking_read_chunk_eof_marks_success_not_canceled() {
     drop(stream);
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_succeeded, 1);
-    assert_eq!(metrics.requests_failed, 0);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 0);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.in_flight, 0);
 }
 
 #[test]
@@ -1997,11 +1997,11 @@ fn blocking_read_trait_eof_marks_success_not_canceled() {
     assert_eq!(out, b"handoff-body".to_vec());
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_succeeded, 1);
-    assert_eq!(metrics.requests_failed, 0);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 0);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.in_flight, 0);
 }
 
 #[test]
@@ -2119,11 +2119,11 @@ fn blocking_send_stream_maps_body_timeout_to_response_body_phase() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_succeeded, 0);
-    assert_eq!(metrics.requests_failed, 1);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.timeout_response_body, 1);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 0);
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.timeouts.response_body, 1);
 }
 
 #[test]
@@ -2231,11 +2231,11 @@ fn blocking_read_chunk_returns_deadline_exceeded_when_read_crosses_total_timeout
     drop(stream);
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_succeeded, 0);
-    assert_eq!(metrics.requests_failed, 1);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 0);
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.in_flight, 0);
 }
 
 #[test]
@@ -2551,9 +2551,9 @@ fn blocking_download_to_writer_reports_write_body_error() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_failed, 1);
-    assert_eq!(metrics.write_body_errors, 1);
-    assert_eq!(metrics.error_counts.get("write_body"), Some(&1));
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.errors.write_body, 1);
+    assert_eq!(metrics.errors.counts.get("write_body"), Some(&1));
 }
 
 #[test]

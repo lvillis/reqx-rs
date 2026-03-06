@@ -200,14 +200,17 @@ pub mod advanced {
     #[cfg(feature = "_async")]
     pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
     pub use crate::{
-        metrics::MetricsSnapshot,
+        metrics::{
+            ErrorMetrics, LatencyMetrics, MetricsSnapshot, RequestMetrics, ResponseMetrics,
+            TimeoutMetrics,
+        },
         observe::Observer,
         policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy},
         rate_limit::{RateLimitPolicy, ServerThrottleScope},
         resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy},
         retry::{
             PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility,
-            StrictRetryEligibility,
+            RetryReason, StrictRetryEligibility,
         },
         tls::{TlsBackend, TlsRootStore},
         upload::{

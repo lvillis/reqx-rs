@@ -16,7 +16,7 @@ use crate::execution::status_retry_delay;
 use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
-use crate::retry::{RetryDecision, RetryPolicy, request_supports_retry};
+use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
 use crate::tls::{TlsBackend, TlsRootStore};
 #[cfg(feature = "_async")]
 use crate::util::classify_transport_error_text_for_test;
@@ -308,20 +308,20 @@ fn retry_policy_backoff_is_capped() {
 fn retry_policy_can_filter_transport_error_kinds() {
     let retry_policy =
         RetryPolicy::standard().retryable_transport_error_kinds([TransportErrorKind::Connect]);
-    let connect_decision = RetryDecision {
-        attempt: 1,
-        max_attempts: 3,
-        method: http::Method::GET,
-        uri: "https://example.com".to_owned(),
-        status: None,
-        transport_error_kind: Some(TransportErrorKind::Connect),
-        timeout_phase: None,
-        response_body_read_error: false,
-    };
-    let dns_decision = RetryDecision {
-        transport_error_kind: Some(TransportErrorKind::Dns),
-        ..connect_decision.clone()
-    };
+    let connect_decision = RetryDecision::new(
+        1,
+        3,
+        http::Method::GET,
+        "https://example.com".to_owned(),
+        RetryReason::Transport(TransportErrorKind::Connect),
+    );
+    let dns_decision = RetryDecision::new(
+        1,
+        3,
+        http::Method::GET,
+        "https://example.com".to_owned(),
+        RetryReason::Transport(TransportErrorKind::Dns),
+    );
 
     assert!(retry_policy.should_retry_decision(&connect_decision));
     assert!(!retry_policy.should_retry_decision(&dns_decision));
@@ -330,20 +330,20 @@ fn retry_policy_can_filter_transport_error_kinds() {
 #[test]
 fn retry_policy_standard_skips_tls_and_other_transport_errors() {
     let retry_policy = RetryPolicy::standard();
-    let tls_decision = RetryDecision {
-        attempt: 1,
-        max_attempts: 3,
-        method: http::Method::GET,
-        uri: "https://example.com/tls".to_owned(),
-        status: None,
-        transport_error_kind: Some(TransportErrorKind::Tls),
-        timeout_phase: None,
-        response_body_read_error: false,
-    };
-    let other_decision = RetryDecision {
-        transport_error_kind: Some(TransportErrorKind::Other),
-        ..tls_decision.clone()
-    };
+    let tls_decision = RetryDecision::new(
+        1,
+        3,
+        http::Method::GET,
+        "https://example.com/tls".to_owned(),
+        RetryReason::Transport(TransportErrorKind::Tls),
+    );
+    let other_decision = RetryDecision::new(
+        1,
+        3,
+        http::Method::GET,
+        "https://example.com/tls".to_owned(),
+        RetryReason::Transport(TransportErrorKind::Other),
+    );
 
     assert!(!retry_policy.should_retry_decision(&tls_decision));
     assert!(!retry_policy.should_retry_decision(&other_decision));
@@ -382,25 +382,27 @@ fn retry_policy_status_retry_window_caps_followup_attempts() {
     let retry_policy = RetryPolicy::standard()
         .retryable_status_codes([429_u16, 503_u16])
         .status_retry_window(429, 2);
-    let first_429 = RetryDecision {
-        attempt: 1,
-        max_attempts: 5,
-        method: http::Method::GET,
-        uri: "https://example.com/rate".to_owned(),
-        status: Some(http::StatusCode::TOO_MANY_REQUESTS),
-        transport_error_kind: None,
-        timeout_phase: None,
-        response_body_read_error: false,
-    };
-    let second_429 = RetryDecision {
-        attempt: 2,
-        ..first_429.clone()
-    };
-    let third_503 = RetryDecision {
-        attempt: 3,
-        status: Some(http::StatusCode::SERVICE_UNAVAILABLE),
-        ..first_429.clone()
-    };
+    let first_429 = RetryDecision::new(
+        1,
+        5,
+        http::Method::GET,
+        "https://example.com/rate".to_owned(),
+        RetryReason::Status(http::StatusCode::TOO_MANY_REQUESTS),
+    );
+    let second_429 = RetryDecision::new(
+        2,
+        5,
+        http::Method::GET,
+        "https://example.com/rate".to_owned(),
+        RetryReason::Status(http::StatusCode::TOO_MANY_REQUESTS),
+    );
+    let third_503 = RetryDecision::new(
+        3,
+        5,
+        http::Method::GET,
+        "https://example.com/rate".to_owned(),
+        RetryReason::Status(http::StatusCode::SERVICE_UNAVAILABLE),
+    );
 
     assert!(retry_policy.should_retry_decision(&first_429));
     assert!(!retry_policy.should_retry_decision(&second_429));
@@ -413,34 +415,41 @@ fn retry_policy_timeout_and_read_body_windows_are_configurable() {
         .retryable_timeout_phases([TimeoutPhase::Transport])
         .timeout_retry_window(TimeoutPhase::Transport, 2)
         .response_body_read_retry_window(2);
-    let transport_timeout_first = RetryDecision {
-        attempt: 1,
-        max_attempts: 5,
-        method: http::Method::GET,
-        uri: "https://example.com/timeout".to_owned(),
-        status: None,
-        transport_error_kind: None,
-        timeout_phase: Some(TimeoutPhase::Transport),
-        response_body_read_error: false,
-    };
-    let transport_timeout_second = RetryDecision {
-        attempt: 2,
-        ..transport_timeout_first.clone()
-    };
-    let response_timeout = RetryDecision {
-        timeout_phase: Some(TimeoutPhase::ResponseBody),
-        ..transport_timeout_first.clone()
-    };
-    let read_body_first = RetryDecision {
-        attempt: 1,
-        timeout_phase: None,
-        response_body_read_error: true,
-        ..transport_timeout_first.clone()
-    };
-    let read_body_second = RetryDecision {
-        attempt: 2,
-        ..read_body_first.clone()
-    };
+    let transport_timeout_first = RetryDecision::new(
+        1,
+        5,
+        http::Method::GET,
+        "https://example.com/timeout".to_owned(),
+        RetryReason::Timeout(TimeoutPhase::Transport),
+    );
+    let transport_timeout_second = RetryDecision::new(
+        2,
+        5,
+        http::Method::GET,
+        "https://example.com/timeout".to_owned(),
+        RetryReason::Timeout(TimeoutPhase::Transport),
+    );
+    let response_timeout = RetryDecision::new(
+        1,
+        5,
+        http::Method::GET,
+        "https://example.com/timeout".to_owned(),
+        RetryReason::Timeout(TimeoutPhase::ResponseBody),
+    );
+    let read_body_first = RetryDecision::new(
+        1,
+        5,
+        http::Method::GET,
+        "https://example.com/timeout".to_owned(),
+        RetryReason::ResponseBodyRead,
+    );
+    let read_body_second = RetryDecision::new(
+        2,
+        5,
+        http::Method::GET,
+        "https://example.com/timeout".to_owned(),
+        RetryReason::ResponseBodyRead,
+    );
 
     assert!(retry_policy.should_retry_decision(&transport_timeout_first));
     assert!(!retry_policy.should_retry_decision(&transport_timeout_second));

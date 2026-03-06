@@ -17,20 +17,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = client.metrics_snapshot();
     println!(
         "started={} succeeded={} failed={} retries={}",
-        metrics.requests_started,
-        metrics.requests_succeeded,
-        metrics.requests_failed,
-        metrics.retries
+        metrics.requests.started,
+        metrics.requests.succeeded,
+        metrics.requests.failed,
+        metrics.requests.retries
     );
     println!(
         "timeout_transport={} timeout_response_body={} in_flight={} avg_latency_ms={:.2}",
-        metrics.timeout_transport,
-        metrics.timeout_response_body,
-        metrics.in_flight,
-        metrics.latency_avg_ms
+        metrics.timeouts.transport,
+        metrics.timeouts.response_body,
+        metrics.requests.in_flight,
+        metrics.latency.average_ms
     );
-    println!("status_counts={:?}", metrics.status_counts);
-    println!("error_counts={:?}", metrics.error_counts);
+    println!("status_counts={:?}", metrics.responses.status_counts);
+    println!("error_counts={:?}", metrics.errors.counts);
 
     Ok(())
 }

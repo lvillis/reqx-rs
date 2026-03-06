@@ -5,7 +5,7 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
-use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy};
+use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
     deadline_exceeded_error, is_redirect_status, parse_retry_after_capped, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, same_origin,
@@ -67,16 +67,13 @@ pub(crate) fn status_retry_decision(
     redacted_uri: &str,
     status: StatusCode,
 ) -> RetryDecision {
-    RetryDecision {
+    RetryDecision::new(
         attempt,
         max_attempts,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        status: Some(status),
-        transport_error_kind: None,
-        timeout_phase: None,
-        response_body_read_error: false,
-    }
+        method.clone(),
+        redacted_uri.to_owned(),
+        RetryReason::Status(status),
+    )
 }
 
 pub(crate) fn transport_retry_decision(
@@ -86,16 +83,13 @@ pub(crate) fn transport_retry_decision(
     redacted_uri: &str,
     transport_error_kind: TransportErrorKind,
 ) -> RetryDecision {
-    RetryDecision {
+    RetryDecision::new(
         attempt,
         max_attempts,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        status: None,
-        transport_error_kind: Some(transport_error_kind),
-        timeout_phase: None,
-        response_body_read_error: false,
-    }
+        method.clone(),
+        redacted_uri.to_owned(),
+        RetryReason::Transport(transport_error_kind),
+    )
 }
 
 pub(crate) fn timeout_retry_decision(
@@ -105,16 +99,13 @@ pub(crate) fn timeout_retry_decision(
     redacted_uri: &str,
     timeout_phase: TimeoutPhase,
 ) -> RetryDecision {
-    RetryDecision {
+    RetryDecision::new(
         attempt,
         max_attempts,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        status: None,
-        transport_error_kind: None,
-        timeout_phase: Some(timeout_phase),
-        response_body_read_error: false,
-    }
+        method.clone(),
+        redacted_uri.to_owned(),
+        RetryReason::Timeout(timeout_phase),
+    )
 }
 
 pub(crate) fn response_body_read_retry_decision(
@@ -123,16 +114,13 @@ pub(crate) fn response_body_read_retry_decision(
     method: &Method,
     redacted_uri: &str,
 ) -> RetryDecision {
-    RetryDecision {
+    RetryDecision::new(
         attempt,
         max_attempts,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        status: None,
-        transport_error_kind: None,
-        timeout_phase: None,
-        response_body_read_error: true,
-    }
+        method.clone(),
+        redacted_uri.to_owned(),
+        RetryReason::ResponseBodyRead,
+    )
 }
 
 pub(crate) fn transport_retry_decision_from_error(

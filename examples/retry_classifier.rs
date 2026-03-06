@@ -2,14 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use reqx::advanced::{RetryClassifier, RetryDecision};
+use reqx::advanced::{RetryClassifier, RetryDecision, RetryReason};
 use reqx::prelude::{Client, RetryPolicy};
 
 struct RetryOn429Only;
 
 impl RetryClassifier for RetryOn429Only {
     fn should_retry(&self, decision: &RetryDecision) -> bool {
-        decision.status == Some(StatusCode::TOO_MANY_REQUESTS)
+        matches!(
+            decision.reason(),
+            RetryReason::Status(StatusCode::TOO_MANY_REQUESTS)
+        )
     }
 }
 

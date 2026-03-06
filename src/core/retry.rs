@@ -8,16 +8,85 @@ use rand::RngExt;
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::error::{TimeoutPhase, TransportErrorKind};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryReason {
+    Status(StatusCode),
+    Transport(TransportErrorKind),
+    Timeout(TimeoutPhase),
+    ResponseBodyRead,
+    Unclassified,
+}
+
 #[derive(Clone, Debug)]
 pub struct RetryDecision {
-    pub attempt: usize,
-    pub max_attempts: usize,
-    pub method: Method,
-    pub uri: String,
-    pub status: Option<StatusCode>,
-    pub transport_error_kind: Option<TransportErrorKind>,
-    pub timeout_phase: Option<TimeoutPhase>,
-    pub response_body_read_error: bool,
+    attempt: usize,
+    max_attempts: usize,
+    method: Method,
+    uri: String,
+    reason: RetryReason,
+}
+
+impl RetryDecision {
+    pub(crate) fn new(
+        attempt: usize,
+        max_attempts: usize,
+        method: Method,
+        uri: String,
+        reason: RetryReason,
+    ) -> Self {
+        Self {
+            attempt,
+            max_attempts,
+            method,
+            uri,
+            reason,
+        }
+    }
+
+    pub fn attempt(&self) -> usize {
+        self.attempt
+    }
+
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn reason(&self) -> RetryReason {
+        self.reason
+    }
+
+    pub fn status(&self) -> Option<StatusCode> {
+        match self.reason {
+            RetryReason::Status(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    pub fn transport_error_kind(&self) -> Option<TransportErrorKind> {
+        match self.reason {
+            RetryReason::Transport(kind) => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub fn timeout_phase(&self) -> Option<TimeoutPhase> {
+        match self.reason {
+            RetryReason::Timeout(phase) => Some(phase),
+            _ => None,
+        }
+    }
+
+    pub fn is_response_body_read_error(&self) -> bool {
+        matches!(self.reason, RetryReason::ResponseBodyRead)
+    }
 }
 
 pub trait RetryClassifier: Send + Sync {
@@ -233,29 +302,31 @@ impl RetryPolicy {
         if let Some(retry_classifier) = &self.retry_classifier {
             return retry_classifier.should_retry(decision);
         }
-        if let Some(status) = decision.status {
-            let window = self.status_retry_windows.get(&status.as_u16()).copied();
-            return self.should_retry_status(status)
-                && Self::is_within_retry_window(window, decision.attempt);
+        match decision.reason() {
+            RetryReason::Status(status) => {
+                let window = self.status_retry_windows.get(&status.as_u16()).copied();
+                self.should_retry_status(status)
+                    && Self::is_within_retry_window(window, decision.attempt())
+            }
+            RetryReason::Transport(kind) => {
+                let window = self.transport_retry_windows.get(&kind).copied();
+                self.retryable_transport_error_kinds.contains(&kind)
+                    && Self::is_within_retry_window(window, decision.attempt())
+            }
+            RetryReason::Timeout(phase) => {
+                let window = self.timeout_retry_windows.get(&phase).copied();
+                self.retryable_timeout_phases.contains(&phase)
+                    && Self::is_within_retry_window(window, decision.attempt())
+            }
+            RetryReason::ResponseBodyRead => {
+                self.retry_on_response_body_read_error
+                    && Self::is_within_retry_window(
+                        self.response_body_read_retry_window,
+                        decision.attempt(),
+                    )
+            }
+            RetryReason::Unclassified => false,
         }
-        if let Some(kind) = decision.transport_error_kind {
-            let window = self.transport_retry_windows.get(&kind).copied();
-            return self.retryable_transport_error_kinds.contains(&kind)
-                && Self::is_within_retry_window(window, decision.attempt);
-        }
-        if let Some(phase) = decision.timeout_phase {
-            let window = self.timeout_retry_windows.get(&phase).copied();
-            return self.retryable_timeout_phases.contains(&phase)
-                && Self::is_within_retry_window(window, decision.attempt);
-        }
-        if decision.response_body_read_error {
-            return self.retry_on_response_body_read_error
-                && Self::is_within_retry_window(
-                    self.response_body_read_retry_window,
-                    decision.attempt,
-                );
-        }
-        false
     }
 
     pub(crate) fn backoff_for_retry(&self, retry_index: usize) -> Duration {
@@ -329,7 +400,7 @@ fn is_method_idempotent(method: &Method) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RetryDecision, RetryPolicy};
+    use super::{RetryDecision, RetryPolicy, RetryReason};
     use http::Method;
 
     #[test]
@@ -353,10 +424,7 @@ mod tests {
             max_attempts: 3,
             method: Method::GET,
             uri: "https://api.example.com/v1/items".to_owned(),
-            status: None,
-            transport_error_kind: None,
-            timeout_phase: None,
-            response_body_read_error: false,
+            reason: RetryReason::Unclassified,
         };
 
         assert!(!policy.should_retry_decision(&decision));

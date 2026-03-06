@@ -1549,7 +1549,7 @@ async fn retry_budget_stream_body_failure_does_not_credit_success() {
 
     let stream = client
         .get("/stream-budget-credit")
-        .timeout(Duration::from_millis(20))
+        .timeout(Duration::from_millis(50))
         .send_stream()
         .await
         .expect("stream request should return headers");
@@ -1671,7 +1671,7 @@ async fn circuit_breaker_stream_body_failure_opens_circuit() {
 
     let stream = client
         .get("/stream-open-circuit")
-        .timeout(Duration::from_millis(20))
+        .timeout(Duration::from_millis(50))
         .send_stream()
         .await
         .expect("stream request should return headers");

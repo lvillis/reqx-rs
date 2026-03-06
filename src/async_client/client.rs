@@ -75,7 +75,7 @@ use crate::response::{
     StreamPermits,
 };
 use crate::retry::{
-    PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy,
+    PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy, RetryReason,
     StrictRetryEligibility,
 };
 #[cfg(any(
@@ -1886,23 +1886,29 @@ impl Client {
         };
 
         let delay_ms = retry_delay.as_millis() as u64;
-        if let Some(status) = retry_decision.status {
-            warn!(
-                status = status.as_u16(),
-                delay_ms,
-                error = %error,
-                "retrying request after retryable status"
-            );
-        } else if retry_decision.response_body_read_error {
-            warn!(
-                delay_ms,
-                error = %error,
-                "retrying request after response body read error"
-            );
-        } else if retry_decision.timeout_phase.is_some() {
-            warn!(delay_ms, error = %error, "retrying request after timeout");
-        } else if retry_decision.transport_error_kind.is_some() {
-            warn!(delay_ms, error = %error, "retrying request after transport error");
+        match retry_decision.reason() {
+            RetryReason::Status(status) => {
+                warn!(
+                    status = status.as_u16(),
+                    delay_ms,
+                    error = %error,
+                    "retrying request after retryable status"
+                );
+            }
+            RetryReason::ResponseBodyRead => {
+                warn!(
+                    delay_ms,
+                    error = %error,
+                    "retrying request after response body read error"
+                );
+            }
+            RetryReason::Timeout(_) => {
+                warn!(delay_ms, error = %error, "retrying request after timeout");
+            }
+            RetryReason::Transport(_) => {
+                warn!(delay_ms, error = %error, "retrying request after transport error");
+            }
+            RetryReason::Unclassified => {}
         }
 
         self.metrics.record_retry();

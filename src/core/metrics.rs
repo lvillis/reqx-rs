@@ -11,27 +11,52 @@ use crate::otel::{OtelRequestSpan, OtelTelemetry};
 use crate::response::Response;
 use crate::util::lock_unpoisoned;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MetricsSnapshot {
-    pub requests_started: u64,
-    pub requests_succeeded: u64,
-    pub requests_failed: u64,
-    pub requests_canceled: u64,
+    pub requests: RequestMetrics,
+    pub responses: ResponseMetrics,
+    pub timeouts: TimeoutMetrics,
+    pub errors: ErrorMetrics,
+    pub latency: LatencyMetrics,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RequestMetrics {
+    pub started: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub canceled: u64,
     pub retries: u64,
-    pub timeout_transport: u64,
-    pub timeout_response_body: u64,
-    pub deadline_exceeded: u64,
-    pub transport_errors: u64,
-    pub read_body_errors: u64,
-    pub write_body_errors: u64,
-    pub response_body_too_large: u64,
-    pub http_status_errors: u64,
     pub in_flight: u64,
-    pub latency_samples: u64,
-    pub latency_total_ms: u64,
-    pub latency_avg_ms: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResponseMetrics {
     pub status_counts: BTreeMap<u16, u64>,
-    pub error_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TimeoutMetrics {
+    pub transport: u64,
+    pub response_body: u64,
+    pub deadline_exceeded: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ErrorMetrics {
+    pub transport: u64,
+    pub read_body: u64,
+    pub write_body: u64,
+    pub response_body_too_large: u64,
+    pub http_status: u64,
+    pub counts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LatencyMetrics {
+    pub samples: u64,
+    pub total_ms: u64,
+    pub average_ms: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -285,27 +310,7 @@ impl ClientMetrics {
 
     pub(crate) fn snapshot(&self) -> MetricsSnapshot {
         let Some(inner) = &self.inner else {
-            return MetricsSnapshot {
-                requests_started: 0,
-                requests_succeeded: 0,
-                requests_failed: 0,
-                requests_canceled: 0,
-                retries: 0,
-                timeout_transport: 0,
-                timeout_response_body: 0,
-                deadline_exceeded: 0,
-                transport_errors: 0,
-                read_body_errors: 0,
-                write_body_errors: 0,
-                response_body_too_large: 0,
-                http_status_errors: 0,
-                in_flight: 0,
-                latency_samples: 0,
-                latency_total_ms: 0,
-                latency_avg_ms: 0.0,
-                status_counts: BTreeMap::new(),
-                error_counts: BTreeMap::new(),
-            };
+            return MetricsSnapshot::default();
         };
 
         let requests_started = inner.requests_started.load(Ordering::Relaxed);
@@ -333,25 +338,33 @@ impl ClientMetrics {
         let error_counts = lock_unpoisoned(&inner.error_counts).clone();
 
         MetricsSnapshot {
-            requests_started,
-            requests_succeeded,
-            requests_failed,
-            requests_canceled,
-            retries,
-            timeout_transport,
-            timeout_response_body,
-            deadline_exceeded,
-            transport_errors,
-            read_body_errors,
-            write_body_errors,
-            response_body_too_large,
-            http_status_errors,
-            in_flight,
-            latency_samples,
-            latency_total_ms,
-            latency_avg_ms,
-            status_counts,
-            error_counts,
+            requests: RequestMetrics {
+                started: requests_started,
+                succeeded: requests_succeeded,
+                failed: requests_failed,
+                canceled: requests_canceled,
+                retries,
+                in_flight,
+            },
+            responses: ResponseMetrics { status_counts },
+            timeouts: TimeoutMetrics {
+                transport: timeout_transport,
+                response_body: timeout_response_body,
+                deadline_exceeded,
+            },
+            errors: ErrorMetrics {
+                transport: transport_errors,
+                read_body: read_body_errors,
+                write_body: write_body_errors,
+                response_body_too_large,
+                http_status: http_status_errors,
+                counts: error_counts,
+            },
+            latency: LatencyMetrics {
+                samples: latency_samples,
+                total_ms: latency_total_ms,
+                average_ms: latency_avg_ms,
+            },
         }
     }
 

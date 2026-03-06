@@ -1169,23 +1169,23 @@ async fn send_stream_drop_marks_canceled_and_releases_in_flight() {
         .expect("stream request should succeed");
 
     let in_flight_metrics = client.metrics_snapshot();
-    assert_eq!(in_flight_metrics.requests_started, 1);
-    assert_eq!(in_flight_metrics.requests_succeeded, 0);
-    assert_eq!(in_flight_metrics.requests_failed, 0);
-    assert_eq!(in_flight_metrics.requests_canceled, 0);
-    assert_eq!(in_flight_metrics.in_flight, 1);
+    assert_eq!(in_flight_metrics.requests.started, 1);
+    assert_eq!(in_flight_metrics.requests.succeeded, 0);
+    assert_eq!(in_flight_metrics.requests.failed, 0);
+    assert_eq!(in_flight_metrics.requests.canceled, 0);
+    assert_eq!(in_flight_metrics.requests.in_flight, 1);
 
     drop(stream);
     tokio::task::yield_now().await;
 
     let canceled_metrics = client.metrics_snapshot();
-    assert_eq!(canceled_metrics.requests_started, 1);
-    assert_eq!(canceled_metrics.requests_succeeded, 0);
-    assert_eq!(canceled_metrics.requests_failed, 0);
-    assert_eq!(canceled_metrics.requests_canceled, 1);
-    assert_eq!(canceled_metrics.in_flight, 0);
+    assert_eq!(canceled_metrics.requests.started, 1);
+    assert_eq!(canceled_metrics.requests.succeeded, 0);
+    assert_eq!(canceled_metrics.requests.failed, 0);
+    assert_eq!(canceled_metrics.requests.canceled, 1);
+    assert_eq!(canceled_metrics.requests.in_flight, 0);
     assert_eq!(
-        canceled_metrics.error_counts.get("request_canceled"),
+        canceled_metrics.errors.counts.get("request_canceled"),
         Some(&1_u64)
     );
 }
@@ -1660,14 +1660,14 @@ async fn response_body_timeout_reports_phase_and_metrics() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_succeeded, 0);
-    assert_eq!(metrics.requests_failed, 1);
-    assert_eq!(metrics.timeout_transport, 0);
-    assert_eq!(metrics.timeout_response_body, 1);
-    assert_eq!(metrics.in_flight, 0);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 0);
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.timeouts.transport, 0);
+    assert_eq!(metrics.timeouts.response_body, 1);
+    assert_eq!(metrics.requests.in_flight, 0);
     assert_eq!(
-        metrics.error_counts.get("timeout:response_body"),
+        metrics.errors.counts.get("timeout:response_body"),
         Some(&1_u64)
     );
 }
@@ -1762,10 +1762,10 @@ async fn send_stream_copy_to_writer_reports_response_body_timeout() {
 
     assert_eq!(server.served_count(), 2);
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 2);
-    assert_eq!(metrics.requests_succeeded, 0);
-    assert_eq!(metrics.requests_failed, 2);
-    assert_eq!(metrics.timeout_response_body, 2);
+    assert_eq!(metrics.requests.started, 2);
+    assert_eq!(metrics.requests.succeeded, 0);
+    assert_eq!(metrics.requests.failed, 2);
+    assert_eq!(metrics.timeouts.response_body, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1805,9 +1805,9 @@ async fn send_stream_copy_to_writer_reports_write_body_error() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_failed, 1);
-    assert_eq!(metrics.write_body_errors, 1);
-    assert_eq!(metrics.error_counts.get("write_body"), Some(&1));
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.errors.write_body, 1);
+    assert_eq!(metrics.errors.counts.get("write_body"), Some(&1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1958,10 +1958,10 @@ async fn decode_content_encoding_error_is_classified() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 1);
-    assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.failed, 1);
     assert_eq!(
-        metrics.error_counts.get("decode_content_encoding"),
+        metrics.errors.counts.get("decode_content_encoding"),
         Some(&1_u64)
     );
 }
@@ -2019,22 +2019,22 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     }
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 3);
-    assert_eq!(metrics.requests_succeeded, 1);
-    assert_eq!(metrics.requests_failed, 2);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.retries, 0);
-    assert_eq!(metrics.http_status_errors, 1);
-    assert_eq!(metrics.response_body_too_large, 1);
-    assert_eq!(metrics.status_counts.get(&200), Some(&1_u64));
-    assert_eq!(metrics.status_counts.get(&503), Some(&1_u64));
-    assert_eq!(metrics.error_counts.get("http_status:503"), Some(&1_u64));
+    assert_eq!(metrics.requests.started, 3);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 2);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.retries, 0);
+    assert_eq!(metrics.errors.http_status, 1);
+    assert_eq!(metrics.errors.response_body_too_large, 1);
+    assert_eq!(metrics.responses.status_counts.get(&200), Some(&1_u64));
+    assert_eq!(metrics.responses.status_counts.get(&503), Some(&1_u64));
+    assert_eq!(metrics.errors.counts.get("http_status:503"), Some(&1_u64));
     assert_eq!(
-        metrics.error_counts.get("response_body_too_large"),
+        metrics.errors.counts.get("response_body_too_large"),
         Some(&1_u64)
     );
-    assert_eq!(metrics.in_flight, 0);
-    assert_eq!(metrics.latency_samples, 3);
+    assert_eq!(metrics.requests.in_flight, 0);
+    assert_eq!(metrics.latency.samples, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2058,14 +2058,14 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
         .expect("request should succeed");
 
     let metrics = client.metrics_snapshot();
-    assert_eq!(metrics.requests_started, 0);
-    assert_eq!(metrics.requests_succeeded, 0);
-    assert_eq!(metrics.requests_failed, 0);
-    assert_eq!(metrics.requests_canceled, 0);
-    assert_eq!(metrics.retries, 0);
-    assert_eq!(metrics.latency_samples, 0);
-    assert!(metrics.status_counts.is_empty());
-    assert!(metrics.error_counts.is_empty());
+    assert_eq!(metrics.requests.started, 0);
+    assert_eq!(metrics.requests.succeeded, 0);
+    assert_eq!(metrics.requests.failed, 0);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.retries, 0);
+    assert_eq!(metrics.latency.samples, 0);
+    assert!(metrics.responses.status_counts.is_empty());
+    assert!(metrics.errors.counts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
