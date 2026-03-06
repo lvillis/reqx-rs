@@ -32,6 +32,15 @@ pub struct RequestBuilder<'a> {
     auto_accept_encoding: Option<bool>,
 }
 
+struct PreparedRequest<'a> {
+    client: &'a Client,
+    method: Method,
+    path: String,
+    headers: HeaderMap,
+    body: Option<RequestBody>,
+    execution_options: RequestExecutionOptions,
+}
+
 impl<'a> RequestBuilder<'a> {
     pub(crate) fn new(client: &'a Client, method: Method, path: String) -> Self {
         Self {
@@ -198,52 +207,52 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn response_mode(self) -> Self {
-        self.status_policy(StatusPolicy::Response)
-    }
-
-    pub fn strict_mode(self) -> Self {
-        self.status_policy(StatusPolicy::Error)
+    fn into_prepared_request(
+        self,
+        forced_status_policy: Option<StatusPolicy>,
+    ) -> PreparedRequest<'a> {
+        let path = append_query_pairs(&self.path, &self.query_pairs);
+        let execution_options = RequestExecutionOptions {
+            request_timeout: self.timeout,
+            total_timeout: self.total_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            retry_policy: self.retry_policy,
+            redirect_policy: self.redirect_policy,
+            status_policy: forced_status_policy.or(self.status_policy),
+            auto_accept_encoding: self.auto_accept_encoding,
+        };
+        PreparedRequest {
+            client: self.client,
+            method: self.method,
+            path,
+            headers: self.headers,
+            body: self.body,
+            execution_options,
+        }
     }
 
     pub fn send(self) -> crate::Result<Response> {
-        let path = append_query_pairs(&self.path, &self.query_pairs);
-        let execution_options = RequestExecutionOptions {
-            request_timeout: self.timeout,
-            total_timeout: self.total_timeout,
-            max_response_body_bytes: self.max_response_body_bytes,
-            retry_policy: self.retry_policy,
-            redirect_policy: self.redirect_policy,
-            status_policy: self.status_policy,
-            auto_accept_encoding: self.auto_accept_encoding,
-        };
-        self.client.send_request(
-            self.method,
+        let PreparedRequest {
+            client,
+            method,
             path,
-            self.headers,
-            self.body,
+            headers,
+            body,
             execution_options,
-        )
+        } = self.into_prepared_request(None);
+        client.send_request(method, path, headers, body, execution_options)
     }
 
     pub fn send_stream(self) -> crate::Result<BlockingResponseStream> {
-        let path = append_query_pairs(&self.path, &self.query_pairs);
-        let execution_options = RequestExecutionOptions {
-            request_timeout: self.timeout,
-            total_timeout: self.total_timeout,
-            max_response_body_bytes: self.max_response_body_bytes,
-            retry_policy: self.retry_policy,
-            redirect_policy: self.redirect_policy,
-            status_policy: self.status_policy,
-            auto_accept_encoding: self.auto_accept_encoding,
-        };
-        self.client.send_request_stream(
-            self.method,
+        let PreparedRequest {
+            client,
+            method,
             path,
-            self.headers,
-            self.body,
+            headers,
+            body,
             execution_options,
-        )
+        } = self.into_prepared_request(None);
+        client.send_request_stream(method, path, headers, body, execution_options)
     }
 
     pub fn download_to_writer<W>(self, writer: &mut W) -> crate::Result<u64>
@@ -273,11 +282,27 @@ impl<'a> RequestBuilder<'a> {
         response.json()
     }
 
-    pub fn send_with_status(self) -> crate::Result<Response> {
-        self.status_policy(StatusPolicy::Response).send()
+    pub fn send_response(self) -> crate::Result<Response> {
+        let PreparedRequest {
+            client,
+            method,
+            path,
+            headers,
+            body,
+            execution_options,
+        } = self.into_prepared_request(Some(StatusPolicy::Response));
+        client.send_request(method, path, headers, body, execution_options)
     }
 
-    pub fn send_stream_with_status(self) -> crate::Result<BlockingResponseStream> {
-        self.status_policy(StatusPolicy::Response).send_stream()
+    pub fn send_response_stream(self) -> crate::Result<BlockingResponseStream> {
+        let PreparedRequest {
+            client,
+            method,
+            path,
+            headers,
+            body,
+            execution_options,
+        } = self.into_prepared_request(Some(StatusPolicy::Response));
+        client.send_request_stream(method, path, headers, body, execution_options)
     }
 }

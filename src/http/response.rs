@@ -1207,8 +1207,7 @@ mod blocking_stream {
 
     impl Read for BlockingResponseStream {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.read_chunk(buffer)
-                .map_err(std::io::Error::other)
+            self.read_chunk(buffer).map_err(std::io::Error::other)
         }
     }
 }

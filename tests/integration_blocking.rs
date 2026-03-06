@@ -1356,7 +1356,7 @@ fn blocking_retry_budget_stream_body_failure_does_not_credit_success() {
 }
 
 #[test]
-fn blocking_retry_budget_is_credited_by_non_retryable_status_response_mode() {
+fn blocking_retry_budget_is_credited_by_non_retryable_send_response() {
     let server = MockServer::start(vec![
         MockResponse::new(404, Vec::<(String, String)>::new(), b"not-found".to_vec()),
         MockResponse::new(503, Vec::<(String, String)>::new(), b"busy".to_vec()),
@@ -1599,13 +1599,13 @@ fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_buffered(
 
     let first = client
         .get("/v1/response-mode-buffered")
-        .send_with_status()
+        .send_response()
         .expect("first non-success response should be returned");
     assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
 
     let second = client
         .get("/v1/response-mode-buffered")
-        .send_with_status()
+        .send_response()
         .expect("second non-success response should be returned");
     assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
 
@@ -1642,13 +1642,13 @@ fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_stream() 
 
     let first = client
         .get("/v1/response-mode-stream")
-        .send_stream_with_status()
+        .send_response_stream()
         .expect("first non-success stream should be returned");
     assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
 
     let second = client
         .get("/v1/response-mode-stream")
-        .send_stream_with_status()
+        .send_response_stream()
         .expect("second non-success stream should be returned");
     assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
 
@@ -2683,7 +2683,7 @@ fn blocking_absolute_request_uri_with_userinfo_is_rejected() {
 }
 
 #[test]
-fn blocking_redirect_policy_none_returns_301_without_following_in_response_mode() {
+fn blocking_redirect_policy_none_returns_301_without_following_with_send_response() {
     let server = MockServer::start(vec![
         MockResponse::new(301, vec![("Location", "/v1/new")], b"redirect".to_vec()),
         MockResponse::new(

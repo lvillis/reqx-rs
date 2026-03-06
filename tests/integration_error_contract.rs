@@ -386,7 +386,7 @@ fn blocking_http_status_error_carries_response_headers() {
 
 #[cfg(feature = "_async")]
 #[tokio::test(flavor = "current_thread")]
-async fn async_send_with_status_returns_response_for_non_success() {
+async fn async_send_response_returns_response_for_non_success() {
     use reqx::prelude::{Client, RetryPolicy};
 
     let server = OneShotServer::start(
@@ -402,7 +402,7 @@ async fn async_send_with_status_returns_response_for_non_success() {
 
     let response = client
         .get("/case")
-        .send_with_status()
+        .send_response()
         .await
         .expect("non-success should be returned as response");
     assert_eq!(response.status().as_u16(), 503);
@@ -436,7 +436,7 @@ async fn async_client_default_status_policy_response_returns_non_success() {
 
 #[cfg(feature = "_blocking")]
 #[test]
-fn blocking_send_with_status_returns_response_for_non_success() {
+fn blocking_send_response_returns_response_for_non_success() {
     use reqx::blocking::Client;
     use reqx::prelude::RetryPolicy;
 
@@ -453,7 +453,7 @@ fn blocking_send_with_status_returns_response_for_non_success() {
 
     let response = client
         .get("/case")
-        .send_with_status()
+        .send_response()
         .expect("non-success should be returned as response");
     assert_eq!(response.status().as_u16(), 503);
     assert_eq!(response.text_lossy(), "unavailable");
@@ -486,7 +486,7 @@ fn blocking_client_default_status_policy_response_returns_non_success() {
 
 #[cfg(feature = "_async")]
 #[tokio::test(flavor = "current_thread")]
-async fn async_send_stream_with_status_returns_stream_for_non_success() {
+async fn async_send_response_stream_returns_stream_for_non_success() {
     use reqx::prelude::{Client, RetryPolicy};
 
     let server = OneShotServer::start(
@@ -502,7 +502,7 @@ async fn async_send_stream_with_status_returns_stream_for_non_success() {
 
     let stream = client
         .get("/case")
-        .send_stream_with_status()
+        .send_response_stream()
         .await
         .expect("non-success should be returned as stream");
     assert_eq!(stream.status().as_u16(), 503);
@@ -574,7 +574,7 @@ async fn async_observer_receives_request_start_event() {
 
 #[cfg(feature = "_blocking")]
 #[test]
-fn blocking_send_stream_with_status_returns_stream_for_non_success() {
+fn blocking_send_response_stream_returns_stream_for_non_success() {
     use reqx::blocking::Client;
     use reqx::prelude::RetryPolicy;
 
@@ -591,7 +591,7 @@ fn blocking_send_stream_with_status_returns_stream_for_non_success() {
 
     let stream = client
         .get("/case")
-        .send_stream_with_status()
+        .send_response_stream()
         .expect("non-success should be returned as stream");
     assert_eq!(stream.status().as_u16(), 503);
     let response = stream

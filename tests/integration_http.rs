@@ -1965,7 +1965,7 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retry_budget_is_credited_by_non_retryable_status_response_mode() {
+async fn retry_budget_is_credited_by_non_retryable_send_response() {
     let server = MockServer::start(vec![
         MockResponse::new(
             404,

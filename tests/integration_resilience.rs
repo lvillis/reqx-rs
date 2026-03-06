@@ -1771,14 +1771,14 @@ async fn circuit_breaker_response_mode_does_not_open_on_non_success_buffered() {
 
     let first = client
         .get("/response-mode-buffered")
-        .send_with_status()
+        .send_response()
         .await
         .expect("first non-success response should be returned");
     assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
 
     let second = client
         .get("/response-mode-buffered")
-        .send_with_status()
+        .send_response()
         .await
         .expect("second non-success response should be returned");
     assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
@@ -1815,14 +1815,14 @@ async fn circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
 
     let first = client
         .get("/response-mode-stream")
-        .send_stream_with_status()
+        .send_response_stream()
         .await
         .expect("first non-success stream should be returned");
     assert_eq!(first.status(), http::StatusCode::NOT_FOUND);
 
     let second = client
         .get("/response-mode-stream")
-        .send_stream_with_status()
+        .send_response_stream()
         .await
         .expect("second non-success stream should be returned");
     assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
