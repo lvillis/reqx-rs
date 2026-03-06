@@ -19,6 +19,7 @@ It focuses on SDK transport concerns: retries, timeout phases, idempotency, prox
   `StatusPolicy::Response`.
 - For multi-endpoint SDKs, plug in an `EndpointSelector` (for example `RoundRobinEndpointSelector`).
 - Hook transport events through `Observer` for retries and server-throttle telemetry.
+- Reach for `reqx::advanced::{...}` when you need non-default transport controls.
 
 ## Install
 

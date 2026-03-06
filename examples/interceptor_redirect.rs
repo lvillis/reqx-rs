@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
+use reqx::advanced::{Interceptor, RequestContext};
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
-use reqx::{Interceptor, RequestContext};
 
 struct TraceInterceptor;
 

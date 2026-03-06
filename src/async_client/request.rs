@@ -20,7 +20,11 @@ use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
 use crate::util::{parse_header_name, parse_header_value};
 
-#[doc(hidden)]
+/// Builds and executes a single request against an existing [`Client`].
+///
+/// Create a builder from [`Client::request`] or the verb helpers such as
+/// [`Client::get`] and [`Client::post`].
+#[must_use = "request builders do nothing until you call a send method"]
 pub struct RequestBuilder<'a> {
     client: &'a Client,
     method: Method,
@@ -194,6 +198,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    /// Overrides automatic `Accept-Encoding` injection for this request.
     pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
         self.execution_overrides.auto_accept_encoding = Some(enabled);
         self
@@ -215,6 +220,7 @@ impl<'a> RequestBuilder<'a> {
         .prepare(forced_status_policy, RequestExecutionOptions::from)
     }
 
+    /// Executes the request and applies the effective [`StatusPolicy`].
     pub async fn send(self) -> crate::Result<crate::response::Response> {
         let PreparedRequest {
             client,
@@ -229,6 +235,9 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
+    /// Executes the request and returns a streaming response body.
+    ///
+    /// Non-success HTTP statuses still follow the effective [`StatusPolicy`].
     pub async fn send_stream(self) -> crate::Result<crate::response::ResponseStream> {
         let PreparedRequest {
             client,
@@ -264,6 +273,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
+    /// Executes the request, buffers the body, and deserializes it as JSON.
     pub async fn send_json<T>(self) -> crate::Result<T>
     where
         T: DeserializeOwned,
@@ -272,6 +282,8 @@ impl<'a> RequestBuilder<'a> {
         response.json()
     }
 
+    /// Executes the request and always returns a buffered [`crate::Response`]
+    /// for HTTP status responses.
     pub async fn send_response(self) -> crate::Result<crate::response::Response> {
         let PreparedRequest {
             client,
@@ -286,6 +298,8 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
+    /// Executes the request and always returns a streaming response for
+    /// HTTP status responses.
     pub async fn send_response_stream(self) -> crate::Result<crate::response::ResponseStream> {
         let PreparedRequest {
             client,

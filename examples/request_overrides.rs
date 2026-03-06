@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::TimeoutPhase;
+use reqx::advanced::TimeoutPhase;
 use reqx::prelude::{Client, Error, RetryPolicy};
 
 #[tokio::main]

@@ -1,7 +1,9 @@
 use std::time::Duration;
 
+use reqx::advanced::{
+    AdvancedConfig, ClientProfile, Observer, RequestContext, RetryDecision, StatusPolicy,
+};
 use reqx::prelude::Client;
-use reqx::{AdvancedConfig, ClientProfile, Observer, RequestContext, RetryDecision, StatusPolicy};
 
 #[derive(Default)]
 struct ConsoleObserver;

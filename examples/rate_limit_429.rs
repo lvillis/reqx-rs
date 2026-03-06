@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::RateLimitPolicy;
+use reqx::advanced::RateLimitPolicy;
 use reqx::prelude::{Client, RetryPolicy};
 
 #[tokio::main]

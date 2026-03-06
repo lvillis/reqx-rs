@@ -46,6 +46,7 @@
 //! - Use `RetryPolicy::standard()` for SDK traffic.
 //! - Set both request timeout and total timeout.
 //! - For `POST` retries, always set `idempotency_key(...)`.
+//! - Reach for [`advanced`] when you need non-default transport controls.
 
 #[cfg(all(
     feature = "strict-feature-guards",
@@ -196,37 +197,34 @@ pub mod blocking {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Recommended imports for most SDK transport code.
 pub mod prelude {
-    pub mod sdk {
-        #[cfg(feature = "_blocking")]
-        pub use crate::blocking;
-        #[cfg(feature = "_async")]
-        pub use crate::{Client, ResponseStream};
-        pub use crate::{
-            Error, ErrorCode, RedirectPolicy, Response, Result, RetryPolicy, StatusPolicy,
-            TlsBackend, TlsRootStore,
-        };
-    }
+    #[cfg(feature = "_blocking")]
+    pub use crate::blocking;
+    #[cfg(feature = "_async")]
+    pub use crate::{Client, ResponseStream};
+    pub use crate::{
+        Error, ErrorCode, RedirectPolicy, Response, Result, RetryPolicy, StatusPolicy, TlsBackend,
+        TlsRootStore,
+    };
+}
 
-    pub mod advanced {
-        pub use crate::{
-            AdaptiveConcurrencyPolicy, AdvancedConfig, BackoffSource,
-            BlockingResumableUploadBackend, BlockingResumableUploader, BodyCodec,
-            CircuitBreakerPolicy, ClientProfile, Clock, EndpointSelector, Interceptor,
-            MetricsSnapshot, Observer, OtelPathNormalizer, PartChecksumAlgorithm,
-            PermissiveRetryEligibility, PolicyBackoffSource, PrimaryEndpointSelector,
-            RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy, RequestContext,
-            ResumableUploadCheckpoint, ResumableUploadError, ResumableUploadOptions,
-            ResumableUploadResult, RetryBudgetPolicy, RetryClassifier, RetryDecision,
-            RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope, StandardBodyCodec,
-            StandardOtelPathNormalizer, StrictRetryEligibility, SystemClock, TimeoutPhase,
-            TransportErrorKind, UploadedPart,
-        };
-        #[cfg(feature = "_async")]
-        pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader};
-    }
-
-    pub use sdk::*;
+/// Advanced transport controls and extensibility points.
+pub mod advanced {
+    pub use crate::{
+        AdaptiveConcurrencyPolicy, AdvancedConfig, BackoffSource, BlockingResumableUploadBackend,
+        BlockingResumableUploader, BodyCodec, CircuitBreakerPolicy, ClientProfile, Clock,
+        EndpointSelector, Interceptor, MetricsSnapshot, Observer, OtelPathNormalizer,
+        PartChecksumAlgorithm, PermissiveRetryEligibility, PolicyBackoffSource,
+        PrimaryEndpointSelector, RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy,
+        RedirectPolicy, RequestContext, ResumableUploadCheckpoint, ResumableUploadError,
+        ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
+        RetryDecision, RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope,
+        StandardBodyCodec, StandardOtelPathNormalizer, StatusPolicy, StrictRetryEligibility,
+        SystemClock, TimeoutPhase, TransportErrorKind, UploadedPart,
+    };
+    #[cfg(feature = "_async")]
+    pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader};
 }
 
 #[cfg(all(test, feature = "_async"))]
