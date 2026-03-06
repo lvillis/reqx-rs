@@ -9,5 +9,6 @@ pub(crate) mod observe;
 pub(crate) mod otel;
 pub(crate) mod policy;
 pub(crate) mod proxy;
+pub(crate) mod request_builder;
 pub(crate) mod retry;
 pub(crate) mod util;

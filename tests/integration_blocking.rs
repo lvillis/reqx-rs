@@ -1005,6 +1005,39 @@ fn blocking_retry_after_429_observer_receives_resolved_scope() {
 }
 
 #[test]
+fn blocking_retry_after_429_observer_receives_scope_without_rate_limiter() {
+    let server = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1"), ("X-RateLimit-Scope", "global")],
+        b"busy".to_vec(),
+    )]);
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let observer = ThrottleObserver {
+        scopes: Arc::clone(&scopes),
+    };
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .server_throttle_scope(ServerThrottleScope::Auto)
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/throttled-scope")
+        .send()
+        .expect_err("request should return 429");
+    match error {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let recorded = scopes.lock().expect("lock scopes").clone();
+    assert_eq!(recorded, vec![ServerThrottleScope::Global]);
+}
+
+#[test]
 fn blocking_max_in_flight_enforces_single_active_request() {
     let server = CountingServer::start(
         3,
@@ -1988,7 +2021,9 @@ fn blocking_read_trait_timeout_maps_to_io_timed_out() {
         .and_then(|source| source.downcast_ref::<Error>())
         .expect("io error should retain original reqx::Error");
     match inner {
-        Error::Timeout { phase, method, uri, .. } => {
+        Error::Timeout {
+            phase, method, uri, ..
+        } => {
             assert_eq!(*phase, TimeoutPhase::ResponseBody);
             assert_eq!(method.as_str(), "GET");
             assert!(uri.contains("/v1/read-trait-timeout"));

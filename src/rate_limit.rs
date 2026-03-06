@@ -18,6 +18,32 @@ pub enum ServerThrottleScope {
     Both,
 }
 
+pub(crate) fn resolve_server_throttle_scope(
+    configured_scope: ServerThrottleScope,
+    header_scope_hint: Option<ServerThrottleScope>,
+    has_host: bool,
+    has_global_rate_limit: bool,
+    has_per_host_rate_limit: bool,
+) -> ServerThrottleScope {
+    match configured_scope {
+        ServerThrottleScope::Auto => match header_scope_hint {
+            Some(ServerThrottleScope::Host) => ServerThrottleScope::Host,
+            Some(ServerThrottleScope::Global) => ServerThrottleScope::Global,
+            Some(ServerThrottleScope::Both) => ServerThrottleScope::Both,
+            _ => {
+                if has_host && has_per_host_rate_limit {
+                    ServerThrottleScope::Host
+                } else if has_global_rate_limit {
+                    ServerThrottleScope::Global
+                } else {
+                    ServerThrottleScope::Host
+                }
+            }
+        },
+        other => other,
+    }
+}
+
 pub(crate) fn server_throttle_scope_from_headers(
     headers: &http::HeaderMap,
 ) -> Option<ServerThrottleScope> {
@@ -315,10 +341,12 @@ impl RateLimiter {
         header_scope_hint: Option<ServerThrottleScope>,
     ) -> ServerThrottleScope {
         let host_key = host.map(|item| item.to_ascii_lowercase());
-        let resolved_scope = self.resolve_server_throttle_scope(
+        let resolved_scope = resolve_server_throttle_scope(
             configured_scope,
             header_scope_hint,
             host_key.is_some(),
+            self.global.is_some(),
+            self.per_host_policy.is_some(),
         );
         if delay.is_zero() {
             return resolved_scope;
@@ -413,31 +441,6 @@ impl RateLimiter {
         }
 
         cleanup_stale_per_host_rate_limits(entries, now);
-    }
-
-    fn resolve_server_throttle_scope(
-        &self,
-        configured_scope: ServerThrottleScope,
-        header_scope_hint: Option<ServerThrottleScope>,
-        has_host: bool,
-    ) -> ServerThrottleScope {
-        match configured_scope {
-            ServerThrottleScope::Auto => match header_scope_hint {
-                Some(ServerThrottleScope::Host) => ServerThrottleScope::Host,
-                Some(ServerThrottleScope::Global) => ServerThrottleScope::Global,
-                Some(ServerThrottleScope::Both) => ServerThrottleScope::Both,
-                _ => {
-                    if has_host && self.per_host_policy.is_some() {
-                        ServerThrottleScope::Host
-                    } else if self.global.is_some() {
-                        ServerThrottleScope::Global
-                    } else {
-                        ServerThrottleScope::Host
-                    }
-                }
-            },
-            other => other,
-        }
     }
 }
 

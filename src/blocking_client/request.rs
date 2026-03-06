@@ -8,10 +8,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
+use crate::core::request_builder::{
+    PreparedRequest, RequestExecutionOverrides, RequestPreparation,
+};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryPolicy;
-use crate::util::{append_query_pairs, parse_header_name, parse_header_value};
+use crate::util::{parse_header_name, parse_header_value};
 
 use super::{Client, RequestBody, RequestExecutionOptions};
 
@@ -23,22 +26,7 @@ pub struct RequestBuilder<'a> {
     query_pairs: Vec<(String, String)>,
     headers: HeaderMap,
     body: Option<RequestBody>,
-    timeout: Option<Duration>,
-    total_timeout: Option<Duration>,
-    max_response_body_bytes: Option<usize>,
-    retry_policy: Option<RetryPolicy>,
-    redirect_policy: Option<RedirectPolicy>,
-    status_policy: Option<StatusPolicy>,
-    auto_accept_encoding: Option<bool>,
-}
-
-struct PreparedRequest<'a> {
-    client: &'a Client,
-    method: Method,
-    path: String,
-    headers: HeaderMap,
-    body: Option<RequestBody>,
-    execution_options: RequestExecutionOptions,
+    execution_overrides: RequestExecutionOverrides,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -50,13 +38,7 @@ impl<'a> RequestBuilder<'a> {
             query_pairs: Vec::new(),
             headers: HeaderMap::new(),
             body: None,
-            timeout: None,
-            total_timeout: None,
-            max_response_body_bytes: None,
-            retry_policy: None,
-            redirect_policy: None,
-            status_policy: None,
-            auto_accept_encoding: None,
+            execution_overrides: RequestExecutionOverrides::default(),
         }
     }
 
@@ -173,62 +155,54 @@ impl<'a> RequestBuilder<'a> {
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout.max(Duration::from_millis(1)));
+        self.execution_overrides.request_timeout = Some(timeout.max(Duration::from_millis(1)));
         self
     }
 
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
-        self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self.execution_overrides.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
         self
     }
 
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
-        self.max_response_body_bytes = Some(max_response_body_bytes.max(1));
+        self.execution_overrides.max_response_body_bytes = Some(max_response_body_bytes.max(1));
         self
     }
 
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
-        self.retry_policy = Some(retry_policy);
+        self.execution_overrides.retry_policy = Some(retry_policy);
         self
     }
 
     pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
-        self.redirect_policy = Some(redirect_policy);
+        self.execution_overrides.redirect_policy = Some(redirect_policy);
         self
     }
 
     pub fn status_policy(mut self, status_policy: StatusPolicy) -> Self {
-        self.status_policy = Some(status_policy);
+        self.execution_overrides.status_policy = Some(status_policy);
         self
     }
 
     pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
-        self.auto_accept_encoding = Some(enabled);
+        self.execution_overrides.auto_accept_encoding = Some(enabled);
         self
     }
 
     fn into_prepared_request(
         self,
         forced_status_policy: Option<StatusPolicy>,
-    ) -> PreparedRequest<'a> {
-        let path = append_query_pairs(&self.path, &self.query_pairs);
-        let execution_options = RequestExecutionOptions {
-            request_timeout: self.timeout,
-            total_timeout: self.total_timeout,
-            max_response_body_bytes: self.max_response_body_bytes,
-            retry_policy: self.retry_policy,
-            redirect_policy: self.redirect_policy,
-            status_policy: forced_status_policy.or(self.status_policy),
-            auto_accept_encoding: self.auto_accept_encoding,
-        };
-        PreparedRequest {
+    ) -> PreparedRequest<'a, Client, RequestBody, RequestExecutionOptions> {
+        RequestPreparation {
             client: self.client,
             method: self.method,
-            path,
+            path: self.path,
+            query_pairs: self.query_pairs,
             headers: self.headers,
             body: self.body,
-            execution_options,
+            execution_overrides: self.execution_overrides,
         }
+        .prepare(forced_status_policy, RequestExecutionOptions::from)
     }
 
     pub fn send(self) -> crate::Result<Response> {
@@ -304,5 +278,19 @@ impl<'a> RequestBuilder<'a> {
             execution_options,
         } = self.into_prepared_request(Some(StatusPolicy::Response));
         client.send_request_stream(method, path, headers, body, execution_options)
+    }
+}
+
+impl From<RequestExecutionOverrides> for RequestExecutionOptions {
+    fn from(overrides: RequestExecutionOverrides) -> Self {
+        Self {
+            request_timeout: overrides.request_timeout,
+            total_timeout: overrides.total_timeout,
+            retry_policy: overrides.retry_policy,
+            max_response_body_bytes: overrides.max_response_body_bytes,
+            redirect_policy: overrides.redirect_policy,
+            status_policy: overrides.status_policy,
+            auto_accept_encoding: overrides.auto_accept_encoding,
+        }
     }
 }

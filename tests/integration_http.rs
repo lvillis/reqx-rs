@@ -1578,6 +1578,41 @@ async fn retry_after_429_observer_receives_resolved_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_after_429_observer_receives_scope_without_rate_limiter() {
+    let server = MockServer::start(vec![MockResponse::new(
+        429,
+        vec![("Retry-After", "1"), ("X-RateLimit-Scope", "global")],
+        "busy",
+        Duration::ZERO,
+    )]);
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    let observer = ThrottleObserver {
+        scopes: Arc::clone(&scopes),
+    };
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .server_throttle_scope(ServerThrottleScope::Auto)
+        .observer(observer)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/throttled-scope")
+        .send()
+        .await
+        .expect_err("request should return 429");
+    match error {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 429),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let recorded = scopes.lock().expect("lock scopes").clone();
+    assert_eq!(recorded, vec![ServerThrottleScope::Global]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_body_timeout_reports_phase_and_metrics() {
     let server = SplitBodyServer::start(
         200,

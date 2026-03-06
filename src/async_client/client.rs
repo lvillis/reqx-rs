@@ -62,7 +62,8 @@ use crate::proxy::{
     NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules, should_bypass_proxy_uri,
 };
 use crate::rate_limit::{
-    RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
+    RateLimitPolicy, RateLimiter, ServerThrottleScope, resolve_server_throttle_scope,
+    server_throttle_scope_from_headers,
 };
 use crate::request::RequestBuilder;
 use crate::resilience::{
@@ -1823,21 +1824,28 @@ impl Client {
         if status != http::StatusCode::TOO_MANY_REQUESTS {
             return;
         }
-        let Some(rate_limiter) = &self.rate_limiter else {
-            return;
-        };
         let throttle_delay = status_retry_delay(
             self.clock.as_ref(),
             headers,
             fallback_delay,
             max_retry_delay,
         );
-        let resolved_scope = rate_limiter.observe_server_throttle(
-            host,
-            throttle_delay,
-            self.server_throttle_scope,
-            server_throttle_scope_from_headers(headers),
-        );
+        let header_scope_hint = server_throttle_scope_from_headers(headers);
+        let resolved_scope = match &self.rate_limiter {
+            Some(rate_limiter) => rate_limiter.observe_server_throttle(
+                host,
+                throttle_delay,
+                self.server_throttle_scope,
+                header_scope_hint,
+            ),
+            None => resolve_server_throttle_scope(
+                self.server_throttle_scope,
+                header_scope_hint,
+                host.is_some(),
+                false,
+                false,
+            ),
+        };
         self.run_server_throttle_observers(context, resolved_scope, throttle_delay);
     }
 
