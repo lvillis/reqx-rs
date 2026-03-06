@@ -1,3 +1,20 @@
+## [0.1.24] - 2026-03-06
+
+### 🐛 Bug Fixes
+
+- Harden stream and upload edge cases
+- Unify throttle and request prep
+
+### 🚜 Refactor
+
+- Simplify request status APIs and harden stream semantics
+- Simplify request APIs and preserve blocking stream error semantics
+- Streamline public API ergonomics
+- [**breaking**] Simplify public API and make ResponseStream directly readable
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump MSRV to 1.94
 ## [0.1.23] - 2026-03-04
 
 ### 🐛 Bug Fixes
@@ -6,6 +23,10 @@
 - Correct stream in-flight and cancel metrics
 - Correct blocking stream success/cancel metrics
 - Enforce post-read total-timeout in blocking stream
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.23
 ## [0.1.22] - 2026-02-25
 
 ### 🐛 Bug Fixes
