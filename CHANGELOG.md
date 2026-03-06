@@ -1,3 +1,8 @@
+## [0.1.25] - 2026-03-06
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.24] - 2026-03-06
 
 ### 🐛 Bug Fixes
@@ -15,6 +20,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump MSRV to 1.94
+- Release reqx version 0.1.24
 ## [0.1.23] - 2026-03-04
 
 ### 🐛 Bug Fixes
