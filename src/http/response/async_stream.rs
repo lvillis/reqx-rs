@@ -16,7 +16,7 @@ use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
 
-use super::{Response, StreamCompletion, StreamLifecycle};
+use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
 
 #[derive(Debug)]
 pub(crate) struct StreamPermits {
@@ -137,10 +137,10 @@ impl StreamBody {
             return Ok(phase_timeout);
         };
         let now = Instant::now();
-        if now >= deadline_at {
+        if deadline_reached(deadline_at) {
             return Err(self.deadline_exceeded_error());
         }
-        let remaining = deadline_at.duration_since(now);
+        let remaining = deadline_at.saturating_duration_since(now);
         Ok(phase_timeout.min(remaining))
     }
 
@@ -184,10 +184,7 @@ impl StreamBody {
                         && timer.as_mut().poll(cx).is_ready()
                     {
                         self.frame_timeout = None;
-                        let error = if self
-                            .deadline_at
-                            .is_some_and(|deadline_at| Instant::now() >= deadline_at)
-                        {
+                        let error = if self.deadline_at.is_some_and(deadline_reached) {
                             self.deadline_exceeded_error()
                         } else {
                             self.response_body_timeout_error()

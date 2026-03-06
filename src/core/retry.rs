@@ -14,7 +14,6 @@ pub enum RetryReason {
     Transport(TransportErrorKind),
     Timeout(TimeoutPhase),
     ResponseBodyRead,
-    Unclassified,
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +324,6 @@ impl RetryPolicy {
                         decision.attempt(),
                     )
             }
-            RetryReason::Unclassified => false,
         }
     }
 
@@ -401,7 +399,7 @@ fn is_method_idempotent(method: &Method) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{RetryDecision, RetryPolicy, RetryReason};
-    use http::Method;
+    use http::{Method, StatusCode};
 
     #[test]
     fn jittered_backoff_never_exceeds_configured_max_backoff() {
@@ -417,16 +415,22 @@ mod tests {
     }
 
     #[test]
-    fn should_retry_decision_defaults_to_no_retry_for_unclassified_outcome() {
-        let policy = RetryPolicy::standard();
-        let decision = RetryDecision {
-            attempt: 1,
-            max_attempts: 3,
-            method: Method::GET,
-            uri: "https://api.example.com/v1/items".to_owned(),
-            reason: RetryReason::Unclassified,
-        };
+    fn retry_decision_accessors_reflect_reason() {
+        let decision = RetryDecision::new(
+            1,
+            3,
+            Method::GET,
+            "https://api.example.com/v1/items".to_owned(),
+            RetryReason::Status(StatusCode::TOO_MANY_REQUESTS),
+        );
 
-        assert!(!policy.should_retry_decision(&decision));
+        assert_eq!(decision.attempt(), 1);
+        assert_eq!(decision.max_attempts(), 3);
+        assert_eq!(decision.method(), &Method::GET);
+        assert_eq!(decision.uri(), "https://api.example.com/v1/items");
+        assert_eq!(decision.status(), Some(StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(decision.transport_error_kind(), None);
+        assert_eq!(decision.timeout_phase(), None);
+        assert!(!decision.is_response_body_read_error());
     }
 }

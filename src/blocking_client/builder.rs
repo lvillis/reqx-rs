@@ -537,10 +537,10 @@ impl ClientBuilder {
             retry_eligibility: self.retry_eligibility,
             retry_budget: self
                 .retry_budget_policy
-                .map(|policy| Arc::new(RetryBudget::new(policy))),
+                .map(|policy| Arc::new(RetryBudget::new(policy, Arc::clone(&self.clock)))),
             circuit_breaker: self
                 .circuit_breaker_policy
-                .map(|policy| Arc::new(CircuitBreaker::new(policy))),
+                .map(|policy| Arc::new(CircuitBreaker::new(policy, Arc::clone(&self.clock)))),
             adaptive_concurrency: self
                 .adaptive_concurrency_policy
                 .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),

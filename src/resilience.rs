@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
+use crate::extensions::Clock;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,25 +63,26 @@ impl Default for RetryBudgetPolicy {
     }
 }
 
-#[derive(Debug)]
 struct RetryBudgetState {
     window_started_at: Instant,
     requests_succeeded: usize,
     retries_consumed: usize,
 }
 
-#[derive(Debug)]
 pub(crate) struct RetryBudget {
     policy: RetryBudgetPolicy,
+    clock: Arc<dyn Clock>,
     state: Mutex<RetryBudgetState>,
 }
 
 impl RetryBudget {
-    pub(crate) fn new(policy: RetryBudgetPolicy) -> Self {
+    pub(crate) fn new(policy: RetryBudgetPolicy, clock: Arc<dyn Clock>) -> Self {
+        let window_started_at = clock.now_monotonic();
         Self {
             policy,
+            clock,
             state: Mutex::new(RetryBudgetState {
-                window_started_at: Instant::now(),
+                window_started_at,
                 requests_succeeded: 0,
                 retries_consumed: 0,
             }),
@@ -89,13 +91,13 @@ impl RetryBudget {
 
     pub(crate) fn record_success(&self) {
         let mut state = lock_unpoisoned(&self.state);
-        refresh_retry_budget_window(&self.policy, &mut state);
+        refresh_retry_budget_window(&self.policy, &mut state, self.clock.as_ref());
         state.requests_succeeded = state.requests_succeeded.saturating_add(1);
     }
 
     pub(crate) fn try_consume_retry(&self) -> bool {
         let mut state = lock_unpoisoned(&self.state);
-        refresh_retry_budget_window(&self.policy, &mut state);
+        refresh_retry_budget_window(&self.policy, &mut state, self.clock.as_ref());
         let dynamic_allowance = (state.requests_succeeded as f64
             * self.policy.configured_retry_ratio())
         .floor() as usize;
@@ -109,9 +111,23 @@ impl RetryBudget {
     }
 }
 
-fn refresh_retry_budget_window(policy: &RetryBudgetPolicy, state: &mut RetryBudgetState) {
-    if state.window_started_at.elapsed() >= policy.configured_window() {
-        state.window_started_at = Instant::now();
+impl std::fmt::Debug for RetryBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetryBudget")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+fn refresh_retry_budget_window(
+    policy: &RetryBudgetPolicy,
+    state: &mut RetryBudgetState,
+    clock: &dyn Clock,
+) {
+    let now = clock.now_monotonic();
+    if now.saturating_duration_since(state.window_started_at) >= policy.configured_window() {
+        state.window_started_at = now;
         state.requests_succeeded = 0;
         state.retries_consumed = 0;
     }
@@ -168,7 +184,6 @@ enum CircuitAttemptKind {
     HalfOpen,
 }
 
-#[derive(Debug)]
 enum CircuitState {
     Closed {
         consecutive_failures: usize,
@@ -182,16 +197,17 @@ enum CircuitState {
     },
 }
 
-#[derive(Debug)]
 pub(crate) struct CircuitBreaker {
     policy: CircuitBreakerPolicy,
+    clock: Arc<dyn Clock>,
     state: Mutex<CircuitState>,
 }
 
 impl CircuitBreaker {
-    pub(crate) fn new(policy: CircuitBreakerPolicy) -> Self {
+    pub(crate) fn new(policy: CircuitBreakerPolicy, clock: Arc<dyn Clock>) -> Self {
         Self {
             policy,
+            clock,
             state: Mutex::new(CircuitState::Closed {
                 consecutive_failures: 0,
             }),
@@ -200,7 +216,7 @@ impl CircuitBreaker {
 
     pub(crate) fn begin(self: &Arc<Self>) -> Result<CircuitAttempt, Duration> {
         let mut state = lock_unpoisoned(&self.state);
-        let now = Instant::now();
+        let now = self.clock.now_monotonic();
         match &mut *state {
             CircuitState::Closed { .. } => Ok(CircuitAttempt {
                 breaker: Arc::clone(self),
@@ -280,7 +296,7 @@ impl CircuitBreaker {
                 *consecutive_failures = consecutive_failures.saturating_add(1);
                 if *consecutive_failures >= self.policy.failure_threshold.max(1) {
                     *state = CircuitState::Open {
-                        opened_at: Instant::now(),
+                        opened_at: self.clock.now_monotonic(),
                     };
                 }
             }
@@ -292,11 +308,20 @@ impl CircuitBreaker {
             ) => {
                 *active_requests = active_requests.saturating_sub(1);
                 *state = CircuitState::Open {
-                    opened_at: Instant::now(),
+                    opened_at: self.clock.now_monotonic(),
                 };
             }
             _ => {}
         }
+    }
+}
+
+impl std::fmt::Debug for CircuitBreaker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CircuitBreaker")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
     }
 }
 
@@ -517,34 +542,77 @@ impl AdaptiveConcurrencyState {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::{CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy};
+    use crate::extensions::Clock;
+
+    #[derive(Debug)]
+    struct TestClock {
+        base_monotonic: Instant,
+        base_system: SystemTime,
+        elapsed: Mutex<Duration>,
+    }
+
+    impl Default for TestClock {
+        fn default() -> Self {
+            Self {
+                base_monotonic: Instant::now(),
+                base_system: SystemTime::UNIX_EPOCH,
+                elapsed: Mutex::new(Duration::ZERO),
+            }
+        }
+    }
+
+    impl TestClock {
+        fn advance(&self, duration: Duration) {
+            let mut elapsed = self.elapsed.lock().expect("test clock mutex poisoned");
+            *elapsed = elapsed.saturating_add(duration);
+        }
+
+        fn elapsed(&self) -> Duration {
+            *self.elapsed.lock().expect("test clock mutex poisoned")
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_system(&self) -> SystemTime {
+            self.base_system + self.elapsed()
+        }
+
+        fn now_monotonic(&self) -> Instant {
+            self.base_monotonic + self.elapsed()
+        }
+    }
 
     #[test]
     fn retry_budget_enforces_minimum_retries_per_window() {
+        let clock = Arc::new(TestClock::default());
         let budget = RetryBudget::new(
             RetryBudgetPolicy::standard()
                 .window(Duration::from_millis(20))
                 .retry_ratio(0.0)
                 .min_retries_per_window(1),
+            clock.clone(),
         );
 
         assert!(budget.try_consume_retry());
         assert!(!budget.try_consume_retry());
 
-        thread::sleep(Duration::from_millis(25));
+        clock.advance(Duration::from_millis(25));
         assert!(budget.try_consume_retry());
     }
 
     #[test]
     fn retry_budget_uses_success_ratio_for_allowance() {
+        let clock = Arc::new(TestClock::default());
         let budget = RetryBudget::new(
             RetryBudgetPolicy::standard()
                 .window(Duration::from_secs(1))
                 .retry_ratio(0.5)
                 .min_retries_per_window(0),
+            clock,
         );
 
         assert!(!budget.try_consume_retry());
@@ -557,11 +625,13 @@ mod tests {
 
     #[test]
     fn retry_budget_zero_window_is_clamped() {
+        let clock = Arc::new(TestClock::default());
         let budget = RetryBudget::new(
             RetryBudgetPolicy::standard()
                 .window(Duration::ZERO)
                 .retry_ratio(0.0)
                 .min_retries_per_window(1),
+            clock,
         );
 
         assert!(budget.try_consume_retry());
@@ -573,12 +643,14 @@ mod tests {
 
     #[test]
     fn circuit_breaker_opens_then_recovers_after_half_open_success() {
+        let clock = Arc::new(TestClock::default());
         let breaker = Arc::new(CircuitBreaker::new(
             CircuitBreakerPolicy::standard()
                 .failure_threshold(2)
                 .open_timeout(Duration::from_millis(20))
                 .half_open_max_requests(1)
                 .half_open_success_threshold(1),
+            clock.clone(),
         ));
 
         drop(
@@ -597,7 +669,7 @@ mod tests {
             "breaker should be open after reaching failure threshold"
         );
 
-        thread::sleep(Duration::from_millis(25));
+        clock.advance(Duration::from_millis(25));
         let half_open_attempt = breaker
             .begin()
             .expect("breaker should transition to half-open after open timeout");
@@ -611,16 +683,18 @@ mod tests {
 
     #[test]
     fn circuit_breaker_limits_half_open_concurrency() {
+        let clock = Arc::new(TestClock::default());
         let breaker = Arc::new(CircuitBreaker::new(
             CircuitBreakerPolicy::standard()
                 .failure_threshold(1)
                 .open_timeout(Duration::from_millis(20))
                 .half_open_max_requests(1)
                 .half_open_success_threshold(1),
+            clock.clone(),
         ));
 
         drop(breaker.begin().expect("closed attempt should be allowed"));
-        thread::sleep(Duration::from_millis(25));
+        clock.advance(Duration::from_millis(25));
 
         let half_open_attempt = breaker
             .begin()

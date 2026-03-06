@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use http::Method;
 
-use crate::error::{Error, TimeoutPhase};
+use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::otel::{OtelRequestSpan, OtelTelemetry};
 use crate::response::Response;
 use crate::util::lock_unpoisoned;
@@ -49,7 +49,10 @@ pub struct ErrorMetrics {
     pub write_body: u64,
     pub response_body_too_large: u64,
     pub http_status: u64,
-    pub counts: BTreeMap<String, u64>,
+    pub by_code: BTreeMap<ErrorCode, u64>,
+    pub by_timeout_phase: BTreeMap<TimeoutPhase, u64>,
+    pub by_transport_kind: BTreeMap<TransportErrorKind, u64>,
+    pub by_http_status: BTreeMap<u16, u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,7 +87,10 @@ struct ClientMetricsInner {
     latency_total_ms: AtomicU64,
     latency_samples: AtomicU64,
     status_counts: Mutex<BTreeMap<u16, u64>>,
-    error_counts: Mutex<BTreeMap<String, u64>>,
+    error_code_counts: Mutex<BTreeMap<ErrorCode, u64>>,
+    timeout_phase_counts: Mutex<BTreeMap<TimeoutPhase, u64>>,
+    transport_error_kind_counts: Mutex<BTreeMap<TransportErrorKind, u64>>,
+    http_status_error_counts: Mutex<BTreeMap<u16, u64>>,
 }
 
 #[derive(Debug)]
@@ -212,7 +218,7 @@ impl ClientMetrics {
         self.record_latency(latency);
         self.otel.record_request_failed(error);
 
-        self.add_error_count(error.code().as_str().to_owned());
+        self.add_error_code_count(error.code());
 
         match error {
             Error::Timeout { phase, .. } => {
@@ -226,7 +232,7 @@ impl ClientMetrics {
                         }
                     }
                 }
-                self.add_error_count(format!("timeout:{phase}"));
+                self.add_timeout_phase_count(*phase);
             }
             Error::DeadlineExceeded { .. } => {
                 if let Some(inner) = &self.inner {
@@ -237,7 +243,7 @@ impl ClientMetrics {
                 if let Some(inner) = &self.inner {
                     inner.transport_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                self.add_error_count(format!("transport:{kind}"));
+                self.add_transport_error_kind_count(*kind);
             }
             Error::ReadBody { .. } => {
                 if let Some(inner) = &self.inner {
@@ -261,7 +267,7 @@ impl ClientMetrics {
                     inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 self.add_status_count(*status);
-                self.add_error_count(format!("http_status:{status}"));
+                self.add_http_status_error_count(*status);
             }
             Error::InvalidUri { .. }
             | Error::InvalidNoProxyRule { .. }
@@ -295,7 +301,6 @@ impl ClientMetrics {
             inner.requests_canceled.fetch_add(1, Ordering::Relaxed);
         }
         self.record_latency(latency);
-        self.add_error_count("request_canceled".to_owned());
         self.otel.record_request_canceled();
     }
 
@@ -335,7 +340,11 @@ impl ClientMetrics {
             latency_total_ms as f64 / latency_samples as f64
         };
         let status_counts = lock_unpoisoned(&inner.status_counts).clone();
-        let error_counts = lock_unpoisoned(&inner.error_counts).clone();
+        let error_code_counts = lock_unpoisoned(&inner.error_code_counts).clone();
+        let timeout_phase_counts = lock_unpoisoned(&inner.timeout_phase_counts).clone();
+        let transport_error_kind_counts =
+            lock_unpoisoned(&inner.transport_error_kind_counts).clone();
+        let http_status_error_counts = lock_unpoisoned(&inner.http_status_error_counts).clone();
 
         MetricsSnapshot {
             requests: RequestMetrics {
@@ -358,7 +367,10 @@ impl ClientMetrics {
                 write_body: write_body_errors,
                 response_body_too_large,
                 http_status: http_status_errors,
-                counts: error_counts,
+                by_code: error_code_counts,
+                by_timeout_phase: timeout_phase_counts,
+                by_transport_kind: transport_error_kind_counts,
+                by_http_status: http_status_error_counts,
             },
             latency: LatencyMetrics {
                 samples: latency_samples,
@@ -389,12 +401,36 @@ impl ClientMetrics {
         *status_counts.entry(status).or_insert(0) += 1;
     }
 
-    fn add_error_count(&self, error_key: String) {
+    fn add_error_code_count(&self, error_code: ErrorCode) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let mut error_counts = lock_unpoisoned(&inner.error_counts);
-        *error_counts.entry(error_key).or_insert(0) += 1;
+        let mut error_code_counts = lock_unpoisoned(&inner.error_code_counts);
+        *error_code_counts.entry(error_code).or_insert(0) += 1;
+    }
+
+    fn add_timeout_phase_count(&self, phase: TimeoutPhase) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut timeout_phase_counts = lock_unpoisoned(&inner.timeout_phase_counts);
+        *timeout_phase_counts.entry(phase).or_insert(0) += 1;
+    }
+
+    fn add_transport_error_kind_count(&self, kind: TransportErrorKind) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut transport_error_kind_counts = lock_unpoisoned(&inner.transport_error_kind_counts);
+        *transport_error_kind_counts.entry(kind).or_insert(0) += 1;
+    }
+
+    fn add_http_status_error_count(&self, status: u16) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut http_status_error_counts = lock_unpoisoned(&inner.http_status_error_counts);
+        *http_status_error_counts.entry(status).or_insert(0) += 1;
     }
 }
 

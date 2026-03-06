@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -81,6 +81,10 @@ impl BackoffSource for PolicyBackoffSource {
 
 pub trait Clock: Send + Sync {
     fn now_system(&self) -> SystemTime;
+
+    fn now_monotonic(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 #[derive(Debug, Default)]

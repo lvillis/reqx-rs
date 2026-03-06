@@ -11,7 +11,7 @@ use crate::content_encoding::{
 };
 use crate::error::{Error, TimeoutPhase};
 
-use super::{Response, StreamCompletion, StreamLifecycle};
+use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
 
 fn map_read_error(
     source: std::io::Error,
@@ -60,9 +60,7 @@ fn map_read_error_with_deadline(
     total_timeout_ms: Option<u128>,
 ) -> Error {
     let mapped = map_read_error(source, method, uri, timeout_ms);
-    if matches!(mapped, Error::Timeout { .. })
-        && deadline_at.is_some_and(|deadline_at| Instant::now() >= deadline_at)
-    {
+    if matches!(mapped, Error::Timeout { .. }) && deadline_at.is_some_and(deadline_reached) {
         return deadline_exceeded_error(method, uri, timeout_ms, total_timeout_ms);
     }
     mapped
@@ -76,7 +74,7 @@ fn ensure_within_deadline(
     total_timeout_ms: Option<u128>,
 ) -> crate::Result<()> {
     if let Some(deadline_at) = deadline_at
-        && Instant::now() >= deadline_at
+        && deadline_reached(deadline_at)
     {
         return Err(deadline_exceeded_error(
             method,

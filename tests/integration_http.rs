@@ -15,12 +15,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
-use reqx::TimeoutPhase;
 use reqx::advanced::{
     AdaptiveConcurrencyPolicy, Interceptor, Observer, RateLimitPolicy, RequestContext,
     RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
 };
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
+use reqx::{ErrorCode, TimeoutPhase};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWrite};
@@ -1184,10 +1184,7 @@ async fn send_stream_drop_marks_canceled_and_releases_in_flight() {
     assert_eq!(canceled_metrics.requests.failed, 0);
     assert_eq!(canceled_metrics.requests.canceled, 1);
     assert_eq!(canceled_metrics.requests.in_flight, 0);
-    assert_eq!(
-        canceled_metrics.errors.counts.get("request_canceled"),
-        Some(&1_u64)
-    );
+    assert!(canceled_metrics.errors.by_code.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1667,7 +1664,10 @@ async fn response_body_timeout_reports_phase_and_metrics() {
     assert_eq!(metrics.timeouts.response_body, 1);
     assert_eq!(metrics.requests.in_flight, 0);
     assert_eq!(
-        metrics.errors.counts.get("timeout:response_body"),
+        metrics
+            .errors
+            .by_timeout_phase
+            .get(&TimeoutPhase::ResponseBody),
         Some(&1_u64)
     );
 }
@@ -1807,7 +1807,7 @@ async fn send_stream_copy_to_writer_reports_write_body_error() {
     let metrics = client.metrics_snapshot();
     assert_eq!(metrics.requests.failed, 1);
     assert_eq!(metrics.errors.write_body, 1);
-    assert_eq!(metrics.errors.counts.get("write_body"), Some(&1));
+    assert_eq!(metrics.errors.by_code.get(&ErrorCode::WriteBody), Some(&1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1961,7 +1961,10 @@ async fn decode_content_encoding_error_is_classified() {
     assert_eq!(metrics.requests.started, 1);
     assert_eq!(metrics.requests.failed, 1);
     assert_eq!(
-        metrics.errors.counts.get("decode_content_encoding"),
+        metrics
+            .errors
+            .by_code
+            .get(&ErrorCode::DecodeContentEncoding),
         Some(&1_u64)
     );
 }
@@ -2028,9 +2031,9 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
     assert_eq!(metrics.errors.response_body_too_large, 1);
     assert_eq!(metrics.responses.status_counts.get(&200), Some(&1_u64));
     assert_eq!(metrics.responses.status_counts.get(&503), Some(&1_u64));
-    assert_eq!(metrics.errors.counts.get("http_status:503"), Some(&1_u64));
+    assert_eq!(metrics.errors.by_http_status.get(&503), Some(&1_u64));
     assert_eq!(
-        metrics.errors.counts.get("response_body_too_large"),
+        metrics.errors.by_code.get(&ErrorCode::ResponseBodyTooLarge),
         Some(&1_u64)
     );
     assert_eq!(metrics.requests.in_flight, 0);
@@ -2065,7 +2068,10 @@ async fn metrics_snapshot_is_noop_when_metrics_disabled() {
     assert_eq!(metrics.requests.retries, 0);
     assert_eq!(metrics.latency.samples, 0);
     assert!(metrics.responses.status_counts.is_empty());
-    assert!(metrics.errors.counts.is_empty());
+    assert!(metrics.errors.by_code.is_empty());
+    assert!(metrics.errors.by_timeout_phase.is_empty());
+    assert!(metrics.errors.by_transport_kind.is_empty());
+    assert!(metrics.errors.by_http_status.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

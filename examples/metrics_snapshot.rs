@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.latency.average_ms
     );
     println!("status_counts={:?}", metrics.responses.status_counts);
-    println!("error_counts={:?}", metrics.errors.counts);
+    println!("errors_by_code={:?}", metrics.errors.by_code);
 
     Ok(())
 }

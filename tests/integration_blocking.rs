@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
-use reqx::TimeoutPhase;
 use reqx::advanced::{
     AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Interceptor, Observer, RateLimitPolicy,
     RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
 };
 use reqx::blocking::Client;
 use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
+use reqx::{ErrorCode, TimeoutPhase};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -1922,10 +1922,7 @@ fn blocking_send_stream_drop_marks_canceled_and_releases_in_flight() {
     assert_eq!(canceled_metrics.requests.failed, 0);
     assert_eq!(canceled_metrics.requests.canceled, 1);
     assert_eq!(canceled_metrics.requests.in_flight, 0);
-    assert_eq!(
-        canceled_metrics.errors.counts.get("request_canceled"),
-        Some(&1_u64)
-    );
+    assert!(canceled_metrics.errors.by_code.is_empty());
 }
 
 #[test]
@@ -2553,7 +2550,7 @@ fn blocking_download_to_writer_reports_write_body_error() {
     let metrics = client.metrics_snapshot();
     assert_eq!(metrics.requests.failed, 1);
     assert_eq!(metrics.errors.write_body, 1);
-    assert_eq!(metrics.errors.counts.get("write_body"), Some(&1));
+    assert_eq!(metrics.errors.by_code.get(&ErrorCode::WriteBody), Some(&1));
 }
 
 #[test]

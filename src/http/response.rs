@@ -5,6 +5,8 @@ use http::{HeaderMap, Method, StatusCode};
 use serde::de::DeserializeOwned;
 #[cfg(any(feature = "_async", feature = "_blocking"))]
 use std::io;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
 use crate::content_encoding::DecodeContentEncodingError;
@@ -70,6 +72,14 @@ pub(crate) trait StreamOutcomeHooks {
     fn complete_error(&mut self, error: &Error);
 
     fn complete_canceled(&mut self);
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+const DEADLINE_SLACK: Duration = Duration::from_millis(1);
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) fn deadline_reached(deadline_at: Instant) -> bool {
+    deadline_at.saturating_duration_since(Instant::now()) <= DEADLINE_SLACK
 }
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
