@@ -1,4 +1,6 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -10,6 +12,7 @@ use crate::content_encoding::{
     decode_content_encoded_body_limited, should_decode_content_encoded_body,
 };
 use crate::error::{Error, TimeoutPhase};
+use crate::extensions::Clock;
 
 use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
 
@@ -51,42 +54,6 @@ fn deadline_exceeded_error(
     }
 }
 
-fn map_read_error_with_deadline(
-    source: std::io::Error,
-    method: &http::Method,
-    uri: &str,
-    timeout_ms: u128,
-    deadline_at: Option<Instant>,
-    total_timeout_ms: Option<u128>,
-) -> Error {
-    let mapped = map_read_error(source, method, uri, timeout_ms);
-    if matches!(mapped, Error::Timeout { .. }) && deadline_at.is_some_and(deadline_reached) {
-        return deadline_exceeded_error(method, uri, timeout_ms, total_timeout_ms);
-    }
-    mapped
-}
-
-fn ensure_within_deadline(
-    deadline_at: Option<Instant>,
-    method: &http::Method,
-    uri: &str,
-    timeout_ms: u128,
-    total_timeout_ms: Option<u128>,
-) -> crate::Result<()> {
-    if let Some(deadline_at) = deadline_at
-        && deadline_reached(deadline_at)
-    {
-        return Err(deadline_exceeded_error(
-            method,
-            uri,
-            timeout_ms,
-            total_timeout_ms,
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
 pub struct BlockingResponseStream {
     status: StatusCode,
     headers: HeaderMap,
@@ -97,12 +64,13 @@ pub struct BlockingResponseStream {
     timeout_ms: u128,
     total_timeout_ms: Option<u128>,
     deadline_at: Option<Instant>,
+    deadline_slack: Duration,
+    clock: Arc<dyn Clock>,
     lifecycle: Option<StreamLifecycle>,
     _global_permit: Option<GlobalRequestPermit>,
     _host_permit: Option<HostRequestPermit>,
 }
 
-#[derive(Debug)]
 pub(crate) struct BlockingResponseStreamContext {
     pub(crate) method: http::Method,
     pub(crate) uri_raw: String,
@@ -110,6 +78,8 @@ pub(crate) struct BlockingResponseStreamContext {
     pub(crate) timeout_ms: u128,
     pub(crate) total_timeout_ms: Option<u128>,
     pub(crate) deadline_at: Option<Instant>,
+    pub(crate) deadline_slack: Duration,
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) lifecycle: Option<StreamLifecycle>,
     pub(crate) global_permit: Option<GlobalRequestPermit>,
     pub(crate) host_permit: Option<HostRequestPermit>,
@@ -129,6 +99,8 @@ impl BlockingResponseStream {
             timeout_ms,
             total_timeout_ms,
             deadline_at,
+            deadline_slack,
+            clock,
             lifecycle,
             global_permit,
             host_permit,
@@ -143,6 +115,8 @@ impl BlockingResponseStream {
             timeout_ms: timeout_ms.max(1),
             total_timeout_ms,
             deadline_at,
+            deadline_slack,
+            clock,
             lifecycle,
             _global_permit: global_permit,
             _host_permit: host_permit,
@@ -196,36 +170,50 @@ impl BlockingResponseStream {
         super::write_body_error(&self.method, &self.uri_redacted, source)
     }
 
-    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
-        if let Err(error) = ensure_within_deadline(
-            self.deadline_at,
-            &self.method,
-            &self.uri_redacted,
-            self.timeout_ms,
-            self.total_timeout_ms,
-        ) {
-            self.complete_error(&error);
-            return Err(error);
-        }
-        let read = self.body.as_reader().read(buffer).map_err(|source| {
-            map_read_error_with_deadline(
-                source,
+    fn map_read_error(&self, source: std::io::Error) -> Error {
+        let mapped = map_read_error(source, &self.method, &self.uri_redacted, self.timeout_ms);
+        if matches!(mapped, Error::Timeout { .. })
+            && self.deadline_at.is_some_and(|deadline_at| {
+                deadline_reached(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
+            })
+        {
+            return deadline_exceeded_error(
                 &self.method,
                 &self.uri_redacted,
                 self.timeout_ms,
-                self.deadline_at,
                 self.total_timeout_ms,
-            )
-        });
+            );
+        }
+        mapped
+    }
+
+    fn ensure_within_deadline(&self) -> crate::Result<()> {
+        if let Some(deadline_at) = self.deadline_at
+            && deadline_reached(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
+        {
+            return Err(deadline_exceeded_error(
+                &self.method,
+                &self.uri_redacted,
+                self.timeout_ms,
+                self.total_timeout_ms,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
+        if let Err(error) = self.ensure_within_deadline() {
+            self.complete_error(&error);
+            return Err(error);
+        }
+        let read = self
+            .body
+            .as_reader()
+            .read(buffer)
+            .map_err(|source| self.map_read_error(source));
         match read {
             Ok(read) => {
-                if let Err(error) = ensure_within_deadline(
-                    self.deadline_at,
-                    &self.method,
-                    &self.uri_redacted,
-                    self.timeout_ms,
-                    self.total_timeout_ms,
-                ) {
+                if let Err(error) = self.ensure_within_deadline() {
                     self.complete_error(&error);
                     return Err(error);
                 }
@@ -402,6 +390,24 @@ impl BlockingResponseStream {
 
     fn complete_error(&mut self, error: &Error) {
         super::complete_error(&mut self.lifecycle, error);
+    }
+}
+
+impl std::fmt::Debug for BlockingResponseStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlockingResponseStream")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("method", &self.method)
+            .field("uri_raw", &self.uri_raw)
+            .field("uri_redacted", &self.uri_redacted)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("total_timeout_ms", &self.total_timeout_ms)
+            .field("deadline_at", &self.deadline_at)
+            .field("deadline_slack", &self.deadline_slack)
+            .field("has_lifecycle", &self.lifecycle.is_some())
+            .finish()
     }
 }
 

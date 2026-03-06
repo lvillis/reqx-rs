@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use crate::execution::{
     stream_timing, terminal_non_success, timeout_retry_decision,
     transport_retry_decision_from_error, transport_timeout_error,
 };
+use crate::extensions::Clock;
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
 use crate::rate_limit::{resolve_server_throttle_scope, server_throttle_scope_from_headers};
@@ -115,6 +117,8 @@ struct StreamResponseInput {
     transport_timeout: Duration,
     stream_total_timeout_ms: Option<u128>,
     stream_deadline_at: Option<Instant>,
+    stream_deadline_slack: Duration,
+    clock: Arc<dyn Clock>,
     stream_lifecycle: Option<StreamLifecycle>,
     stream_global_permit: Option<GlobalRequestPermit>,
     host_permit: HostRequestPermit,
@@ -174,6 +178,8 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
         transport_timeout,
         stream_total_timeout_ms,
         stream_deadline_at,
+        stream_deadline_slack,
+        clock,
         stream_lifecycle,
         stream_global_permit,
         host_permit,
@@ -189,6 +195,8 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
             timeout_ms: transport_timeout.as_millis(),
             total_timeout_ms: stream_total_timeout_ms,
             deadline_at: stream_deadline_at,
+            deadline_slack: stream_deadline_slack,
+            clock,
             lifecycle: stream_lifecycle,
             global_permit: stream_global_permit,
             host_permit: Some(host_permit),
@@ -1321,6 +1329,8 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_deadline_slack: self.stream_deadline_slack,
+                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,
@@ -1370,6 +1380,8 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_deadline_slack: self.stream_deadline_slack,
+                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,

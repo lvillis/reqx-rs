@@ -71,8 +71,8 @@ use crate::resilience::{
     RetryBudget, RetryBudgetPolicy,
 };
 use crate::response::{
-    Response, ResponseStream, ResponseStreamContext, StreamLifecycle, StreamOutcomeHooks,
-    StreamPermits,
+    DEFAULT_STREAM_DEADLINE_SLACK, Response, ResponseStream, ResponseStreamContext,
+    StreamLifecycle, StreamOutcomeHooks, StreamPermits,
 };
 use crate::retry::{
     PermissiveRetryEligibility, RetryDecision, RetryEligibility, RetryPolicy, RetryReason,
@@ -507,6 +507,8 @@ struct StreamResponseInput {
     transport_timeout: Duration,
     stream_total_timeout_ms: Option<u128>,
     stream_deadline_at: Option<Instant>,
+    stream_deadline_slack: Duration,
+    clock: Arc<dyn Clock>,
     stream_lifecycle: Option<StreamLifecycle>,
     stream_global_permit: Option<GlobalRequestPermit>,
     host_permit: HostRequestPermit,
@@ -566,6 +568,8 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
         transport_timeout,
         stream_total_timeout_ms,
         stream_deadline_at,
+        stream_deadline_slack,
+        clock,
         stream_lifecycle,
         stream_global_permit,
         host_permit,
@@ -581,6 +585,8 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
             timeout_ms: transport_timeout.as_millis(),
             total_timeout_ms: stream_total_timeout_ms,
             deadline_at: stream_deadline_at,
+            deadline_slack: stream_deadline_slack,
+            clock,
             lifecycle: stream_lifecycle,
             permits: StreamPermits::new(stream_global_permit, Some(host_permit)),
         },
@@ -858,18 +864,19 @@ fn build_transport_client(
     }
 }
 
-#[derive(Debug)]
 struct AdaptiveConcurrencyController {
     policy: AdaptiveConcurrencyPolicy,
     state: Mutex<AdaptiveConcurrencyState>,
+    clock: Arc<dyn Clock>,
     notify: Notify,
 }
 
 impl AdaptiveConcurrencyController {
-    fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+    fn new(policy: AdaptiveConcurrencyPolicy, clock: Arc<dyn Clock>) -> Self {
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState::new(policy)),
+            clock,
             notify: Notify::new(),
         }
     }
@@ -884,7 +891,7 @@ impl AdaptiveConcurrencyController {
                 if state.try_acquire() {
                     return AdaptiveConcurrencyPermit {
                         controller: Arc::clone(self),
-                        started_at: Instant::now(),
+                        started_at: self.clock.now_monotonic(),
                         completed: false,
                     };
                 }
@@ -913,15 +920,20 @@ struct AdaptiveConcurrencyPermit {
 }
 
 impl AdaptiveConcurrencyPermit {
-    fn mark_success(mut self) {
+    fn latency(&self) -> Duration {
         self.controller
-            .release_and_record(true, self.started_at.elapsed());
+            .clock
+            .now_monotonic()
+            .saturating_duration_since(self.started_at)
+    }
+
+    fn mark_success(mut self) {
+        self.controller.release_and_record(true, self.latency());
         self.completed = true;
     }
 
     fn mark_failure(mut self) {
-        self.controller
-            .release_and_record(false, self.started_at.elapsed());
+        self.controller.release_and_record(false, self.latency());
         self.completed = true;
     }
 
@@ -934,8 +946,7 @@ impl AdaptiveConcurrencyPermit {
 impl Drop for AdaptiveConcurrencyPermit {
     fn drop(&mut self) {
         if !self.completed {
-            self.controller
-                .release_and_record(false, self.started_at.elapsed());
+            self.controller.release_and_record(false, self.latency());
             self.completed = true;
         }
     }
@@ -946,7 +957,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy};
+    use super::{AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy, SystemClock};
 
     #[tokio::test]
     async fn adaptive_controller_unblocks_waiter_after_release() {
@@ -954,7 +965,10 @@ mod tests {
             .min_limit(1)
             .initial_limit(1)
             .max_limit(1);
-        let controller = Arc::new(AdaptiveConcurrencyController::new(policy));
+        let controller = Arc::new(AdaptiveConcurrencyController::new(
+            policy,
+            Arc::new(SystemClock),
+        ));
 
         let first_permit = controller.acquire().await;
         let waiter = {
@@ -991,6 +1005,7 @@ pub struct ClientBuilder {
     stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
+    stream_deadline_slack: Duration,
     max_response_body_bytes: usize,
     connect_timeout: Duration,
     pool_idle_timeout: Duration,
@@ -1035,6 +1050,7 @@ impl ClientBuilder {
             stream_auto_accept_encoding: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             total_timeout: None,
+            stream_deadline_slack: DEFAULT_STREAM_DEADLINE_SLACK,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
@@ -1078,6 +1094,11 @@ impl ClientBuilder {
 
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
         self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    pub fn stream_deadline_slack(mut self, stream_deadline_slack: Duration) -> Self {
+        self.stream_deadline_slack = stream_deadline_slack;
         self
     }
 
@@ -1475,6 +1496,7 @@ impl ClientBuilder {
         } else {
             OtelTelemetry::disabled()
         };
+        let clock = self.clock;
 
         Ok(Client {
             base_url: self.base_url,
@@ -1483,21 +1505,26 @@ impl ClientBuilder {
             stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,
             total_timeout: self.total_timeout,
+            stream_deadline_slack: self.stream_deadline_slack,
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             retry_eligibility: self.retry_eligibility,
             retry_budget: self
                 .retry_budget_policy
-                .map(|policy| Arc::new(RetryBudget::new(policy, Arc::clone(&self.clock)))),
+                .map(|policy| Arc::new(RetryBudget::new(policy, Arc::clone(&clock)))),
             circuit_breaker: self
                 .circuit_breaker_policy
-                .map(|policy| Arc::new(CircuitBreaker::new(policy, Arc::clone(&self.clock)))),
-            adaptive_concurrency: self
-                .adaptive_concurrency_policy
-                .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),
+                .map(|policy| Arc::new(CircuitBreaker::new(policy, Arc::clone(&clock)))),
+            adaptive_concurrency: self.adaptive_concurrency_policy.map(|policy| {
+                Arc::new(AdaptiveConcurrencyController::new(
+                    policy,
+                    Arc::clone(&clock),
+                ))
+            }),
             rate_limiter: RateLimiter::new(
                 self.global_rate_limit_policy,
                 self.per_host_rate_limit_policy,
+                Arc::clone(&clock),
             )
             .map(Arc::new),
             server_throttle_scope: self.server_throttle_scope,
@@ -1509,9 +1536,13 @@ impl ClientBuilder {
             transport,
             endpoint_selector: self.endpoint_selector,
             body_codec: self.body_codec,
-            clock: self.clock,
+            clock: Arc::clone(&clock),
             backoff_source: self.backoff_source,
-            request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
+            request_limiters: RequestLimiters::new(
+                self.max_in_flight,
+                self.max_in_flight_per_host,
+                Arc::clone(&clock),
+            ),
             metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
             observers: self.observers,
@@ -1527,6 +1558,7 @@ pub struct Client {
     stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
+    stream_deadline_slack: Duration,
     max_response_body_bytes: usize,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,
@@ -2723,6 +2755,8 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_deadline_slack: self.stream_deadline_slack,
+                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,
@@ -2777,6 +2811,8 @@ impl Client {
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
+                        stream_deadline_slack: self.stream_deadline_slack,
+                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,

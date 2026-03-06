@@ -79,6 +79,11 @@ impl BackoffSource for PolicyBackoffSource {
     }
 }
 
+/// Time source used by retry/resilience bookkeeping and other internal control loops.
+///
+/// Real transport sleeps and socket deadlines still use the runtime or OS timers.
+/// Custom clocks should therefore track wall time monotonically rather than simulating
+/// arbitrary jumps unless they are only used in tests for pure control-flow components.
 pub trait Clock: Send + Sync {
     fn now_system(&self) -> SystemTime;
 

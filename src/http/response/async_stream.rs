@@ -1,6 +1,7 @@
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use tokio::time::Sleep;
 use crate::body::decode_content_encoded_body_limited;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
+use crate::extensions::Clock;
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
 
 use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
@@ -33,7 +35,6 @@ impl StreamPermits {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ResponseStreamContext {
     pub(crate) method: http::Method,
     pub(crate) uri_raw: String,
@@ -41,11 +42,12 @@ pub(crate) struct ResponseStreamContext {
     pub(crate) timeout_ms: u128,
     pub(crate) total_timeout_ms: Option<u128>,
     pub(crate) deadline_at: Option<Instant>,
+    pub(crate) deadline_slack: Duration,
+    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) lifecycle: Option<StreamLifecycle>,
     pub(crate) permits: StreamPermits,
 }
 
-#[derive(Debug)]
 struct StreamBody {
     inner: Incoming,
     method: http::Method,
@@ -53,6 +55,8 @@ struct StreamBody {
     timeout_ms: u128,
     total_timeout_ms: Option<u128>,
     deadline_at: Option<Instant>,
+    deadline_slack: Duration,
+    clock: Arc<dyn Clock>,
     frame_timeout: Option<Pin<Box<Sleep>>>,
     read_buffer: Bytes,
     lifecycle: Option<StreamLifecycle>,
@@ -69,6 +73,8 @@ impl StreamBody {
             timeout_ms,
             total_timeout_ms,
             deadline_at,
+            deadline_slack,
+            clock,
             lifecycle,
             permits,
         } = context;
@@ -79,6 +85,8 @@ impl StreamBody {
             timeout_ms: timeout_ms.max(1),
             total_timeout_ms,
             deadline_at,
+            deadline_slack,
+            clock,
             frame_timeout: None,
             read_buffer: Bytes::new(),
             lifecycle,
@@ -136,8 +144,8 @@ impl StreamBody {
         let Some(deadline_at) = self.deadline_at else {
             return Ok(phase_timeout);
         };
-        let now = Instant::now();
-        if deadline_reached(deadline_at) {
+        let now = self.clock.now_monotonic();
+        if deadline_reached(deadline_at, now, self.deadline_slack) {
             return Err(self.deadline_exceeded_error());
         }
         let remaining = deadline_at.saturating_duration_since(now);
@@ -184,7 +192,13 @@ impl StreamBody {
                         && timer.as_mut().poll(cx).is_ready()
                     {
                         self.frame_timeout = None;
-                        let error = if self.deadline_at.is_some_and(deadline_reached) {
+                        let error = if self.deadline_at.is_some_and(|deadline_at| {
+                            deadline_reached(
+                                deadline_at,
+                                self.clock.now_monotonic(),
+                                self.deadline_slack,
+                            )
+                        }) {
                             self.deadline_exceeded_error()
                         } else {
                             self.response_body_timeout_error()
@@ -333,6 +347,23 @@ impl StreamBody {
 
     fn complete_error(&mut self, error: &Error) {
         super::complete_error(&mut self.lifecycle, error);
+    }
+}
+
+impl std::fmt::Debug for StreamBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamBody")
+            .field("method", &self.method)
+            .field("uri_redacted", &self.uri_redacted)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("total_timeout_ms", &self.total_timeout_ms)
+            .field("deadline_at", &self.deadline_at)
+            .field("deadline_slack", &self.deadline_slack)
+            .field("has_frame_timeout", &self.frame_timeout.is_some())
+            .field("read_buffer_len", &self.read_buffer.len())
+            .field("has_lifecycle", &self.lifecycle.is_some())
+            .finish()
     }
 }
 

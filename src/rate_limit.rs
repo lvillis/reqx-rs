@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::extensions::Clock;
 use crate::util::lock_unpoisoned;
 
 const PER_HOST_RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(300);
@@ -238,8 +239,8 @@ struct PerHostRateLimitEntry {
     last_used_at: Instant,
 }
 
-#[derive(Debug)]
 pub(crate) struct RateLimiter {
+    clock: Arc<dyn Clock>,
     global: Option<Mutex<TokenBucket>>,
     per_host_policy: Option<RateLimitPolicy>,
     per_host: Mutex<BTreeMap<String, PerHostRateLimitEntry>>,
@@ -251,13 +252,15 @@ impl RateLimiter {
     pub(crate) fn new(
         global_policy: Option<RateLimitPolicy>,
         per_host_policy: Option<RateLimitPolicy>,
+        clock: Arc<dyn Clock>,
     ) -> Option<Self> {
         if global_policy.is_none() && per_host_policy.is_none() {
             return None;
         }
 
-        let now = Instant::now();
+        let now = clock.now_monotonic();
         Some(Self {
+            clock,
             global: global_policy.map(|policy| Mutex::new(TokenBucket::new(policy, now))),
             per_host_policy: per_host_policy.map(RateLimitPolicy::normalize),
             per_host: Mutex::new(BTreeMap::new()),
@@ -267,7 +270,7 @@ impl RateLimiter {
     }
 
     pub(crate) fn acquire_delay(&self, host: Option<&str>) -> Duration {
-        let now = Instant::now();
+        let now = self.clock.now_monotonic();
         let host_key = host.map(|item| item.to_ascii_lowercase());
 
         let mut global_bucket = self.global.as_ref().map(lock_unpoisoned);
@@ -352,7 +355,7 @@ impl RateLimiter {
             return resolved_scope;
         }
 
-        let now = Instant::now();
+        let now = self.clock.now_monotonic();
 
         let mut applied = false;
 
@@ -475,14 +478,50 @@ fn cleanup_stale_per_host_rate_limits(
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-
     use super::{
         RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
     };
+    use crate::extensions::Clock;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[derive(Debug)]
+    struct TestClock {
+        base_monotonic: Instant,
+        elapsed: Mutex<Duration>,
+    }
+
+    impl Default for TestClock {
+        fn default() -> Self {
+            Self {
+                base_monotonic: Instant::now(),
+                elapsed: Mutex::new(Duration::ZERO),
+            }
+        }
+    }
+
+    impl TestClock {
+        fn advance(&self, duration: Duration) {
+            let mut elapsed = self.elapsed.lock().expect("test clock mutex poisoned");
+            *elapsed = elapsed.saturating_add(duration);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+
+        fn now_monotonic(&self) -> Instant {
+            let elapsed = *self.elapsed.lock().expect("test clock mutex poisoned");
+            self.base_monotonic + elapsed
+        }
+    }
 
     #[test]
     fn global_rate_limiter_respects_burst_and_refill() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             Some(
                 RateLimitPolicy::standard()
@@ -490,47 +529,49 @@ mod tests {
                     .burst(1),
             ),
             None,
+            clock.clone(),
         )
         .expect("global limiter should be built");
 
-        assert_eq!(limiter.acquire_delay(None), std::time::Duration::ZERO);
+        assert_eq!(limiter.acquire_delay(None), Duration::ZERO);
         let wait = limiter.acquire_delay(None);
-        assert!(wait >= std::time::Duration::from_millis(45));
+        assert!(wait >= Duration::from_millis(45));
 
-        sleep(wait);
-        assert_eq!(limiter.acquire_delay(None), std::time::Duration::ZERO);
+        clock.advance(wait);
+        assert_eq!(limiter.acquire_delay(None), Duration::ZERO);
     }
 
     #[test]
     fn throttle_delay_is_applied_for_host_bucket() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             None,
             Some(
                 RateLimitPolicy::standard()
                     .requests_per_second(100.0)
                     .burst(10)
-                    .max_throttle_delay(std::time::Duration::from_millis(500)),
+                    .max_throttle_delay(Duration::from_millis(500)),
             ),
+            clock,
         )
         .expect("per-host limiter should be built");
 
         assert_eq!(
             limiter.acquire_delay(Some("api.example.com")),
-            std::time::Duration::ZERO
+            Duration::ZERO
         );
         limiter.observe_server_throttle(
             Some("api.example.com"),
-            std::time::Duration::from_millis(120),
+            Duration::from_millis(120),
             ServerThrottleScope::Auto,
             None,
         );
-        assert!(
-            limiter.acquire_delay(Some("api.example.com")) >= std::time::Duration::from_millis(110)
-        );
+        assert!(limiter.acquire_delay(Some("api.example.com")) >= Duration::from_millis(110));
     }
 
     #[test]
     fn auto_server_throttle_scope_prefers_host_bucket_when_available() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             Some(
                 RateLimitPolicy::standard()
@@ -542,24 +583,26 @@ mod tests {
                     .requests_per_second(500.0)
                     .burst(100),
             ),
+            clock,
         )
         .expect("limiter should be built");
 
         limiter.observe_server_throttle(
             Some("api-a.example.com"),
-            std::time::Duration::from_millis(120),
+            Duration::from_millis(120),
             ServerThrottleScope::Auto,
             None,
         );
 
         let host_a_wait = limiter.acquire_delay(Some("api-a.example.com"));
         let host_b_wait = limiter.acquire_delay(Some("api-b.example.com"));
-        assert!(host_a_wait >= std::time::Duration::from_millis(110));
-        assert!(host_b_wait <= std::time::Duration::from_millis(20));
+        assert!(host_a_wait >= Duration::from_millis(110));
+        assert!(host_b_wait <= Duration::from_millis(20));
     }
 
     #[test]
     fn global_server_throttle_scope_backpressures_all_hosts() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             Some(
                 RateLimitPolicy::standard()
@@ -571,18 +614,19 @@ mod tests {
                     .requests_per_second(500.0)
                     .burst(100),
             ),
+            clock,
         )
         .expect("limiter should be built");
 
         limiter.observe_server_throttle(
             Some("api-a.example.com"),
-            std::time::Duration::from_millis(120),
+            Duration::from_millis(120),
             ServerThrottleScope::Global,
             None,
         );
 
         let host_b_wait = limiter.acquire_delay(Some("api-b.example.com"));
-        assert!(host_b_wait >= std::time::Duration::from_millis(110));
+        assert!(host_b_wait >= Duration::from_millis(110));
     }
 
     #[test]
@@ -600,6 +644,7 @@ mod tests {
 
     #[test]
     fn explicit_host_scope_does_not_fallback_to_global_bucket() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             Some(
                 RateLimitPolicy::standard()
@@ -607,22 +652,24 @@ mod tests {
                     .burst(100),
             ),
             None,
+            clock,
         )
         .expect("limiter should be built");
 
         limiter.observe_server_throttle(
             Some("api.example.com"),
-            std::time::Duration::from_millis(120),
+            Duration::from_millis(120),
             ServerThrottleScope::Host,
             None,
         );
 
         let global_wait = limiter.acquire_delay(None);
-        assert!(global_wait <= std::time::Duration::from_millis(20));
+        assert!(global_wait <= Duration::from_millis(20));
     }
 
     #[test]
     fn explicit_global_scope_does_not_fallback_to_host_bucket() {
+        let clock = Arc::new(TestClock::default());
         let limiter = RateLimiter::new(
             None,
             Some(
@@ -630,17 +677,18 @@ mod tests {
                     .requests_per_second(500.0)
                     .burst(100),
             ),
+            clock,
         )
         .expect("limiter should be built");
 
         limiter.observe_server_throttle(
             Some("api.example.com"),
-            std::time::Duration::from_millis(120),
+            Duration::from_millis(120),
             ServerThrottleScope::Global,
             None,
         );
 
         let host_wait = limiter.acquire_delay(Some("api.example.com"));
-        assert!(host_wait <= std::time::Duration::from_millis(20));
+        assert!(host_wait <= Duration::from_millis(20));
     }
 }

@@ -11,10 +11,12 @@ use crate::core::limiters::{
     PerHostLimiterEntry as PerHostLimiterEntryState, cleanup_stale_per_host_limiters,
 };
 use crate::error::Error;
+use crate::extensions::Clock;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone)]
 pub(crate) struct RequestLimiters {
+    clock: Arc<dyn Clock>,
     global: Option<Arc<Semaphore>>,
     per_host_limit: Option<usize>,
     per_host: Arc<Mutex<BTreeMap<String, PerHostLimiterEntry>>>,
@@ -48,12 +50,17 @@ impl PerHostLimiterEntryState for PerHostLimiterEntry {
 }
 
 impl RequestLimiters {
-    pub(crate) fn new(max_in_flight: Option<usize>, per_host_limit: Option<usize>) -> Option<Self> {
+    pub(crate) fn new(
+        max_in_flight: Option<usize>,
+        per_host_limit: Option<usize>,
+        clock: Arc<dyn Clock>,
+    ) -> Option<Self> {
         if max_in_flight.is_none() && per_host_limit.is_none() {
             return None;
         }
 
         Some(Self {
+            clock,
             global: max_in_flight.map(|limit| Arc::new(Semaphore::new(limit))),
             per_host_limit,
             per_host: Arc::new(Mutex::new(BTreeMap::new())),
@@ -84,7 +91,7 @@ impl RequestLimiters {
             (Some(limit), Some(host)) => {
                 let semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
-                    let now = Instant::now();
+                    let now = self.clock.now_monotonic();
                     cleanup_stale_per_host_limiters(
                         &mut guard,
                         now,

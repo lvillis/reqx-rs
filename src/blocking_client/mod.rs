@@ -37,18 +37,19 @@ const DEFAULT_POOL_MAX_IDLE_CONNECTIONS: usize = 16;
 const DEFAULT_CLIENT_NAME: &str = "reqx";
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug)]
 struct AdaptiveConcurrencyController {
     policy: AdaptiveConcurrencyPolicy,
     state: Mutex<AdaptiveConcurrencyState>,
+    clock: Arc<dyn Clock>,
     condvar: Condvar,
 }
 
 impl AdaptiveConcurrencyController {
-    fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
+    fn new(policy: AdaptiveConcurrencyPolicy, clock: Arc<dyn Clock>) -> Self {
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState::new(policy)),
+            clock,
             condvar: Condvar::new(),
         }
     }
@@ -85,7 +86,7 @@ impl AdaptiveConcurrencyController {
         drop(state);
         Some(AdaptiveConcurrencyPermit {
             controller: Arc::clone(self),
-            started_at: Instant::now(),
+            started_at: self.clock.now_monotonic(),
             completed: false,
         })
     }
@@ -110,15 +111,20 @@ struct AdaptiveConcurrencyPermit {
 }
 
 impl AdaptiveConcurrencyPermit {
-    fn mark_success(mut self) {
+    fn latency(&self) -> Duration {
         self.controller
-            .release_and_record(true, self.started_at.elapsed());
+            .clock
+            .now_monotonic()
+            .saturating_duration_since(self.started_at)
+    }
+
+    fn mark_success(mut self) {
+        self.controller.release_and_record(true, self.latency());
         self.completed = true;
     }
 
     fn mark_failure(mut self) {
-        self.controller
-            .release_and_record(false, self.started_at.elapsed());
+        self.controller.release_and_record(false, self.latency());
         self.completed = true;
     }
 
@@ -131,8 +137,7 @@ impl AdaptiveConcurrencyPermit {
 impl Drop for AdaptiveConcurrencyPermit {
     fn drop(&mut self) {
         if !self.completed {
-            self.controller
-                .release_and_record(false, self.started_at.elapsed());
+            self.controller.release_and_record(false, self.latency());
             self.completed = true;
         }
     }
@@ -160,6 +165,7 @@ pub struct ClientBuilder {
     stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
+    stream_deadline_slack: Duration,
     max_response_body_bytes: usize,
     connect_timeout: Duration,
     pool_idle_timeout: Duration,
@@ -202,6 +208,7 @@ pub struct Client {
     stream_auto_accept_encoding: bool,
     request_timeout: Duration,
     total_timeout: Option<Duration>,
+    stream_deadline_slack: Duration,
     max_response_body_bytes: usize,
     retry_policy: RetryPolicy,
     retry_eligibility: Arc<dyn RetryEligibility>,

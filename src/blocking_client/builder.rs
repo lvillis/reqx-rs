@@ -19,6 +19,7 @@ use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
+use crate::response::DEFAULT_STREAM_DEADLINE_SLACK;
 use crate::retry::{
     PermissiveRetryEligibility, RetryEligibility, RetryPolicy, StrictRetryEligibility,
 };
@@ -45,6 +46,7 @@ impl ClientBuilder {
             stream_auto_accept_encoding: false,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             total_timeout: None,
+            stream_deadline_slack: DEFAULT_STREAM_DEADLINE_SLACK,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             pool_idle_timeout: DEFAULT_POOL_IDLE_TIMEOUT,
@@ -88,6 +90,11 @@ impl ClientBuilder {
 
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
         self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    pub fn stream_deadline_slack(mut self, stream_deadline_slack: Duration) -> Self {
+        self.stream_deadline_slack = stream_deadline_slack;
         self
     }
 
@@ -524,6 +531,7 @@ impl ClientBuilder {
         } else {
             OtelTelemetry::disabled()
         };
+        let clock = self.clock;
 
         Ok(Client {
             base_url: self.base_url,
@@ -532,21 +540,26 @@ impl ClientBuilder {
             stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,
             total_timeout: self.total_timeout,
+            stream_deadline_slack: self.stream_deadline_slack,
             max_response_body_bytes: self.max_response_body_bytes,
             retry_policy: self.retry_policy,
             retry_eligibility: self.retry_eligibility,
             retry_budget: self
                 .retry_budget_policy
-                .map(|policy| Arc::new(RetryBudget::new(policy, Arc::clone(&self.clock)))),
+                .map(|policy| Arc::new(RetryBudget::new(policy, Arc::clone(&clock)))),
             circuit_breaker: self
                 .circuit_breaker_policy
-                .map(|policy| Arc::new(CircuitBreaker::new(policy, Arc::clone(&self.clock)))),
-            adaptive_concurrency: self
-                .adaptive_concurrency_policy
-                .map(|policy| Arc::new(AdaptiveConcurrencyController::new(policy))),
+                .map(|policy| Arc::new(CircuitBreaker::new(policy, Arc::clone(&clock)))),
+            adaptive_concurrency: self.adaptive_concurrency_policy.map(|policy| {
+                Arc::new(AdaptiveConcurrencyController::new(
+                    policy,
+                    Arc::clone(&clock),
+                ))
+            }),
             rate_limiter: RateLimiter::new(
                 self.global_rate_limit_policy,
                 self.per_host_rate_limit_policy,
+                Arc::clone(&clock),
             )
             .map(Arc::new),
             server_throttle_scope: self.server_throttle_scope,
@@ -560,10 +573,14 @@ impl ClientBuilder {
             proxy_config,
             endpoint_selector: self.endpoint_selector,
             body_codec: self.body_codec,
-            clock: self.clock,
+            clock: Arc::clone(&clock),
             backoff_source: self.backoff_source,
             connect_timeout: self.connect_timeout,
-            request_limiters: RequestLimiters::new(self.max_in_flight, self.max_in_flight_per_host),
+            request_limiters: RequestLimiters::new(
+                self.max_in_flight,
+                self.max_in_flight_per_host,
+                Arc::clone(&clock),
+            ),
             metrics: ClientMetrics::with_options(self.metrics_enabled, otel),
             interceptors: self.interceptors,
             observers: self.observers,
