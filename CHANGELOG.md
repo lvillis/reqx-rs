@@ -1,8 +1,18 @@
+## [0.1.26] - 2026-03-06
+
+### 🚜 Refactor
+
+- [**breaking**] Split response streaming internals and separate write-body errors
+- Type retry decisions and group metrics snapshots
 ## [0.1.25] - 2026-03-06
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.25
 ## [0.1.24] - 2026-03-06
 
 ### 🐛 Bug Fixes
