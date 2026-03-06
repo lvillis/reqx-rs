@@ -1,9 +1,28 @@
+## [0.1.27] - 2026-03-06
+
+### 🐛 Bug Fixes
+
+- Tighten stream deadline timeout classification
+
+### 🚜 Refactor
+
+- Type metrics errors and inject resilience clocks
+- Unify internal time controls and expose stream deadline slack
+- Tighten control-clock semantics and deadline classification
+
+### ⚙️ Miscellaneous Tasks
+
+- *(docs)* Add advanced time controls example
 ## [0.1.26] - 2026-03-06
 
 ### 🚜 Refactor
 
 - [**breaking**] Split response streaming internals and separate write-body errors
 - Type retry decisions and group metrics snapshots
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.26
 ## [0.1.25] - 2026-03-06
 
 ### 🐛 Bug Fixes
