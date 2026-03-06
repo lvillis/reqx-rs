@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use http::{HeaderMap, StatusCode};
 
+use crate::advanced::{AdaptiveConcurrencyPolicy, ClientProfile, StatusPolicy};
 use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
@@ -22,7 +25,6 @@ use crate::util::{
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
     resolve_redirect_uri, resolve_uri, same_origin,
 };
-use crate::{AdaptiveConcurrencyPolicy, AdvancedConfig, ClientProfile, StatusPolicy};
 
 #[test]
 fn join_base_path_handles_slashes() {
@@ -619,7 +621,7 @@ fn error_safe_request_accessors_return_method_uri_and_path() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 28);
+    assert_eq!(codes.len(), 29);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -640,6 +642,7 @@ fn error_code_contract_table_is_stable() {
             "response_body_too_large",
             "http_status",
             "deserialize_json",
+            "decode_text",
             "invalid_header_name",
             "invalid_header_value",
             "decode_content_encoding",
@@ -874,19 +877,40 @@ fn build_rejects_base_url_with_surrounding_whitespace() {
 }
 
 #[test]
-fn client_profile_and_advanced_config_compose() {
+fn client_profile_and_direct_builder_overrides_compose() {
     let client = Client::builder("https://api.example.com")
         .profile(ClientProfile::LowLatency)
-        .advanced(
-            AdvancedConfig::default()
-                .with_request_timeout(Duration::from_secs(4))
-                .with_total_timeout(Duration::from_secs(9))
-                .with_max_response_body_bytes(16 * 1024)
-                .with_default_status_policy(StatusPolicy::Response),
-        )
+        .request_timeout(Duration::from_secs(4))
+        .total_timeout(Duration::from_secs(9))
+        .max_response_body_bytes(16 * 1024)
+        .default_status_policy(StatusPolicy::Response)
         .build()
-        .expect("client should build with profile and advanced config");
+        .expect("client should build with profile and direct overrides");
     assert_eq!(client.default_status_policy(), StatusPolicy::Response);
+}
+
+#[test]
+fn response_text_accepts_valid_utf8() {
+    let response = Response::new(
+        StatusCode::OK,
+        HeaderMap::new(),
+        Bytes::from_static(b"hello"),
+    );
+    assert_eq!(response.text().expect("text should decode"), "hello");
+}
+
+#[test]
+fn response_text_rejects_invalid_utf8() {
+    let response = Response::new(
+        StatusCode::OK,
+        HeaderMap::new(),
+        Bytes::from_static(b"hello\xff"),
+    );
+    let error = response.text().expect_err("invalid utf-8 should fail");
+    match error {
+        Error::DecodeText { body, .. } => assert_eq!(body, "hello\u{fffd}"),
+        other => panic!("unexpected error variant: {other}"),
+    }
 }
 
 #[test]

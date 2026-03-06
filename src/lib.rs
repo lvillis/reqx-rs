@@ -157,37 +157,12 @@ pub(crate) use crate::http::response;
 
 #[cfg(feature = "_async")]
 pub use crate::client::{Client, ClientBuilder};
-pub use crate::config::{AdvancedConfig, ClientProfile};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
-pub use crate::extensions::{
-    BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
-    PrimaryEndpointSelector, RoundRobinEndpointSelector, StandardBodyCodec,
-    StandardOtelPathNormalizer, SystemClock,
-};
-pub use crate::metrics::MetricsSnapshot;
-pub use crate::observe::Observer;
-pub use crate::policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy};
-pub use crate::rate_limit::{RateLimitPolicy, ServerThrottleScope};
 #[cfg(feature = "_async")]
 pub use crate::request::RequestBuilder;
-pub use crate::resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy};
 pub use crate::response::Response;
 #[cfg(feature = "_async")]
 pub use crate::response::ResponseStream;
-#[cfg(feature = "_async")]
-pub use crate::response::StreamBody;
-pub use crate::retry::{
-    PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility, RetryPolicy,
-    StrictRetryEligibility,
-};
-pub use crate::tls::{TlsBackend, TlsRootStore};
-#[cfg(feature = "_async")]
-pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
-pub use crate::upload::{
-    BlockingResumableUploadBackend, BlockingResumableUploader, PartChecksumAlgorithm,
-    RESUMABLE_UPLOAD_CHECKPOINT_VERSION, ResumableUploadCheckpoint, ResumableUploadError,
-    ResumableUploadOptions, ResumableUploadResult, UploadedPart,
-};
 
 #[cfg(feature = "_blocking")]
 pub mod blocking {
@@ -199,32 +174,48 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Recommended imports for most SDK transport code.
 pub mod prelude {
+    pub use crate::Result;
     #[cfg(feature = "_blocking")]
     pub use crate::blocking;
     #[cfg(feature = "_async")]
-    pub use crate::{Client, ResponseStream};
-    pub use crate::{
-        Error, ErrorCode, RedirectPolicy, Response, Result, RetryPolicy, StatusPolicy, TlsBackend,
-        TlsRootStore,
-    };
+    pub use crate::client::Client;
+    pub use crate::error::{Error, ErrorCode};
+    pub use crate::policy::{RedirectPolicy, StatusPolicy};
+    pub use crate::response::Response;
+    #[cfg(feature = "_async")]
+    pub use crate::response::ResponseStream;
+    pub use crate::retry::RetryPolicy;
+    pub use crate::tls::{TlsBackend, TlsRootStore};
 }
 
 /// Advanced transport controls and extensibility points.
 pub mod advanced {
-    pub use crate::{
-        AdaptiveConcurrencyPolicy, AdvancedConfig, BackoffSource, BlockingResumableUploadBackend,
-        BlockingResumableUploader, BodyCodec, CircuitBreakerPolicy, ClientProfile, Clock,
-        EndpointSelector, Interceptor, MetricsSnapshot, Observer, OtelPathNormalizer,
-        PartChecksumAlgorithm, PermissiveRetryEligibility, PolicyBackoffSource,
-        PrimaryEndpointSelector, RESUMABLE_UPLOAD_CHECKPOINT_VERSION, RateLimitPolicy,
-        RedirectPolicy, RequestContext, ResumableUploadCheckpoint, ResumableUploadError,
-        ResumableUploadOptions, ResumableUploadResult, RetryBudgetPolicy, RetryClassifier,
-        RetryDecision, RetryEligibility, RoundRobinEndpointSelector, ServerThrottleScope,
-        StandardBodyCodec, StandardOtelPathNormalizer, StatusPolicy, StrictRetryEligibility,
-        SystemClock, TimeoutPhase, TransportErrorKind, UploadedPart,
+    pub use crate::config::ClientProfile;
+    pub use crate::error::{TimeoutPhase, TransportErrorKind};
+    pub use crate::extensions::{
+        BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
+        PrimaryEndpointSelector, RoundRobinEndpointSelector, StandardBodyCodec,
+        StandardOtelPathNormalizer, SystemClock,
     };
     #[cfg(feature = "_async")]
-    pub use crate::{AsyncResumableUploadBackend, AsyncResumableUploader};
+    pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
+    pub use crate::{
+        metrics::MetricsSnapshot,
+        observe::Observer,
+        policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy},
+        rate_limit::{RateLimitPolicy, ServerThrottleScope},
+        resilience::{AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy},
+        retry::{
+            PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility,
+            StrictRetryEligibility,
+        },
+        tls::{TlsBackend, TlsRootStore},
+        upload::{
+            BlockingResumableUploadBackend, BlockingResumableUploader, PartChecksumAlgorithm,
+            RESUMABLE_UPLOAD_CHECKPOINT_VERSION, ResumableUploadCheckpoint, ResumableUploadError,
+            ResumableUploadOptions, ResumableUploadResult, UploadedPart,
+        },
+    };
 }
 
 #[cfg(all(test, feature = "_async"))]

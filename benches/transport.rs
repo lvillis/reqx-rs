@@ -338,7 +338,7 @@ fn bench_upload_modes(c: &mut Criterion) {
                 let response = client
                     .post("/v1/upload")
                     .header(CONTENT_LENGTH, payload_len_header)
-                    .body_bytes(payload)
+                    .body(payload)
                     .send()
                     .await
                     .expect("buffered upload should succeed");

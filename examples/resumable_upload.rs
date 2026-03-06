@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "_async")]
-use reqx::{
+use reqx::advanced::{
     AsyncResumableUploadBackend, AsyncResumableUploader, ResumableUploadOptions, UploadedPart,
 };
 #[cfg(feature = "_async")]

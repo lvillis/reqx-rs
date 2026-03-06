@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upload_status = client
         .post("/post")
         .idempotency_key("blocking-upload-reader-001")?
-        .upload_from_reader_with_length(reader_payload, 26)?
+        .body_reader_with_length(reader_payload, 26)?
         .send()?
         .status();
     println!("upload status={upload_status}");

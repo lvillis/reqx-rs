@@ -12,7 +12,7 @@ pub enum ClientProfile {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProfileDefaults {
+pub(crate) struct ProfileDefaults {
     pub request_timeout: Duration,
     pub total_timeout: Option<Duration>,
     pub retry_policy: RetryPolicy,
@@ -22,7 +22,7 @@ pub struct ProfileDefaults {
 }
 
 impl ClientProfile {
-    pub fn defaults(self) -> ProfileDefaults {
+    pub(crate) fn defaults(self) -> ProfileDefaults {
         match self {
             Self::StandardSdk => ProfileDefaults {
                 request_timeout: Duration::from_secs(10),
@@ -55,47 +55,5 @@ impl ClientProfile {
                 status_policy: StatusPolicy::Error,
             },
         }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AdvancedConfig {
-    pub request_timeout: Option<Duration>,
-    pub total_timeout: Option<Duration>,
-    pub max_response_body_bytes: Option<usize>,
-    pub connect_timeout: Option<Duration>,
-    pub redirect_policy: Option<RedirectPolicy>,
-    pub default_status_policy: Option<StatusPolicy>,
-}
-
-impl AdvancedConfig {
-    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
-        self.request_timeout = Some(request_timeout);
-        self
-    }
-
-    pub fn with_total_timeout(mut self, total_timeout: Duration) -> Self {
-        self.total_timeout = Some(total_timeout);
-        self
-    }
-
-    pub fn with_max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
-        self.max_response_body_bytes = Some(max_response_body_bytes);
-        self
-    }
-
-    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        self.connect_timeout = Some(connect_timeout);
-        self
-    }
-
-    pub fn with_redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
-        self.redirect_policy = Some(redirect_policy);
-        self
-    }
-
-    pub fn with_default_status_policy(mut self, default_status_policy: StatusPolicy) -> Self {
-        self.default_status_policy = Some(default_status_policy);
-        self
     }
 }

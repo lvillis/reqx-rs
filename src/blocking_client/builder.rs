@@ -4,9 +4,14 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
-use crate::StandardOtelPathNormalizer;
+use crate::config::ClientProfile;
 use crate::error::Error;
+use crate::extensions::{
+    BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
+    PrimaryEndpointSelector, StandardBodyCodec, StandardOtelPathNormalizer, SystemClock,
+};
 use crate::metrics::ClientMetrics;
+use crate::observe::Observer;
 use crate::otel::OtelTelemetry;
 use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules};
@@ -22,9 +27,6 @@ use crate::util::{
     parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url,
     validate_http_proxy_uri,
 };
-use crate::{AdvancedConfig, ClientProfile};
-use crate::{BackoffSource, BodyCodec, Clock, EndpointSelector, Observer, OtelPathNormalizer};
-use crate::{PolicyBackoffSource, PrimaryEndpointSelector, StandardBodyCodec, SystemClock};
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
 use super::{
@@ -443,28 +445,6 @@ impl ClientBuilder {
         self.max_response_body_bytes = defaults.max_response_body_bytes;
         self.redirect_policy = defaults.redirect_policy;
         self.default_status_policy = defaults.status_policy;
-        self
-    }
-
-    pub fn advanced(mut self, config: AdvancedConfig) -> Self {
-        if let Some(request_timeout) = config.request_timeout {
-            self.request_timeout = request_timeout.max(Duration::from_millis(1));
-        }
-        if let Some(total_timeout) = config.total_timeout {
-            self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
-        }
-        if let Some(max_response_body_bytes) = config.max_response_body_bytes {
-            self.max_response_body_bytes = max_response_body_bytes.max(1);
-        }
-        if let Some(connect_timeout) = config.connect_timeout {
-            self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
-        }
-        if let Some(redirect_policy) = config.redirect_policy {
-            self.redirect_policy = redirect_policy;
-        }
-        if let Some(default_status_policy) = config.default_status_policy {
-            self.default_status_policy = default_status_policy;
-        }
         self
     }
 

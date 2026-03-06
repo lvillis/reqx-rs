@@ -106,18 +106,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
-    pub fn upload_from_reader<R>(self, reader: R) -> Self
-    where
-        R: Read + Send + 'static,
-    {
-        self.body_reader(reader)
-    }
-
-    pub fn upload_from_reader_with_length<R>(
-        self,
-        reader: R,
-        content_length: u64,
-    ) -> crate::Result<Self>
+    pub fn body_reader_with_length<R>(self, reader: R, content_length: u64) -> crate::Result<Self>
     where
         R: Read + Send + 'static,
     {
@@ -130,7 +119,7 @@ impl<'a> RequestBuilder<'a> {
         Ok(self.body_reader(reader).header(CONTENT_LENGTH, value))
     }
 
-    pub fn body_bytes(mut self, body: Bytes) -> Self {
+    fn body_bytes(mut self, body: Bytes) -> Self {
         self.body = Some(RequestBody::Buffered(body));
         self
     }

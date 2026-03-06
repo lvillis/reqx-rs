@@ -37,6 +37,13 @@ impl Response {
         &self.body
     }
 
+    pub fn text(&self) -> crate::Result<&str> {
+        std::str::from_utf8(&self.body).map_err(|source| Error::DecodeText {
+            source,
+            body: truncate_body(&self.body),
+        })
+    }
+
     pub fn text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
@@ -152,18 +159,18 @@ impl Drop for StreamLifecycle {
 
 #[cfg(feature = "_async")]
 mod stream {
-    use std::future::Future;
+    use std::future::{Future, poll_fn};
+    use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
-    use http_body_util::BodyExt;
-    use hyper::body::{Body as HyperBody, Frame, Incoming, SizeHint};
+    use hyper::body::{Body as HyperBody, Incoming};
     use serde::de::DeserializeOwned;
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
-    use tokio::time::{Sleep, timeout};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::time::Sleep;
 
     use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
     use crate::content_encoding::should_decode_content_encoded_body;
@@ -195,162 +202,19 @@ mod stream {
         }
     }
 
-    #[derive(Debug)]
-    pub struct StreamBody {
-        inner: Incoming,
-        method: http::Method,
-        uri: String,
-        timeout_ms: u128,
-        total_timeout_ms: Option<u128>,
-        deadline_at: Option<Instant>,
-        frame_timeout: Option<Pin<Box<Sleep>>>,
-        lifecycle: Option<super::StreamLifecycle>,
-        _global_permit: Option<GlobalRequestPermit>,
-        _host_permit: Option<HostRequestPermit>,
-    }
-
-    impl StreamBody {
-        pub(crate) fn new(inner: Incoming, context: ResponseStreamContext) -> Self {
-            let ResponseStreamContext {
-                method,
-                uri_raw: _,
-                uri_redacted,
-                timeout_ms,
-                total_timeout_ms,
-                deadline_at,
-                lifecycle,
-                permits,
-            } = context;
-            Self {
-                inner,
-                method,
-                uri: uri_redacted,
-                timeout_ms: timeout_ms.max(1),
-                total_timeout_ms,
-                deadline_at,
-                frame_timeout: None,
-                lifecycle,
-                _global_permit: permits.global,
-                _host_permit: permits.host,
-            }
-        }
-
-        fn with_lifecycle(mut self, lifecycle: Option<super::StreamLifecycle>) -> Self {
-            self.lifecycle = lifecycle;
-            self
-        }
-
-        fn response_body_timeout_error(&self) -> Error {
-            Error::Timeout {
-                phase: TimeoutPhase::ResponseBody,
-                timeout_ms: self.timeout_ms.max(1),
-                method: self.method.clone(),
-                uri: self.uri.clone(),
-            }
-        }
-
-        fn deadline_exceeded_error(&self) -> Error {
-            Error::DeadlineExceeded {
-                timeout_ms: self
-                    .total_timeout_ms
-                    .unwrap_or_else(|| self.timeout_ms.max(1)),
-                method: self.method.clone(),
-                uri: self.uri.clone(),
-            }
-        }
-
-        fn effective_frame_timeout(&self) -> crate::Result<Duration> {
-            let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
-            let Some(deadline_at) = self.deadline_at else {
-                return Ok(phase_timeout);
-            };
-            let now = Instant::now();
-            if now >= deadline_at {
-                return Err(self.deadline_exceeded_error());
-            }
-            let remaining = deadline_at.duration_since(now);
-            Ok(phase_timeout.min(remaining))
-        }
-
-        fn ensure_frame_timeout(&mut self) -> crate::Result<()> {
-            if self.frame_timeout.is_none() {
-                let timeout = self.effective_frame_timeout()?;
-                self.frame_timeout = Some(Box::pin(tokio::time::sleep(timeout)));
-            }
-            Ok(())
-        }
-
-        fn complete_success(&mut self) {
-            if let Some(lifecycle) = &mut self.lifecycle {
-                lifecycle.complete_success();
-            }
-        }
-
-        fn complete_error(&mut self, error: &Error) {
-            if let Some(lifecycle) = &mut self.lifecycle {
-                lifecycle.complete_error(error);
-            }
+    fn stream_read_io_error_kind(error: &Error) -> io::ErrorKind {
+        match error {
+            Error::Timeout { .. } | Error::DeadlineExceeded { .. } => io::ErrorKind::TimedOut,
+            Error::ReadBody { source } => source
+                .downcast_ref::<io::Error>()
+                .map_or(io::ErrorKind::Other, io::Error::kind),
+            _ => io::ErrorKind::Other,
         }
     }
 
-    impl HyperBody for StreamBody {
-        type Data = Bytes;
-        type Error = Error;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            match Pin::new(&mut self.inner).poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    self.frame_timeout = None;
-                    Poll::Ready(Some(Ok(frame)))
-                }
-                Poll::Ready(Some(Err(source))) => {
-                    self.frame_timeout = None;
-                    let error = Error::ReadBody {
-                        source: Box::new(source),
-                    };
-                    self.complete_error(&error);
-                    Poll::Ready(Some(Err(error)))
-                }
-                Poll::Ready(None) => {
-                    self.frame_timeout = None;
-                    self.complete_success();
-                    Poll::Ready(None)
-                }
-                Poll::Pending => {
-                    if let Err(error) = self.ensure_frame_timeout() {
-                        self.complete_error(&error);
-                        return Poll::Ready(Some(Err(error)));
-                    }
-                    if let Some(timer) = self.frame_timeout.as_mut()
-                        && timer.as_mut().poll(cx).is_ready()
-                    {
-                        self.frame_timeout = None;
-                        let error = if self
-                            .deadline_at
-                            .is_some_and(|deadline_at| Instant::now() >= deadline_at)
-                        {
-                            self.deadline_exceeded_error()
-                        } else {
-                            self.response_body_timeout_error()
-                        };
-                        self.complete_error(&error);
-                        return Poll::Ready(Some(Err(error)));
-                    }
-                    Poll::Pending
-                }
-            }
-        }
-
-        fn is_end_stream(&self) -> bool {
-            self.inner.is_end_stream()
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            self.inner.size_hint()
-        }
+    fn into_stream_read_io_error(error: Error) -> io::Error {
+        let kind = stream_read_io_error_kind(&error);
+        io::Error::new(kind, error)
     }
 
     #[derive(Debug)]
@@ -381,31 +245,25 @@ mod stream {
     }
 
     #[derive(Debug)]
-    pub struct ResponseStream {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Incoming,
+    struct StreamBody {
+        inner: Incoming,
         method: http::Method,
-        uri_raw: String,
         uri_redacted: String,
         timeout_ms: u128,
         total_timeout_ms: Option<u128>,
         deadline_at: Option<Instant>,
+        frame_timeout: Option<Pin<Box<Sleep>>>,
+        read_buffer: Bytes,
         lifecycle: Option<super::StreamLifecycle>,
         _global_permit: Option<GlobalRequestPermit>,
         _host_permit: Option<HostRequestPermit>,
     }
 
-    impl ResponseStream {
-        pub(crate) fn new(
-            status: StatusCode,
-            headers: HeaderMap,
-            body: Incoming,
-            context: ResponseStreamContext,
-        ) -> Self {
+    impl StreamBody {
+        fn new(inner: Incoming, context: ResponseStreamContext) -> Self {
             let ResponseStreamContext {
                 method,
-                uri_raw,
+                uri_raw: _,
                 uri_redacted,
                 timeout_ms,
                 total_timeout_ms,
@@ -414,22 +272,21 @@ mod stream {
                 permits,
             } = context;
             Self {
-                status,
-                headers,
-                body,
+                inner,
                 method,
-                uri_raw,
                 uri_redacted,
                 timeout_ms: timeout_ms.max(1),
                 total_timeout_ms,
                 deadline_at,
+                frame_timeout: None,
+                read_buffer: Bytes::new(),
                 lifecycle,
                 _global_permit: permits.global,
                 _host_permit: permits.host,
             }
         }
 
-        pub(crate) fn attach_completion(&mut self, completion: super::StreamCompletion) {
+        fn attach_completion(&mut self, completion: super::StreamCompletion) {
             if let Some(lifecycle) = &mut self.lifecycle {
                 lifecycle.attach_completion(completion);
             } else {
@@ -439,237 +296,12 @@ mod stream {
             }
         }
 
-        pub fn status(&self) -> StatusCode {
-            self.status
-        }
-
-        pub fn headers(&self) -> &HeaderMap {
-            &self.headers
-        }
-
-        pub fn method(&self) -> &http::Method {
+        fn method(&self) -> &http::Method {
             &self.method
         }
 
-        /// Returns the original request URI, including query string.
-        pub fn uri(&self) -> &str {
-            &self.uri_raw
-        }
-
-        /// Returns the original request URI, including query string.
-        pub fn uri_raw(&self) -> &str {
-            &self.uri_raw
-        }
-
-        /// Returns a redacted URI suitable for logs and errors.
-        ///
-        /// The redacted form omits the query string to reduce accidental
-        /// leakage of sensitive parameters.
-        pub fn uri_redacted(&self) -> &str {
+        fn uri_redacted(&self) -> &str {
             &self.uri_redacted
-        }
-
-        pub fn into_body(self) -> StreamBody {
-            let ResponseStream {
-                body,
-                method,
-                uri_raw,
-                uri_redacted,
-                timeout_ms,
-                total_timeout_ms,
-                deadline_at,
-                lifecycle,
-                _global_permit,
-                _host_permit,
-                ..
-            } = self;
-            StreamBody::new(
-                body,
-                ResponseStreamContext {
-                    method,
-                    uri_raw,
-                    uri_redacted,
-                    timeout_ms,
-                    total_timeout_ms,
-                    deadline_at,
-                    lifecycle: None,
-                    permits: StreamPermits::new(_global_permit, _host_permit),
-                },
-            )
-            .with_lifecycle(lifecycle)
-        }
-
-        pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
-            let max_bytes = max_bytes.max(1);
-            let mut this = self;
-            match this.read_raw_bytes_limited(max_bytes).await {
-                Ok(body) => {
-                    this.complete_success();
-                    Ok(body)
-                }
-                Err(error) => {
-                    this.complete_error(&error);
-                    Err(error)
-                }
-            }
-        }
-
-        pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
-        where
-            W: AsyncWrite + Unpin + Send + ?Sized,
-        {
-            // Stream raw wire bytes (content-encoding is not decoded on this path).
-            let mut copied = 0_u64;
-
-            while let Some(frame) = match self.next_frame_with_timeout().await {
-                Ok(frame) => frame,
-                Err(error) => {
-                    self.complete_error(&error);
-                    return Err(error);
-                }
-            } {
-                if let Some(data) = frame.data_ref() {
-                    if let Err(source) = writer.write_all(data).await {
-                        let error = Error::ReadBody {
-                            source: Box::new(source),
-                        };
-                        self.complete_error(&error);
-                        return Err(error);
-                    }
-                    copied = copied.saturating_add(data.len() as u64);
-                }
-            }
-            if let Err(source) = writer.flush().await {
-                let error = Error::ReadBody {
-                    source: Box::new(source),
-                };
-                self.complete_error(&error);
-                return Err(error);
-            }
-            self.complete_success();
-            Ok(copied)
-        }
-
-        pub async fn copy_to_writer_limited<W>(
-            mut self,
-            writer: &mut W,
-            max_bytes: usize,
-        ) -> crate::Result<u64>
-        where
-            W: AsyncWrite + Unpin + Send + ?Sized,
-        {
-            // Stream raw wire bytes with a hard byte cap.
-            let max_bytes = max_bytes.max(1);
-            let mut copied = 0_u64;
-
-            while let Some(frame) = match self.next_frame_with_timeout().await {
-                Ok(frame) => frame,
-                Err(error) => {
-                    self.complete_error(&error);
-                    return Err(error);
-                }
-            } {
-                if let Some(data) = frame.data_ref() {
-                    copied = copied.saturating_add(data.len() as u64);
-                    if copied > max_bytes as u64 {
-                        let error = Error::ResponseBodyTooLarge {
-                            limit_bytes: max_bytes,
-                            actual_bytes: copied as usize,
-                            method: self.method.clone(),
-                            uri: self.uri_redacted.clone(),
-                        };
-                        self.complete_error(&error);
-                        return Err(error);
-                    }
-                    if let Err(source) = writer.write_all(data).await {
-                        let error = Error::ReadBody {
-                            source: Box::new(source),
-                        };
-                        self.complete_error(&error);
-                        return Err(error);
-                    }
-                }
-            }
-            if let Err(source) = writer.flush().await {
-                let error = Error::ReadBody {
-                    source: Box::new(source),
-                };
-                self.complete_error(&error);
-                return Err(error);
-            }
-            self.complete_success();
-            Ok(copied)
-        }
-
-        pub async fn into_response_limited(self, max_bytes: usize) -> crate::Result<Response> {
-            let ResponseStream {
-                status,
-                mut headers,
-                body,
-                method,
-                uri_raw,
-                uri_redacted,
-                timeout_ms,
-                total_timeout_ms,
-                deadline_at,
-                lifecycle,
-                _global_permit,
-                _host_permit,
-            } = self;
-            let max_bytes = max_bytes.max(1);
-            let mut stream = ResponseStream {
-                status,
-                headers: HeaderMap::new(),
-                body,
-                method: method.clone(),
-                uri_raw: uri_raw.clone(),
-                uri_redacted: uri_redacted.clone(),
-                timeout_ms,
-                total_timeout_ms,
-                deadline_at,
-                lifecycle,
-                _global_permit,
-                _host_permit,
-            };
-            let body = match stream.read_raw_bytes_limited(max_bytes).await {
-                Ok(body) => body,
-                Err(error) => {
-                    stream.complete_error(&error);
-                    return Err(error);
-                }
-            };
-            let should_decode = should_decode_content_encoded_body(&method, status, body.len());
-            let body = if should_decode {
-                match decode_content_encoded_body_limited(body, &headers, max_bytes) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        let error = map_decode_body_error(error, &method, &uri_redacted, max_bytes);
-                        stream.complete_error(&error);
-                        return Err(error);
-                    }
-                }
-            } else {
-                body
-            };
-            if should_decode && headers.contains_key(super::CONTENT_ENCODING) {
-                headers.remove(super::CONTENT_ENCODING);
-                headers.remove(super::CONTENT_LENGTH);
-            }
-            stream.complete_success();
-            Ok(Response::new(status, headers, body))
-        }
-
-        pub async fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
-            let response = self.into_response_limited(max_bytes).await?;
-            Ok(response.text_lossy())
-        }
-
-        pub async fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
-        where
-            T: DeserializeOwned,
-        {
-            let response = self.into_response_limited(max_bytes).await?;
-            response.json()
         }
 
         fn response_body_timeout_error(&self) -> Error {
@@ -691,18 +323,6 @@ mod stream {
             }
         }
 
-        fn complete_success(&mut self) {
-            if let Some(lifecycle) = &mut self.lifecycle {
-                lifecycle.complete_success();
-            }
-        }
-
-        fn complete_error(&mut self, error: &Error) {
-            if let Some(lifecycle) = &mut self.lifecycle {
-                lifecycle.complete_error(error);
-            }
-        }
-
         fn effective_frame_timeout(&self) -> crate::Result<Duration> {
             let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
             let Some(deadline_at) = self.deadline_at else {
@@ -716,25 +336,75 @@ mod stream {
             Ok(phase_timeout.min(remaining))
         }
 
-        async fn next_frame_with_timeout(&mut self) -> crate::Result<Option<Frame<Bytes>>> {
-            let timeout_duration = self.effective_frame_timeout()?;
-            let next = timeout(timeout_duration, self.body.frame())
-                .await
-                .map_err(|_| {
-                    if self
-                        .deadline_at
-                        .is_some_and(|deadline_at| Instant::now() >= deadline_at)
-                    {
-                        self.deadline_exceeded_error()
-                    } else {
-                        self.response_body_timeout_error()
+        fn ensure_frame_timeout(&mut self) -> crate::Result<()> {
+            if self.frame_timeout.is_none() {
+                let timeout = self.effective_frame_timeout()?;
+                self.frame_timeout = Some(Box::pin(tokio::time::sleep(timeout)));
+            }
+            Ok(())
+        }
+
+        fn poll_next_chunk(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, Error>>> {
+            loop {
+                match Pin::new(&mut self.inner).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        self.frame_timeout = None;
+                        match frame.into_data() {
+                            Ok(data) if data.is_empty() => continue,
+                            Ok(data) => return Poll::Ready(Some(Ok(data))),
+                            Err(_) => continue,
+                        }
                     }
-                })?;
-            match next {
-                Some(frame) => frame.map(Some).map_err(|source| Error::ReadBody {
-                    source: Box::new(source),
-                }),
+                    Poll::Ready(Some(Err(source))) => {
+                        self.frame_timeout = None;
+                        return Poll::Ready(Some(Err(Error::ReadBody {
+                            source: Box::new(source),
+                        })));
+                    }
+                    Poll::Ready(None) => {
+                        self.frame_timeout = None;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {
+                        if let Err(error) = self.ensure_frame_timeout() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        if let Some(timer) = self.frame_timeout.as_mut()
+                            && timer.as_mut().poll(cx).is_ready()
+                        {
+                            self.frame_timeout = None;
+                            let error = if self
+                                .deadline_at
+                                .is_some_and(|deadline_at| Instant::now() >= deadline_at)
+                            {
+                                self.deadline_exceeded_error()
+                            } else {
+                                self.response_body_timeout_error()
+                            };
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
+
+        async fn next_chunk(&mut self) -> crate::Result<Option<Bytes>> {
+            match poll_fn(|cx| Pin::new(&mut *self).poll_next_chunk(cx)).await {
+                Some(Ok(chunk)) => Ok(Some(chunk)),
+                Some(Err(error)) => Err(error),
                 None => Ok(None),
+            }
+        }
+
+        fn take_pending_chunk(&mut self) -> Option<Bytes> {
+            if self.read_buffer.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut self.read_buffer))
             }
         }
 
@@ -742,21 +412,342 @@ mod stream {
             let max_bytes = max_bytes.max(1);
             let mut collected = Vec::new();
             let mut total_len = 0_usize;
-            while let Some(frame) = self.next_frame_with_timeout().await? {
-                if let Some(data) = frame.data_ref() {
-                    total_len = total_len.saturating_add(data.len());
-                    if total_len > max_bytes {
-                        return Err(Error::ResponseBodyTooLarge {
-                            limit_bytes: max_bytes,
-                            actual_bytes: total_len,
-                            method: self.method.clone(),
-                            uri: self.uri_redacted.clone(),
-                        });
-                    }
-                    collected.extend_from_slice(data);
+
+            if let Some(chunk) = self.take_pending_chunk() {
+                total_len = total_len.saturating_add(chunk.len());
+                if total_len > max_bytes {
+                    return Err(Error::ResponseBodyTooLarge {
+                        limit_bytes: max_bytes,
+                        actual_bytes: total_len,
+                        method: self.method.clone(),
+                        uri: self.uri_redacted.clone(),
+                    });
                 }
+                collected.extend_from_slice(&chunk);
+            }
+
+            while let Some(chunk) = self.next_chunk().await? {
+                total_len = total_len.saturating_add(chunk.len());
+                if total_len > max_bytes {
+                    return Err(Error::ResponseBodyTooLarge {
+                        limit_bytes: max_bytes,
+                        actual_bytes: total_len,
+                        method: self.method.clone(),
+                        uri: self.uri_redacted.clone(),
+                    });
+                }
+                collected.extend_from_slice(&chunk);
             }
             Ok(Bytes::from(collected))
+        }
+
+        async fn copy_to_writer<W>(&mut self, writer: &mut W) -> crate::Result<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            let mut copied = 0_u64;
+
+            if let Some(chunk) = self.take_pending_chunk() {
+                if let Err(source) = writer.write_all(&chunk).await {
+                    let error = Error::ReadBody {
+                        source: Box::new(source),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+                copied = copied.saturating_add(chunk.len() as u64);
+            }
+
+            while let Some(chunk) = match self.next_chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            } {
+                if let Err(source) = writer.write_all(&chunk).await {
+                    let error = Error::ReadBody {
+                        source: Box::new(source),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+                copied = copied.saturating_add(chunk.len() as u64);
+            }
+            if let Err(source) = writer.flush().await {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
+            Ok(copied)
+        }
+
+        async fn copy_to_writer_limited<W>(
+            &mut self,
+            writer: &mut W,
+            max_bytes: usize,
+        ) -> crate::Result<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            let max_bytes = max_bytes.max(1);
+            let mut copied = 0_u64;
+
+            if let Some(chunk) = self.take_pending_chunk() {
+                copied = copied.saturating_add(chunk.len() as u64);
+                if copied > max_bytes as u64 {
+                    let error = Error::ResponseBodyTooLarge {
+                        limit_bytes: max_bytes,
+                        actual_bytes: copied as usize,
+                        method: self.method.clone(),
+                        uri: self.uri_redacted.clone(),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+                if let Err(source) = writer.write_all(&chunk).await {
+                    let error = Error::ReadBody {
+                        source: Box::new(source),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            }
+
+            while let Some(chunk) = match self.next_chunk().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            } {
+                copied = copied.saturating_add(chunk.len() as u64);
+                if copied > max_bytes as u64 {
+                    let error = Error::ResponseBodyTooLarge {
+                        limit_bytes: max_bytes,
+                        actual_bytes: copied as usize,
+                        method: self.method.clone(),
+                        uri: self.uri_redacted.clone(),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+                if let Err(source) = writer.write_all(&chunk).await {
+                    let error = Error::ReadBody {
+                        source: Box::new(source),
+                    };
+                    self.complete_error(&error);
+                    return Err(error);
+                }
+            }
+            if let Err(source) = writer.flush().await {
+                let error = Error::ReadBody {
+                    source: Box::new(source),
+                };
+                self.complete_error(&error);
+                return Err(error);
+            }
+            self.complete_success();
+            Ok(copied)
+        }
+
+        fn complete_success(&mut self) {
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_success();
+            }
+        }
+
+        fn complete_error(&mut self, error: &Error) {
+            if let Some(lifecycle) = &mut self.lifecycle {
+                lifecycle.complete_error(error);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ResponseStream {
+        status: StatusCode,
+        headers: HeaderMap,
+        uri_raw: String,
+        body: StreamBody,
+    }
+
+    impl ResponseStream {
+        pub(crate) fn new(
+            status: StatusCode,
+            headers: HeaderMap,
+            body: Incoming,
+            context: ResponseStreamContext,
+        ) -> Self {
+            let uri_raw = context.uri_raw.clone();
+            Self {
+                status,
+                headers,
+                uri_raw,
+                body: StreamBody::new(body, context),
+            }
+        }
+
+        pub(crate) fn attach_completion(&mut self, completion: super::StreamCompletion) {
+            self.body.attach_completion(completion);
+        }
+
+        pub fn status(&self) -> StatusCode {
+            self.status
+        }
+
+        pub fn headers(&self) -> &HeaderMap {
+            &self.headers
+        }
+
+        pub fn method(&self) -> &http::Method {
+            self.body.method()
+        }
+
+        /// Returns the original request URI, including query string.
+        pub fn uri_raw(&self) -> &str {
+            &self.uri_raw
+        }
+
+        /// Returns a redacted URI suitable for logs and errors.
+        ///
+        /// The redacted form omits the query string to reduce accidental
+        /// leakage of sensitive parameters.
+        pub fn uri_redacted(&self) -> &str {
+            self.body.uri_redacted()
+        }
+
+        pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
+            let max_bytes = max_bytes.max(1);
+            let mut this = self;
+            match this.body.read_raw_bytes_limited(max_bytes).await {
+                Ok(body) => {
+                    this.body.complete_success();
+                    Ok(body)
+                }
+                Err(error) => {
+                    this.body.complete_error(&error);
+                    Err(error)
+                }
+            }
+        }
+
+        pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            self.body.copy_to_writer(writer).await
+        }
+
+        pub async fn copy_to_writer_limited<W>(
+            mut self,
+            writer: &mut W,
+            max_bytes: usize,
+        ) -> crate::Result<u64>
+        where
+            W: AsyncWrite + Unpin + Send + ?Sized,
+        {
+            self.body.copy_to_writer_limited(writer, max_bytes).await
+        }
+
+        pub async fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
+            let max_bytes = max_bytes.max(1);
+            let method = self.body.method().clone();
+            let uri_redacted = self.body.uri_redacted().to_owned();
+            let body = match self.body.read_raw_bytes_limited(max_bytes).await {
+                Ok(body) => body,
+                Err(error) => {
+                    self.body.complete_error(&error);
+                    return Err(error);
+                }
+            };
+            let should_decode =
+                should_decode_content_encoded_body(&method, self.status, body.len());
+            let body = if should_decode {
+                match decode_content_encoded_body_limited(body, &self.headers, max_bytes) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let error = map_decode_body_error(error, &method, &uri_redacted, max_bytes);
+                        self.body.complete_error(&error);
+                        return Err(error);
+                    }
+                }
+            } else {
+                body
+            };
+            if should_decode && self.headers.contains_key(super::CONTENT_ENCODING) {
+                self.headers.remove(super::CONTENT_ENCODING);
+                self.headers.remove(super::CONTENT_LENGTH);
+            }
+            self.body.complete_success();
+            Ok(Response::new(self.status, self.headers, body))
+        }
+
+        pub async fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
+            let response = self.into_response_limited(max_bytes).await?;
+            response.text().map(ToOwned::to_owned)
+        }
+
+        pub async fn into_text_lossy_limited(self, max_bytes: usize) -> crate::Result<String> {
+            let response = self.into_response_limited(max_bytes).await?;
+            Ok(response.text_lossy())
+        }
+
+        pub async fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let response = self.into_response_limited(max_bytes).await?;
+            response.json()
+        }
+    }
+
+    impl AsyncRead for StreamBody {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if buffer.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            loop {
+                if !self.read_buffer.is_empty() {
+                    let to_copy = self.read_buffer.len().min(buffer.remaining());
+                    let chunk = self.read_buffer.split_to(to_copy);
+                    buffer.put_slice(&chunk);
+                    return Poll::Ready(Ok(()));
+                }
+
+                match self.as_mut().poll_next_chunk(cx) {
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        self.read_buffer = chunk;
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        self.complete_error(&error);
+                        return Poll::Ready(Err(into_stream_read_io_error(error)));
+                    }
+                    Poll::Ready(None) => {
+                        self.complete_success();
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
+
+    impl AsyncRead for ResponseStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.body).poll_read(cx, buffer)
         }
     }
 }
@@ -1196,6 +1187,11 @@ mod blocking_stream {
 
         pub fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
             let response = self.into_response_limited(max_bytes)?;
+            response.text().map(ToOwned::to_owned)
+        }
+
+        pub fn into_text_lossy_limited(self, max_bytes: usize) -> crate::Result<String> {
+            let response = self.into_response_limited(max_bytes)?;
             Ok(response.text_lossy())
         }
 
@@ -1232,6 +1228,6 @@ pub use blocking_stream::BlockingResponseStream;
 #[cfg(feature = "_blocking")]
 pub(crate) use blocking_stream::BlockingResponseStreamContext;
 #[cfg(feature = "_async")]
-pub use stream::{ResponseStream, StreamBody};
+pub use stream::ResponseStream;
 #[cfg(feature = "_async")]
 pub(crate) use stream::{ResponseStreamContext, StreamPermits};

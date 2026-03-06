@@ -241,6 +241,7 @@ impl ClientMetrics {
             | Error::SerializeForm { .. }
             | Error::RequestBuild { .. }
             | Error::DeserializeJson { .. }
+            | Error::DecodeText { .. }
             | Error::InvalidHeaderName { .. }
             | Error::InvalidHeaderValue { .. }
             | Error::DecodeContentEncoding { .. }

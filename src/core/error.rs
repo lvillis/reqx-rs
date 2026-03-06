@@ -59,6 +59,7 @@ pub enum ErrorCode {
     ResponseBodyTooLarge,
     HttpStatus,
     DeserializeJson,
+    DecodeText,
     InvalidHeaderName,
     InvalidHeaderValue,
     DecodeContentEncoding,
@@ -75,7 +76,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
         Self::InvalidProxyConfig,
@@ -91,6 +92,7 @@ impl ErrorCode {
         Self::ResponseBodyTooLarge,
         Self::HttpStatus,
         Self::DeserializeJson,
+        Self::DecodeText,
         Self::InvalidHeaderName,
         Self::InvalidHeaderValue,
         Self::DecodeContentEncoding,
@@ -127,6 +129,7 @@ impl ErrorCode {
             Self::ResponseBodyTooLarge => "response_body_too_large",
             Self::HttpStatus => "http_status",
             Self::DeserializeJson => "deserialize_json",
+            Self::DecodeText => "decode_text",
             Self::InvalidHeaderName => "invalid_header_name",
             Self::InvalidHeaderValue => "invalid_header_value",
             Self::DecodeContentEncoding => "decode_content_encoding",
@@ -233,6 +236,12 @@ pub enum Error {
         source: serde_json::Error,
         body: String,
     },
+    #[error("failed to decode response text as utf-8: {source}")]
+    DecodeText {
+        #[source]
+        source: std::str::Utf8Error,
+        body: String,
+    },
     #[error("invalid header name {name}: {source}")]
     InvalidHeaderName {
         name: String,
@@ -328,6 +337,7 @@ impl Error {
             Self::ResponseBodyTooLarge { .. } => ErrorCode::ResponseBodyTooLarge,
             Self::HttpStatus { .. } => ErrorCode::HttpStatus,
             Self::DeserializeJson { .. } => ErrorCode::DeserializeJson,
+            Self::DecodeText { .. } => ErrorCode::DecodeText,
             Self::InvalidHeaderName { .. } => ErrorCode::InvalidHeaderName,
             Self::InvalidHeaderValue { .. } => ErrorCode::InvalidHeaderValue,
             Self::DecodeContentEncoding { .. } => ErrorCode::DecodeContentEncoding,

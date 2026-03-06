@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
+use reqx::TimeoutPhase;
+use reqx::advanced::{
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Interceptor, Observer, RateLimitPolicy,
+    RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
+};
 use reqx::blocking::Client;
 use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
-use reqx::{
-    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Interceptor, RateLimitPolicy, RequestContext,
-    RetryBudgetPolicy, ServerThrottleScope, StatusPolicy, TimeoutPhase,
-};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -130,10 +131,10 @@ struct ThrottleObserver {
     scopes: Arc<Mutex<Vec<ServerThrottleScope>>>,
 }
 
-impl reqx::Observer for ThrottleObserver {
+impl Observer for ThrottleObserver {
     fn on_server_throttle(
         &self,
-        _context: &reqx::RequestContext,
+        _context: &RequestContext,
         scope: ServerThrottleScope,
         _delay: Duration,
     ) {

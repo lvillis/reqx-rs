@@ -13,14 +13,15 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
-use http_body_util::BodyExt;
-use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
-use reqx::{
-    Interceptor, RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope,
-    StatusPolicy, TimeoutPhase,
+use reqx::TimeoutPhase;
+use reqx::advanced::{
+    AdaptiveConcurrencyPolicy, Interceptor, Observer, RateLimitPolicy, RequestContext,
+    RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
 };
+use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone)]
 struct MockResponse {
@@ -151,10 +152,10 @@ struct ThrottleObserver {
     scopes: Arc<Mutex<Vec<ServerThrottleScope>>>,
 }
 
-impl reqx::Observer for ThrottleObserver {
+impl Observer for ThrottleObserver {
     fn on_server_throttle(
         &self,
-        _context: &reqx::RequestContext,
+        _context: &RequestContext,
         scope: ServerThrottleScope,
         _delay: Duration,
     ) {
@@ -1106,10 +1107,6 @@ async fn send_stream_uri_exposes_raw_and_redacted_variants() {
         .expect("stream request should succeed");
 
     assert_eq!(stream.status().as_u16(), 200);
-    assert!(stream.uri().contains("/v1/list?"));
-    assert!(stream.uri().contains("list-type=2"));
-    assert!(stream.uri().contains("uploads="));
-
     assert!(stream.uri_raw().contains("/v1/list?"));
     assert!(stream.uri_raw().contains("list-type=2"));
     assert!(stream.uri_raw().contains("uploads="));
@@ -1804,14 +1801,19 @@ async fn send_stream_into_body_collect_reports_response_body_timeout() {
         .send_stream()
         .await
         .expect("stream request should return headers");
+    let mut stream = stream;
+    let mut body = Vec::new();
     let error = stream
-        .into_body()
-        .collect()
+        .read_to_end(&mut body)
         .await
-        .expect_err("collecting a delayed stream body should timeout");
+        .expect_err("reading a delayed stream body should timeout");
+    let error = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>())
+        .expect("stream read should wrap reqx::Error");
     match error {
         Error::Timeout { phase, uri, .. } => {
-            assert_eq!(phase, TimeoutPhase::ResponseBody);
+            assert_eq!(*phase, TimeoutPhase::ResponseBody);
             assert!(uri.contains("/slow-stream-collect"));
         }
         other => panic!("unexpected error variant: {other}"),
@@ -2051,7 +2053,7 @@ async fn retry_budget_is_credited_by_non_retryable_send_response() {
 async fn build_rejects_invalid_adaptive_concurrency_policy() {
     let result = Client::builder("https://api.example.com")
         .adaptive_concurrency_policy(
-            reqx::AdaptiveConcurrencyPolicy::standard()
+            AdaptiveConcurrencyPolicy::standard()
                 .min_limit(10)
                 .initial_limit(8)
                 .max_limit(5),

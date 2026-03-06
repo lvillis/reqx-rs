@@ -8,10 +8,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use http::Uri;
-use http_body_util::BodyExt;
+use reqx::TimeoutPhase;
+use reqx::advanced::{
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, RetryBudgetPolicy, RetryClassifier,
+    RetryDecision,
+};
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
-use reqx::{CircuitBreakerPolicy, RetryBudgetPolicy, RetryClassifier, RetryDecision};
-use tokio::io::sink;
+use tokio::io::{AsyncReadExt, sink};
 
 #[derive(Clone)]
 struct ResponseSpec {
@@ -1051,7 +1054,7 @@ async fn adaptive_concurrency_queue_wait_respects_total_timeout_deadline() {
     );
     let client = Client::builder(format!("http://{}", server.authority()))
         .adaptive_concurrency_policy(
-            reqx::AdaptiveConcurrencyPolicy::standard()
+            AdaptiveConcurrencyPolicy::standard()
                 .min_limit(1)
                 .initial_limit(1)
                 .max_limit(1),
@@ -1550,13 +1553,18 @@ async fn retry_budget_stream_body_failure_does_not_credit_success() {
         .send_stream()
         .await
         .expect("stream request should return headers");
+    let mut stream = stream;
+    let mut body = Vec::new();
     let error = stream
-        .into_body()
-        .collect()
+        .read_to_end(&mut body)
         .await
         .expect_err("stream body should time out");
+    let error = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>())
+        .expect("stream read should wrap reqx::Error");
     match error {
-        Error::Timeout { phase, .. } => assert_eq!(phase, reqx::TimeoutPhase::ResponseBody),
+        Error::Timeout { phase, .. } => assert_eq!(*phase, TimeoutPhase::ResponseBody),
         other => panic!("unexpected stream error: {other}"),
     }
 
@@ -1667,13 +1675,18 @@ async fn circuit_breaker_stream_body_failure_opens_circuit() {
         .send_stream()
         .await
         .expect("stream request should return headers");
+    let mut stream = stream;
+    let mut body = Vec::new();
     let error = stream
-        .into_body()
-        .collect()
+        .read_to_end(&mut body)
         .await
         .expect_err("stream body should time out");
+    let error = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Error>())
+        .expect("stream read should wrap reqx::Error");
     match error {
-        Error::Timeout { phase, .. } => assert_eq!(phase, reqx::TimeoutPhase::ResponseBody),
+        Error::Timeout { phase, .. } => assert_eq!(*phase, TimeoutPhase::ResponseBody),
         other => panic!("unexpected stream error: {other}"),
     }
 
@@ -1886,12 +1899,13 @@ async fn send_stream_downloads_body_without_buffered_send_path() {
         .expect("send_stream should succeed");
     assert_eq!(streamed.status().as_u16(), 200);
 
-    let collected = streamed
-        .into_body()
-        .collect()
+    let mut streamed = streamed;
+    let mut collected = Vec::new();
+    streamed
+        .read_to_end(&mut collected)
         .await
-        .expect("stream body collect should succeed");
-    assert_eq!(collected.to_bytes().to_vec(), payload);
+        .expect("stream body read should succeed");
+    assert_eq!(collected, payload);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

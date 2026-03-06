@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use reqx::advanced::{
-    AdvancedConfig, ClientProfile, Observer, RequestContext, RetryDecision, StatusPolicy,
-};
+use reqx::advanced::{ClientProfile, Observer, RequestContext, RetryDecision, StatusPolicy};
 use reqx::prelude::Client;
 
 #[derive(Default)]
@@ -36,14 +34,11 @@ impl Observer for ConsoleObserver {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let advanced = AdvancedConfig::default()
-        .with_request_timeout(Duration::from_secs(3))
-        .with_total_timeout(Duration::from_secs(8))
-        .with_default_status_policy(StatusPolicy::Response);
-
     let client = Client::builder("https://postman-echo.com")
         .profile(ClientProfile::StandardSdk)
-        .advanced(advanced)
+        .request_timeout(Duration::from_secs(3))
+        .total_timeout(Duration::from_secs(8))
+        .default_status_policy(StatusPolicy::Response)
         .observer(ConsoleObserver)
         .build()?;
 

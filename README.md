@@ -14,7 +14,7 @@ It focuses on SDK transport concerns: retries, timeout phases, idempotency, prox
 ## For SDK Authors
 
 - Start with a profile: `ClientProfile::StandardSdk`, `ClientProfile::LowLatency`, or `ClientProfile::HighThroughput`.
-- Fine-tune with `AdvancedConfig` only when required.
+- Override specific builder knobs only when required after `.profile(...)`.
 - Keep strict behavior with `StatusPolicy::Error` (default), or opt into response-first mode with
   `StatusPolicy::Response`.
 - For multi-endpoint SDKs, plug in an `EndpointSelector` (for example `RoundRobinEndpointSelector`).
@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Core Capabilities
 
 - global defaults + per-request overrides
-- profile presets (`ClientProfile`) + explicit overrides (`AdvancedConfig`)
+- profile presets (`ClientProfile`) + direct builder overrides
 - idempotency-aware retries
 - retry budget + circuit breaker + adaptive concurrency controls
 - global/per-host rate limiting with `429 Retry-After` backpressure
@@ -149,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
 - separate connect timeout (`connect_timeout(...)`)
-- streaming upload and streaming response path
+- streaming upload plus `ResponseStream: AsyncRead` / `blocking::ResponseStream: Read`
 - stream `copy_to_writer*` / `into_bytes_limited` keep raw bytes (wire semantics)
 - explicit buffered conversion (`send()`, `into_response_limited`, `into_json_limited`) decodes
   `gzip`, `br`, `deflate`, `zstd` for both async and blocking

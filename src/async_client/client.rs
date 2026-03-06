@@ -33,7 +33,7 @@ use crate::body::{
     ReadBodyError, ReqBody, RequestBody, buffered_req_body, build_http_request, empty_req_body,
     read_all_body_limited,
 };
-use crate::config::{AdvancedConfig, ClientProfile};
+use crate::config::ClientProfile;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::execution::{
@@ -1435,28 +1435,6 @@ impl ClientBuilder {
         self.max_response_body_bytes = defaults.max_response_body_bytes;
         self.redirect_policy = defaults.redirect_policy;
         self.default_status_policy = defaults.status_policy;
-        self
-    }
-
-    pub fn advanced(mut self, config: AdvancedConfig) -> Self {
-        if let Some(request_timeout) = config.request_timeout {
-            self.request_timeout = request_timeout.max(Duration::from_millis(1));
-        }
-        if let Some(total_timeout) = config.total_timeout {
-            self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
-        }
-        if let Some(max_response_body_bytes) = config.max_response_body_bytes {
-            self.max_response_body_bytes = max_response_body_bytes.max(1);
-        }
-        if let Some(connect_timeout) = config.connect_timeout {
-            self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
-        }
-        if let Some(redirect_policy) = config.redirect_policy {
-            self.redirect_policy = redirect_policy;
-        }
-        if let Some(default_status_policy) = config.default_status_policy {
-            self.default_status_policy = default_status_policy;
-        }
         self
     }
 

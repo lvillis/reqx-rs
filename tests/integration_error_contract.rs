@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
+use reqx::advanced::{Observer, RequestContext, RetryDecision, StatusPolicy};
 use reqx::prelude::{Error, ErrorCode};
 
 struct OneShotServer {
@@ -146,6 +147,23 @@ fn error_display_does_not_include_response_body_payloads() {
         Error::DeserializeJson { body, .. } => assert_eq!(body, secret),
         other => panic!("unexpected error variant: {other}"),
     }
+
+    let invalid = vec![0xff_u8];
+    let source =
+        std::str::from_utf8(&invalid).expect_err("invalid utf-8 should produce a decode error");
+    let decode_error = Error::DecodeText {
+        source,
+        body: secret.to_owned(),
+    };
+    let decode_text = decode_error.to_string();
+    assert!(
+        !decode_text.contains(secret),
+        "text decode display should not leak response body"
+    );
+    match decode_error {
+        Error::DecodeText { body, .. } => assert_eq!(body, secret),
+        other => panic!("unexpected error variant: {other}"),
+    }
 }
 
 #[test]
@@ -175,6 +193,19 @@ fn error_debug_does_not_include_response_body_payloads() {
         !decode_text.contains(secret),
         "json decode debug should not leak response body"
     );
+
+    let invalid = vec![0xff_u8];
+    let source =
+        std::str::from_utf8(&invalid).expect_err("invalid utf-8 should produce a decode error");
+    let decode_error = Error::DecodeText {
+        source,
+        body: secret.to_owned(),
+    };
+    let decode_text = format!("{decode_error:?}");
+    assert!(
+        !decode_text.contains(secret),
+        "text decode debug should not leak response body"
+    );
 }
 
 #[derive(Clone)]
@@ -183,15 +214,15 @@ struct CountingObserver {
     retries: Arc<AtomicUsize>,
 }
 
-impl reqx::Observer for CountingObserver {
-    fn on_request_start(&self, _context: &reqx::RequestContext) {
+impl Observer for CountingObserver {
+    fn on_request_start(&self, _context: &RequestContext) {
         self.started.fetch_add(1, Ordering::Relaxed);
     }
 
     fn on_retry_scheduled(
         &self,
-        _context: &reqx::RequestContext,
-        _decision: &reqx::RetryDecision,
+        _context: &RequestContext,
+        _decision: &RetryDecision,
         _delay: Duration,
     ) {
         self.retries.fetch_add(1, Ordering::Relaxed);
@@ -412,7 +443,6 @@ async fn async_send_response_returns_response_for_non_success() {
 #[cfg(feature = "_async")]
 #[tokio::test(flavor = "current_thread")]
 async fn async_client_default_status_policy_response_returns_non_success() {
-    use reqx::StatusPolicy;
     use reqx::prelude::{Client, RetryPolicy};
 
     let server = OneShotServer::start(
@@ -462,7 +492,6 @@ fn blocking_send_response_returns_response_for_non_success() {
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_client_default_status_policy_response_returns_non_success() {
-    use reqx::StatusPolicy;
     use reqx::blocking::Client;
     use reqx::prelude::RetryPolicy;
 
@@ -517,7 +546,7 @@ async fn async_send_response_stream_returns_stream_for_non_success() {
 #[cfg(feature = "_async")]
 #[tokio::test(flavor = "current_thread")]
 async fn async_endpoint_selector_can_override_base_url() {
-    use reqx::RoundRobinEndpointSelector;
+    use reqx::advanced::RoundRobinEndpointSelector;
     use reqx::prelude::Client;
 
     let server = OneShotServer::start(
@@ -604,7 +633,7 @@ fn blocking_send_response_stream_returns_stream_for_non_success() {
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_endpoint_selector_can_override_base_url() {
-    use reqx::RoundRobinEndpointSelector;
+    use reqx::advanced::RoundRobinEndpointSelector;
     use reqx::blocking::Client;
 
     let server = OneShotServer::start(

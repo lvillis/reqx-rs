@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream;
-use http_body_util::BodyExt;
 use reqx::prelude::{Client, RetryPolicy};
-use tokio::io::{AsyncWriteExt, sink};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, sink};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,14 +19,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<Bytes, std::io::Error>(Bytes::from_static(b"reqx")),
     ]);
 
-    let upload_response = client
+    let mut upload_response = client
         .post("/post")
         .idempotency_key("stream-upload-001")?
         .body_stream(upload_stream)
         .send_stream()
         .await?;
 
-    let upload_bytes = upload_response.into_body().collect().await?.to_bytes();
+    let mut upload_bytes = Vec::new();
+    upload_response.read_to_end(&mut upload_bytes).await?;
     println!("stream upload response bytes={}", upload_bytes.len());
 
     let (mut writer, reader) = tokio::io::duplex(64);
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upload_reader_response = client
         .post("/post")
         .idempotency_key("stream-upload-reader-001")?
-        .upload_from_reader(reader)
+        .body_reader(reader)
         .send_stream()
         .await?;
     println!(
@@ -46,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upload_reader_response.status().as_u16()
     );
 
-    let download_response = client.get("/stream/5").send_stream().await?;
-    let download_bytes = download_response.into_body().collect().await?.to_bytes();
+    let mut download_response = client.get("/stream/5").send_stream().await?;
+    let mut download_bytes = Vec::new();
+    download_response.read_to_end(&mut download_bytes).await?;
     println!("stream download bytes={}", download_bytes.len());
 
     let mut writer = sink();
