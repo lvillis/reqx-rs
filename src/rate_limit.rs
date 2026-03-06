@@ -461,8 +461,9 @@ fn cleanup_stale_per_host_rate_limits(
     entries: &mut BTreeMap<String, PerHostRateLimitEntry>,
     now: Instant,
 ) {
-    entries
-        .retain(|_, entry| now.duration_since(entry.last_used_at) <= PER_HOST_RATE_LIMIT_ENTRY_TTL);
+    entries.retain(|_, entry| {
+        now.saturating_duration_since(entry.last_used_at) <= PER_HOST_RATE_LIMIT_ENTRY_TTL
+    });
 
     while entries.len() > PER_HOST_RATE_LIMIT_MAX_ENTRIES {
         let oldest_key = entries
@@ -479,9 +480,11 @@ fn cleanup_stale_per_host_rate_limits(
 #[cfg(test)]
 mod tests {
     use super::{
-        RateLimitPolicy, RateLimiter, ServerThrottleScope, server_throttle_scope_from_headers,
+        PerHostRateLimitEntry, RateLimitPolicy, RateLimiter, ServerThrottleScope, TokenBucket,
+        cleanup_stale_per_host_rate_limits, server_throttle_scope_from_headers,
     };
     use crate::extensions::Clock;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant, SystemTime};
@@ -690,5 +693,22 @@ mod tests {
 
         let host_wait = limiter.acquire_delay(Some("api.example.com"));
         assert!(host_wait <= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn cleanup_tolerates_entries_newer_than_now() {
+        let now = Instant::now();
+        let future = now + Duration::from_secs(1);
+        let mut entries = BTreeMap::from([(
+            "future.example.com".to_owned(),
+            PerHostRateLimitEntry {
+                bucket: TokenBucket::new(RateLimitPolicy::standard(), future),
+                last_used_at: future,
+            },
+        )]);
+
+        cleanup_stale_per_host_rate_limits(&mut entries, now);
+
+        assert!(entries.contains_key("future.example.com"));
     }
 }

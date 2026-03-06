@@ -78,7 +78,12 @@ pub(crate) trait StreamOutcomeHooks {
 pub(crate) const DEFAULT_STREAM_DEADLINE_SLACK: Duration = Duration::from_millis(1);
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
-pub(crate) fn deadline_reached(
+pub(crate) fn deadline_elapsed(deadline_at: Instant, now: Instant) -> bool {
+    now >= deadline_at
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) fn deadline_within_slack(
     deadline_at: Instant,
     now: Instant,
     deadline_slack: Duration,

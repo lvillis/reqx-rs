@@ -2189,6 +2189,36 @@ fn blocking_send_stream_respects_total_timeout_deadline() {
 }
 
 #[test]
+fn blocking_send_stream_large_deadline_slack_does_not_shorten_total_timeout() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        b"ok".to_vec(),
+        Duration::from_millis(80),
+    );
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(250))
+        .stream_deadline_slack(Duration::from_secs(5))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body = client
+        .get("/v1/stream-large-deadline-slack")
+        .send_stream()
+        .expect("stream request should return headers")
+        .into_bytes_limited(64)
+        .expect("large classification slack must not shorten the actual deadline");
+
+    assert_eq!(body.as_ref(), b"ok");
+}
+
+#[test]
 fn blocking_read_chunk_returns_deadline_exceeded_when_read_crosses_total_timeout() {
     let server = ChunkedBodyServer::start(
         200,

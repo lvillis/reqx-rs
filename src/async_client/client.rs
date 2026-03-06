@@ -1097,6 +1097,11 @@ impl ClientBuilder {
         self
     }
 
+    /// Tunes near-deadline classification for streaming body reads.
+    ///
+    /// This only affects how ambiguous boundary cases are classified between
+    /// `Timeout(ResponseBody)` and `DeadlineExceeded`; it does not shorten the
+    /// actual time spent waiting on the runtime's transport timers.
     pub fn stream_deadline_slack(mut self, stream_deadline_slack: Duration) -> Self {
         self.stream_deadline_slack = stream_deadline_slack;
         self
@@ -1298,16 +1303,22 @@ impl ClientBuilder {
         self.body_codec_arc(Arc::new(body_codec))
     }
 
-    pub fn clock_arc(mut self, clock: Arc<dyn Clock>) -> Self {
+    /// Sets the time source used by Retry-After parsing and internal control loops.
+    ///
+    /// This does not replace the runtime timers used for transport I/O.
+    pub fn control_clock_arc(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
 
-    pub fn clock<C>(self, clock: C) -> Self
+    /// Sets the time source used by Retry-After parsing and internal control loops.
+    ///
+    /// This does not replace the runtime timers used for transport I/O.
+    pub fn control_clock<C>(self, clock: C) -> Self
     where
         C: Clock + 'static,
     {
-        self.clock_arc(Arc::new(clock))
+        self.control_clock_arc(Arc::new(clock))
     }
 
     pub fn backoff_source_arc(mut self, backoff_source: Arc<dyn BackoffSource>) -> Self {

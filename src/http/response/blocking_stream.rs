@@ -14,7 +14,7 @@ use crate::content_encoding::{
 use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
 
-use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
+use super::{Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_within_slack};
 
 fn map_read_error(
     source: std::io::Error,
@@ -174,7 +174,7 @@ impl BlockingResponseStream {
         let mapped = map_read_error(source, &self.method, &self.uri_redacted, self.timeout_ms);
         if matches!(mapped, Error::Timeout { .. })
             && self.deadline_at.is_some_and(|deadline_at| {
-                deadline_reached(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
+                deadline_within_slack(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
             })
         {
             return deadline_exceeded_error(
@@ -189,7 +189,7 @@ impl BlockingResponseStream {
 
     fn ensure_within_deadline(&self) -> crate::Result<()> {
         if let Some(deadline_at) = self.deadline_at
-            && deadline_reached(deadline_at, self.clock.now_monotonic(), self.deadline_slack)
+            && deadline_elapsed(deadline_at, self.clock.now_monotonic())
         {
             return Err(deadline_exceeded_error(
                 &self.method,

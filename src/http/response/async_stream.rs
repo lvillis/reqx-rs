@@ -18,7 +18,7 @@ use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
 
-use super::{Response, StreamCompletion, StreamLifecycle, deadline_reached};
+use super::{Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_within_slack};
 
 #[derive(Debug)]
 pub(crate) struct StreamPermits {
@@ -145,7 +145,7 @@ impl StreamBody {
             return Ok(phase_timeout);
         };
         let now = self.clock.now_monotonic();
-        if deadline_reached(deadline_at, now, self.deadline_slack) {
+        if deadline_elapsed(deadline_at, now) {
             return Err(self.deadline_exceeded_error());
         }
         let remaining = deadline_at.saturating_duration_since(now);
@@ -193,7 +193,7 @@ impl StreamBody {
                     {
                         self.frame_timeout = None;
                         let error = if self.deadline_at.is_some_and(|deadline_at| {
-                            deadline_reached(
+                            deadline_within_slack(
                                 deadline_at,
                                 self.clock.now_monotonic(),
                                 self.deadline_slack,

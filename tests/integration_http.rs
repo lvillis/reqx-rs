@@ -1847,6 +1847,37 @@ async fn send_stream_copy_to_writer_respects_total_timeout_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_large_deadline_slack_does_not_shorten_total_timeout() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        b"ok".to_vec(),
+        Duration::from_millis(80),
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(400))
+        .total_timeout(Duration::from_millis(250))
+        .stream_deadline_slack(Duration::from_secs(5))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body = client
+        .get("/stream-large-deadline-slack")
+        .send_stream()
+        .await
+        .expect("stream request should return headers")
+        .into_bytes_limited(64)
+        .await
+        .expect("large classification slack must not shorten the actual deadline");
+
+    assert_eq!(body, Bytes::from_static(b"ok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_stream_into_body_collect_reports_response_body_timeout() {
     let server = SplitBodyServer::start(
         200,

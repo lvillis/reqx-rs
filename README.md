@@ -19,6 +19,7 @@ It focuses on SDK transport concerns: retries, timeout phases, idempotency, prox
   `StatusPolicy::Response`.
 - For multi-endpoint SDKs, plug in an `EndpointSelector` (for example `RoundRobinEndpointSelector`).
 - Hook transport events through `Observer` for retries and server-throttle telemetry.
+- Use `control_clock(...)` only when you need deterministic Retry-After or control-loop behavior in tests.
 - Reach for `reqx::advanced::{...}` when you need non-default transport controls.
 
 ## Install
@@ -148,6 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - request-level and client-level status handling (`StatusPolicy`)
 - bounded redirect following (`RedirectPolicy`)
 - transport timeout + response-body timeout + total deadline
+- `stream_deadline_slack(...)` tunes only near-deadline streaming error classification; it does not shorten actual I/O waits
 - separate connect timeout (`connect_timeout(...)`)
 - streaming upload plus `ResponseStream: AsyncRead` / `blocking::ResponseStream: Read`
 - stream `copy_to_writer*` / `into_bytes_limited` keep raw bytes (wire semantics)
