@@ -85,7 +85,8 @@ fn status_text(status: u16) -> &'static str {
 }
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
-    raw.windows(4).position(|window| window == b"\r\n\r\n")
+    raw.array_windows::<4>()
+        .position(|window| window == b"\r\n\r\n")
 }
 
 fn read_request_headers(stream: &mut std::net::TcpStream) -> std::io::Result<()> {

@@ -48,7 +48,8 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
-    raw.windows(4).position(|window| window == b"\r\n\r\n")
+    raw.array_windows::<4>()
+        .position(|window| window == b"\r\n\r\n")
 }
 
 fn parse_content_length(raw_headers: &[u8]) -> usize {

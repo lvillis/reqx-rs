@@ -446,7 +446,8 @@ impl Drop for CountingServer {
 }
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
-    raw.windows(4).position(|window| window == b"\r\n\r\n")
+    raw.array_windows::<4>()
+        .position(|window| window == b"\r\n\r\n")
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {

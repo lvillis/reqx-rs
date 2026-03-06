@@ -505,7 +505,8 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
 }
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
-    raw.windows(4).position(|window| window == b"\r\n\r\n")
+    raw.array_windows::<4>()
+        .position(|window| window == b"\r\n\r\n")
 }
 
 fn status_text(status: u16) -> &'static str {
