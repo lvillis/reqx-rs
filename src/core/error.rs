@@ -56,6 +56,7 @@ pub enum ErrorCode {
     Timeout,
     DeadlineExceeded,
     ReadBody,
+    WriteBody,
     ResponseBodyTooLarge,
     HttpStatus,
     DeserializeJson,
@@ -76,7 +77,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
         Self::InvalidProxyConfig,
@@ -89,6 +90,7 @@ impl ErrorCode {
         Self::Timeout,
         Self::DeadlineExceeded,
         Self::ReadBody,
+        Self::WriteBody,
         Self::ResponseBodyTooLarge,
         Self::HttpStatus,
         Self::DeserializeJson,
@@ -126,6 +128,7 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::ReadBody => "read_body",
+            Self::WriteBody => "write_body",
             Self::ResponseBodyTooLarge => "response_body_too_large",
             Self::HttpStatus => "http_status",
             Self::DeserializeJson => "deserialize_json",
@@ -210,6 +213,13 @@ pub enum Error {
     },
     #[error("failed to read response body: {source}")]
     ReadBody {
+        #[source]
+        source: BoxError,
+    },
+    #[error("failed to write response body for {method} {uri}: {source}")]
+    WriteBody {
+        method: Method,
+        uri: String,
         #[source]
         source: BoxError,
     },
@@ -334,6 +344,7 @@ impl Error {
             Self::Timeout { .. } => ErrorCode::Timeout,
             Self::DeadlineExceeded { .. } => ErrorCode::DeadlineExceeded,
             Self::ReadBody { .. } => ErrorCode::ReadBody,
+            Self::WriteBody { .. } => ErrorCode::WriteBody,
             Self::ResponseBodyTooLarge { .. } => ErrorCode::ResponseBodyTooLarge,
             Self::HttpStatus { .. } => ErrorCode::HttpStatus,
             Self::DeserializeJson { .. } => ErrorCode::DeserializeJson,
@@ -387,6 +398,7 @@ impl Error {
             Self::Transport { method, .. }
             | Self::Timeout { method, .. }
             | Self::DeadlineExceeded { method, .. }
+            | Self::WriteBody { method, .. }
             | Self::ResponseBodyTooLarge { method, .. }
             | Self::HttpStatus { method, .. }
             | Self::DecodeContentEncoding { method, .. }
@@ -407,6 +419,7 @@ impl Error {
             | Self::Transport { uri, .. }
             | Self::Timeout { uri, .. }
             | Self::DeadlineExceeded { uri, .. }
+            | Self::WriteBody { uri, .. }
             | Self::ResponseBodyTooLarge { uri, .. }
             | Self::HttpStatus { uri, .. }
             | Self::DecodeContentEncoding { uri, .. }

@@ -9,9 +9,7 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 
-pub(crate) use crate::content_encoding::{
-    DecodeContentEncodingError, decode_content_encoded_body_limited,
-};
+pub(crate) use crate::content_encoding::decode_content_encoded_body_limited;
 use crate::error::Error;
 
 type BoxBodyError = Box<dyn StdError + Send + Sync>;

@@ -3,8 +3,10 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,7 @@ use reqx::advanced::{
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 #[derive(Clone)]
 struct MockResponse {
@@ -160,6 +162,29 @@ impl Observer for ThrottleObserver {
         _delay: Duration,
     ) {
         self.scopes.lock().expect("lock scopes").push(scope);
+    }
+}
+
+struct FailingAsyncWriter;
+
+impl AsyncWrite for FailingAsyncWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = self;
+        Poll::Ready(Err(std::io::Error::other("writer failed")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let _ = self;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let _ = self;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1741,6 +1766,48 @@ async fn send_stream_copy_to_writer_reports_response_body_timeout() {
     assert_eq!(metrics.requests_succeeded, 0);
     assert_eq!(metrics.requests_failed, 2);
     assert_eq!(metrics.timeout_response_body, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_copy_to_writer_reports_write_body_error() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )],
+        b"writer-fail".to_vec(),
+        Duration::ZERO,
+    );
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(100))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-copy-write-fail")
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let mut writer = FailingAsyncWriter;
+    let error = stream
+        .copy_to_writer(&mut writer)
+        .await
+        .expect_err("writer failure should surface as write_body");
+    match error {
+        Error::WriteBody { method, uri, .. } => {
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/stream-copy-write-fail"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.write_body_errors, 1);
+    assert_eq!(metrics.error_counts.get("write_body"), Some(&1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

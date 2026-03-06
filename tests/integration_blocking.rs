@@ -142,6 +142,18 @@ impl Observer for ThrottleObserver {
     }
 }
 
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("writer failed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct BlockingProxyServer {
     uri: String,
     served: Arc<AtomicUsize>,
@@ -2507,6 +2519,41 @@ fn blocking_download_to_writer_limited_maps_limit_error() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn blocking_download_to_writer_reports_write_body_error() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"writer-stream-fail".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut output = FailingWriter;
+    let error = client
+        .get("/v1/download-write-fail")
+        .download_to_writer(&mut output)
+        .expect_err("download_to_writer should surface write_body");
+
+    match error {
+        Error::WriteBody { method, uri, .. } => {
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/download-write-fail"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests_failed, 1);
+    assert_eq!(metrics.write_body_errors, 1);
+    assert_eq!(metrics.error_counts.get("write_body"), Some(&1));
 }
 
 #[test]

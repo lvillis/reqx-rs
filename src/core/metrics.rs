@@ -23,6 +23,7 @@ pub struct MetricsSnapshot {
     pub deadline_exceeded: u64,
     pub transport_errors: u64,
     pub read_body_errors: u64,
+    pub write_body_errors: u64,
     pub response_body_too_large: u64,
     pub http_status_errors: u64,
     pub in_flight: u64,
@@ -51,6 +52,7 @@ struct ClientMetricsInner {
     deadline_exceeded: AtomicU64,
     transport_errors: AtomicU64,
     read_body_errors: AtomicU64,
+    write_body_errors: AtomicU64,
     response_body_too_large: AtomicU64,
     http_status_errors: AtomicU64,
     in_flight: AtomicU64,
@@ -217,6 +219,11 @@ impl ClientMetrics {
                     inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            Error::WriteBody { .. } => {
+                if let Some(inner) = &self.inner {
+                    inner.write_body_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Error::ResponseBodyTooLarge { .. } => {
                 if let Some(inner) = &self.inner {
                     inner
@@ -289,6 +296,7 @@ impl ClientMetrics {
                 deadline_exceeded: 0,
                 transport_errors: 0,
                 read_body_errors: 0,
+                write_body_errors: 0,
                 response_body_too_large: 0,
                 http_status_errors: 0,
                 in_flight: 0,
@@ -310,6 +318,7 @@ impl ClientMetrics {
         let deadline_exceeded = inner.deadline_exceeded.load(Ordering::Relaxed);
         let transport_errors = inner.transport_errors.load(Ordering::Relaxed);
         let read_body_errors = inner.read_body_errors.load(Ordering::Relaxed);
+        let write_body_errors = inner.write_body_errors.load(Ordering::Relaxed);
         let response_body_too_large = inner.response_body_too_large.load(Ordering::Relaxed);
         let http_status_errors = inner.http_status_errors.load(Ordering::Relaxed);
         let in_flight = inner.in_flight.load(Ordering::Relaxed);
@@ -334,6 +343,7 @@ impl ClientMetrics {
             deadline_exceeded,
             transport_errors,
             read_body_errors,
+            write_body_errors,
             response_body_too_large,
             http_status_errors,
             in_flight,

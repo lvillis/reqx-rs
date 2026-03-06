@@ -8,9 +8,9 @@ use flate2::write::GzEncoder;
 use http::{HeaderMap, StatusCode};
 
 use crate::advanced::{AdaptiveConcurrencyPolicy, ClientProfile, StatusPolicy};
-use crate::body::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
+use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 use crate::execution::status_retry_delay;
 use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock};
@@ -621,7 +621,7 @@ fn error_safe_request_accessors_return_method_uri_and_path() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 29);
+    assert_eq!(codes.len(), 30);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -639,6 +639,7 @@ fn error_code_contract_table_is_stable() {
             "timeout",
             "deadline_exceeded",
             "read_body",
+            "write_body",
             "response_body_too_large",
             "http_status",
             "deserialize_json",
@@ -911,6 +912,26 @@ fn response_text_rejects_invalid_utf8() {
         Error::DecodeText { body, .. } => assert_eq!(body, "hello\u{fffd}"),
         other => panic!("unexpected error variant: {other}"),
     }
+}
+
+#[test]
+fn write_body_error_accessors_expose_request_context() {
+    let error = Error::WriteBody {
+        method: http::Method::GET,
+        uri: "https://api.example.com/v1/download".to_owned(),
+        source: Box::new(std::io::Error::other("writer failed")),
+    };
+
+    assert_eq!(error.code(), ErrorCode::WriteBody);
+    assert_eq!(
+        error.request_method().map(http::Method::as_str),
+        Some("GET")
+    );
+    assert_eq!(
+        error.request_uri_redacted(),
+        Some("https://api.example.com/v1/download")
+    );
+    assert_eq!(error.request_path().as_deref(), Some("/v1/download"));
 }
 
 #[test]
