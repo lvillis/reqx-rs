@@ -877,6 +877,21 @@ mod blocking_stream {
         Ok(())
     }
 
+    fn stream_read_io_error_kind(error: &Error) -> std::io::ErrorKind {
+        match error {
+            Error::Timeout { .. } | Error::DeadlineExceeded { .. } => std::io::ErrorKind::TimedOut,
+            Error::ReadBody { source } => source
+                .downcast_ref::<std::io::Error>()
+                .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+            _ => std::io::ErrorKind::Other,
+        }
+    }
+
+    fn into_stream_read_io_error(error: Error) -> std::io::Error {
+        let kind = stream_read_io_error_kind(&error);
+        std::io::Error::new(kind, error)
+    }
+
     #[derive(Debug)]
     pub struct BlockingResponseStream {
         status: StatusCode,
@@ -1207,7 +1222,7 @@ mod blocking_stream {
 
     impl Read for BlockingResponseStream {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.read_chunk(buffer).map_err(std::io::Error::other)
+            self.read_chunk(buffer).map_err(into_stream_read_io_error)
         }
     }
 }

@@ -1959,6 +1959,45 @@ fn blocking_read_trait_eof_marks_success_not_canceled() {
 }
 
 #[test]
+fn blocking_read_trait_timeout_maps_to_io_timed_out() {
+    let server = SplitBodyServer::start(
+        200,
+        vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+        b"delayed".to_vec(),
+        Duration::from_millis(180),
+    );
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(80))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/v1/read-trait-timeout")
+        .send_stream()
+        .expect("headers should be read before timeout");
+    let mut out = Vec::new();
+    let error = stream
+        .read_to_end(&mut out)
+        .expect_err("read_to_end should surface a timeout");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let inner = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+        .expect("io error should retain original reqx::Error");
+    match inner {
+        Error::Timeout { phase, method, uri, .. } => {
+            assert_eq!(*phase, TimeoutPhase::ResponseBody);
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/read-trait-timeout"));
+        }
+        other => panic!("unexpected inner error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_send_stream_limit_violation_uses_response_body_too_large_error() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
