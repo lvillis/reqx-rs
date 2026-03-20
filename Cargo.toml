@@ -105,7 +105,7 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 # TLS backends (feature-gated).
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
-rustls = { version = "0.23.36", default-features = false, features = ["std"], optional = true }
+rustls = { version = "0.23.36", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
@@ -135,8 +135,8 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["met
 # Benchmark framework.
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 rcgen = "0.14.7"
-tokio-rustls = "0.26.4"
-tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 
 [[bench]]
 name = "transport"
