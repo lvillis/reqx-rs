@@ -76,6 +76,10 @@ cargo add reqx --no-default-features -F blocking-tls-native
 - runtime selection via `tls_backend(TlsBackend::...)`
 - build-time mismatch returns structured error from `build()`
 - trust store selection via `tls_root_store(TlsRootStore::BackendDefault | WebPki | System | Specific)`
+- async TLS version controls via `tls_version(...)`, `tls_min_version(...)`, and `tls_max_version(...)`
+- use `tls_max_version(TlsVersion::V1_2)` for version-intolerant endpoints that reject TLS 1.3
+- async `native-tls` currently supports only explicit TLS 1.2 constraints
+- blocking `ureq` transports do not expose TLS version selection
 - `BackendDefault` follows each backend's default trust roots; set `System` explicitly for enterprise/private PKI environments
 - custom root CA: `tls_root_store(TlsRootStore::Specific)` + `tls_root_ca_pem(...)` / `tls_root_ca_der(...)`
 - mTLS identity:

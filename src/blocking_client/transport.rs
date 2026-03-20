@@ -7,7 +7,7 @@ use http::{HeaderMap, Uri};
 
 use crate::error::TransportErrorKind;
 use crate::proxy::ProxyConfig;
-use crate::tls::{TlsBackend, TlsOptions};
+use crate::tls::{TlsBackend, TlsOptions, tls_version_bounds};
 #[cfg(any(
     feature = "blocking-tls-rustls-ring",
     feature = "blocking-tls-rustls-aws-lc-rs",
@@ -122,6 +122,14 @@ fn build_sync_tls_config(
     backend: TlsBackend,
     tls_options: &TlsOptions,
 ) -> crate::Result<ureq::tls::TlsConfig> {
+    let version_bounds = tls_version_bounds(backend, tls_options)?;
+    if version_bounds.min.is_some() || version_bounds.max.is_some() {
+        return Err(tls_config_error(
+            backend,
+            "TLS version bounds are unsupported for blocking ureq transport; protocol version overrides are currently available only for async backends",
+        ));
+    }
+
     let provider = match backend {
         TlsBackend::RustlsRing | TlsBackend::RustlsAwsLcRs => ureq::tls::TlsProvider::Rustls,
         TlsBackend::NativeTls => ureq::tls::TlsProvider::NativeTls,

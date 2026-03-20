@@ -35,7 +35,7 @@ use crate::body::{
 };
 use crate::config::ClientProfile;
 use crate::content_encoding::should_decode_content_encoded_body;
-use crate::error::{Error, TimeoutPhase, TransportErrorKind};
+use crate::error::{Error, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, next_redirect_action, response_body_read_retry_decision,
@@ -84,7 +84,10 @@ use crate::retry::{
     feature = "async-tls-native"
 ))]
 use crate::tls::tls_config_error;
-use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
+use crate::tls::{
+    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, TlsVersion,
+    tls_version_bounds,
+};
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
     ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
@@ -290,6 +293,29 @@ fn build_rustls_root_store(
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs"
 ))]
+pub(crate) fn configured_rustls_protocol_versions(
+    tls_backend: TlsBackend,
+    tls_options: &TlsOptions,
+) -> crate::Result<Vec<&'static rustls::SupportedProtocolVersion>> {
+    let bounds = tls_version_bounds(tls_backend, tls_options)?;
+    let versions = [TlsVersion::V1_3, TlsVersion::V1_2]
+        .into_iter()
+        .filter(|version| bounds.contains(*version))
+        .collect::<Vec<_>>();
+
+    Ok(versions
+        .into_iter()
+        .map(|version| match version {
+            TlsVersion::V1_2 => &rustls::version::TLS12,
+            TlsVersion::V1_3 => &rustls::version::TLS13,
+        })
+        .collect())
+}
+
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn build_rustls_tls_config(
     tls_backend: TlsBackend,
     provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
@@ -298,9 +324,10 @@ fn build_rustls_tls_config(
     use rustls::pki_types::pem::PemObject;
 
     let root_store = build_rustls_root_store(tls_backend, tls_options)?;
+    let protocol_versions = configured_rustls_protocol_versions(tls_backend, tls_options)?;
 
     let config_builder = rustls::ClientConfig::builder_with_provider(provider.into())
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&protocol_versions)
         .map_err(|source| Error::TlsBackendInit {
             backend: tls_backend.as_str(),
             message: source.to_string(),
@@ -482,14 +509,14 @@ enum RetryResponse {
 }
 
 fn response_mode_mismatch_error(method: &Method, redacted_uri: &str, expected_mode: &str) -> Error {
-    Error::Transport {
-        kind: TransportErrorKind::Other,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        source: Box::new(std::io::Error::other(format!(
+    transport_error(
+        TransportErrorKind::Other,
+        method.clone(),
+        redacted_uri.to_owned(),
+        std::io::Error::other(format!(
             "internal response mode mismatch: expected {expected_mode} response variant"
-        ))),
-    }
+        )),
+    )
 }
 
 fn remove_content_encoding_headers(headers: &mut HeaderMap) {
@@ -680,6 +707,34 @@ fn build_rustls_aws_lc_rs_transport(
 }
 
 #[cfg(feature = "async-tls-native")]
+fn apply_native_tls_protocol_versions(
+    connector_builder: &mut hyper_tls::native_tls::TlsConnectorBuilder,
+    tls_options: &TlsOptions,
+) -> crate::Result<()> {
+    let bounds = tls_version_bounds(TlsBackend::NativeTls, tls_options)?;
+    if bounds.min.is_none() && bounds.max.is_none() {
+        return Ok(());
+    }
+
+    match (bounds.min, bounds.max) {
+        (Some(TlsVersion::V1_2), Some(TlsVersion::V1_2)) | (None, Some(TlsVersion::V1_2)) => {
+            connector_builder.min_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
+            connector_builder.max_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
+            Ok(())
+        }
+        (Some(TlsVersion::V1_2), None) => {
+            connector_builder.min_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
+            Ok(())
+        }
+        (Some(TlsVersion::V1_3), _) | (_, Some(TlsVersion::V1_3)) => Err(tls_config_error(
+            TlsBackend::NativeTls,
+            "async native-tls backend currently supports only explicit TLS 1.2 constraints via tls_version(TlsVersion::V1_2), tls_min_version(TlsVersion::V1_2), or tls_max_version(TlsVersion::V1_2)",
+        )),
+        (None, None) => Ok(()),
+    }
+}
+
+#[cfg(feature = "async-tls-native")]
 fn build_native_tls_connector(
     tls_options: &TlsOptions,
 ) -> crate::Result<hyper_tls::native_tls::TlsConnector> {
@@ -780,6 +835,8 @@ fn build_native_tls_connector(
         };
         connector_builder.identity(identity);
     }
+
+    apply_native_tls_protocol_versions(&mut connector_builder, tls_options)?;
 
     connector_builder
         .build()
@@ -1280,6 +1337,22 @@ impl ClientBuilder {
         self
     }
 
+    pub fn tls_version(mut self, version: TlsVersion) -> Self {
+        self.tls_options.min_protocol_version = Some(version);
+        self.tls_options.max_protocol_version = Some(version);
+        self
+    }
+
+    pub fn tls_min_version(mut self, version: TlsVersion) -> Self {
+        self.tls_options.min_protocol_version = Some(version);
+        self
+    }
+
+    pub fn tls_max_version(mut self, version: TlsVersion) -> Self {
+        self.tls_options.max_protocol_version = Some(version);
+        self
+    }
+
     pub fn endpoint_selector_arc(mut self, endpoint_selector: Arc<dyn EndpointSelector>) -> Self {
         self.endpoint_selector = endpoint_selector;
         self
@@ -1384,6 +1457,12 @@ impl ClientBuilder {
 
     pub fn clear_tls_client_identity(mut self) -> Self {
         self.tls_options.client_identity = None;
+        self
+    }
+
+    pub fn clear_tls_version_bounds(mut self) -> Self {
+        self.tls_options.min_protocol_version = None;
+        self.tls_options.max_protocol_version = None;
         self
     }
 
@@ -2610,12 +2689,12 @@ impl Client {
                 Ok(response) => response,
                 Err(TransportRequestError::Transport(source)) => {
                     let kind = classify_transport_error(&source);
-                    let error = Error::Transport {
+                    let error = transport_error(
                         kind,
-                        method: current_method.clone(),
-                        uri: current_redacted_uri.clone(),
-                        source: Box::new(source),
-                    };
+                        current_method.clone(),
+                        current_redacted_uri.clone(),
+                        source,
+                    );
                     let Some(retry_decision) = transport_retry_decision_from_error(
                         attempt,
                         max_attempts,

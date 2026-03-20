@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 
 use crate::content_encoding::should_decode_content_encoded_body;
-use crate::error::{Error, TimeoutPhase, TransportErrorKind};
+use crate::error::{Error, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::{
     RedirectInput, RedirectTransitionInput, StatusRetryPlanInput, apply_redirect_transition,
     effective_status_policy, next_redirect_action, response_body_read_retry_decision,
@@ -97,14 +97,14 @@ enum RetryResponse {
 }
 
 fn response_mode_mismatch_error(method: &Method, redacted_uri: &str, expected_mode: &str) -> Error {
-    Error::Transport {
-        kind: TransportErrorKind::Other,
-        method: method.clone(),
-        uri: redacted_uri.to_owned(),
-        source: Box::new(std::io::Error::other(format!(
+    transport_error(
+        TransportErrorKind::Other,
+        method.clone(),
+        redacted_uri.to_owned(),
+        std::io::Error::other(format!(
             "internal response mode mismatch: expected {expected_mode} response variant"
-        ))),
-    }
+        )),
+    )
 }
 
 struct StreamResponseInput {
@@ -826,12 +826,12 @@ impl Client {
                     method,
                     uri: redact_uri_for_logs(uri_text),
                 },
-                other => Error::Transport {
-                    kind: classify_ureq_transport_error(&other),
+                other => transport_error(
+                    classify_ureq_transport_error(&other),
                     method,
-                    uri: redact_uri_for_logs(uri_text),
-                    source: Box::new(other),
-                },
+                    redact_uri_for_logs(uri_text),
+                    other,
+                ),
             })
     }
 

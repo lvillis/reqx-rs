@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqx::prelude::{Client, TlsBackend, TlsRootStore};
+use reqx::prelude::{Client, TlsBackend, TlsRootStore, TlsVersion};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         builder = builder.tls_backend(TlsBackend::RustlsRing);
     }
+
+    // Cap negotiation at TLS 1.2 for version-intolerant endpoints.
+    builder = builder.tls_max_version(TlsVersion::V1_2);
 
     let client = builder.build()?;
     println!("selected tls backend = {:?}", client.tls_backend());

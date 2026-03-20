@@ -134,6 +134,8 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["met
 [dev-dependencies]
 # Benchmark framework.
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+rcgen = "0.14.7"
+tokio-rustls = "0.26.4"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
 
 [[bench]]

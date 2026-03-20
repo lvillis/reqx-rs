@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
@@ -11,13 +12,13 @@ use crate::advanced::{AdaptiveConcurrencyPolicy, ClientProfile, StatusPolicy};
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded_body_limited};
-use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
+use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::status_retry_delay;
 use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
-use crate::tls::{TlsBackend, TlsRootStore};
+use crate::tls::{TlsBackend, TlsOptions, TlsRootStore, TlsVersion, tls_version_bounds};
 #[cfg(feature = "_async")]
 use crate::util::classify_transport_error_text_for_test;
 use crate::util::{
@@ -363,6 +364,10 @@ fn classify_transport_error_text_detects_dns_tls_and_connect() {
         classify_transport_error_text_for_test("connection refused", true),
         TransportErrorKind::Connect
     );
+    assert_eq!(
+        classify_transport_error_text_for_test("received fatal alert: ProtocolVersion", true),
+        TransportErrorKind::Tls
+    );
 }
 
 #[test]
@@ -588,18 +593,156 @@ fn error_code_maps_expected_variant() {
 
 #[test]
 fn error_display_redacts_query_from_request_uri() {
-    let error = Error::Transport {
-        kind: TransportErrorKind::Connect,
-        method: http::Method::GET,
-        uri: crate::util::redact_uri_for_logs("https://api.example.com/v1/items?token=secret"),
-        source: Box::new(std::io::Error::other("connect failed")),
-    };
+    let error = transport_error(
+        TransportErrorKind::Connect,
+        http::Method::GET,
+        crate::util::redact_uri_for_logs("https://api.example.com/v1/items?token=secret"),
+        std::io::Error::other("connect failed"),
+    );
 
     let display = error.to_string();
     let debug = format!("{error:?}");
     assert!(!display.contains("token=secret"));
     assert!(!debug.contains("token=secret"));
     assert!(display.contains("/v1/items"));
+}
+
+#[derive(Debug)]
+struct TestNestedError {
+    message: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl TestNestedError {
+    fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            source: None,
+        }
+    }
+
+    fn with_source(
+        message: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl fmt::Display for TestNestedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for TestNestedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
+
+#[test]
+fn transport_error_display_includes_nested_source_chain() {
+    let source = TestNestedError::with_source(
+        "client error (Connect)",
+        TestNestedError::new("received fatal alert: ProtocolVersion"),
+    );
+    let error = transport_error(
+        TransportErrorKind::Other,
+        http::Method::POST,
+        "https://example.com/v1/login".to_owned(),
+        source,
+    );
+
+    let display = error.to_string();
+    assert!(display.contains("client error (Connect)"));
+    assert!(display.contains("received fatal alert: ProtocolVersion"));
+}
+
+#[test]
+fn tls_version_bounds_validate_range() {
+    let tls_options = TlsOptions {
+        min_protocol_version: Some(TlsVersion::V1_2),
+        max_protocol_version: Some(TlsVersion::V1_3),
+        ..TlsOptions::default()
+    };
+    assert_eq!(
+        tls_version_bounds(TlsBackend::RustlsRing, &tls_options)
+            .expect("version bounds should validate"),
+        crate::tls::TlsVersionBounds {
+            min: Some(TlsVersion::V1_2),
+            max: Some(TlsVersion::V1_3),
+        }
+    );
+
+    let invalid = TlsOptions {
+        min_protocol_version: Some(TlsVersion::V1_3),
+        max_protocol_version: Some(TlsVersion::V1_2),
+        ..TlsOptions::default()
+    };
+    match tls_version_bounds(TlsBackend::RustlsRing, &invalid) {
+        Ok(_) => panic!("invalid tls version bounds should fail"),
+        Err(Error::TlsConfig { message, .. }) => {
+            assert!(message.contains("min version"));
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "async-tls-rustls-ring")]
+#[test]
+fn selecting_tls_version_for_rustls_ring_builds() {
+    let client = Client::builder("https://example.com")
+        .tls_backend(TlsBackend::RustlsRing)
+        .tls_version(TlsVersion::V1_2)
+        .build()
+        .expect("rustls ring client should build with explicit tls version");
+
+    assert_eq!(client.tls_backend(), TlsBackend::RustlsRing);
+}
+
+#[cfg(feature = "async-tls-rustls-aws-lc-rs")]
+#[test]
+fn selecting_tls_version_for_rustls_aws_lc_builds() {
+    let client = Client::builder("https://example.com")
+        .tls_backend(TlsBackend::RustlsAwsLcRs)
+        .tls_max_version(TlsVersion::V1_2)
+        .build()
+        .expect("rustls aws-lc client should build with max tls version");
+
+    assert_eq!(client.tls_backend(), TlsBackend::RustlsAwsLcRs);
+}
+
+#[cfg(feature = "async-tls-native")]
+#[test]
+fn selecting_tls_version_for_native_tls12_builds() {
+    let client = Client::builder("https://example.com")
+        .tls_backend(TlsBackend::NativeTls)
+        .tls_version(TlsVersion::V1_2)
+        .build()
+        .expect("native tls client should build with explicit tls 1.2");
+
+    assert_eq!(client.tls_backend(), TlsBackend::NativeTls);
+}
+
+#[cfg(feature = "async-tls-native")]
+#[test]
+fn selecting_tls13_bounds_for_native_tls_returns_tls_config_error() {
+    let result = Client::builder("https://example.com")
+        .tls_backend(TlsBackend::NativeTls)
+        .tls_max_version(TlsVersion::V1_3)
+        .build();
+
+    match result {
+        Ok(_) => panic!("native tls should reject unsupported tls 1.3 bounds"),
+        Err(Error::TlsConfig { message, .. }) => {
+            assert!(message.contains("TLS 1.2 constraints"));
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]

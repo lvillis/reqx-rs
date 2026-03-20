@@ -4,6 +4,38 @@ use std::time::{Duration, SystemTime};
 use crate::util::parse_retry_after;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+pub(crate) fn summarize_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = Vec::new();
+    let mut current = Some(error);
+
+    while let Some(source) = current {
+        let message = source.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = source.source();
+    }
+
+    messages.join(": ")
+}
+
+pub(crate) fn transport_error(
+    kind: TransportErrorKind,
+    method: Method,
+    uri: String,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> Error {
+    let source: BoxError = Box::new(source);
+    let message = summarize_error_chain(source.as_ref());
+    Error::Transport {
+        kind,
+        method,
+        uri,
+        message,
+        source,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TransportErrorKind {
     Dns,
@@ -190,11 +222,12 @@ pub enum Error {
         #[source]
         source: http::Error,
     },
-    #[error("http transport error ({kind}) for {method} {uri}: {source}")]
+    #[error("http transport error ({kind}) for {method} {uri}: {message}")]
     Transport {
         kind: TransportErrorKind,
         method: Method,
         uri: String,
+        message: String,
         #[source]
         source: BoxError,
     },

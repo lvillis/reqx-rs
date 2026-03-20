@@ -163,6 +163,7 @@ pub use crate::request::RequestBuilder;
 pub use crate::response::Response;
 #[cfg(feature = "_async")]
 pub use crate::response::ResponseStream;
+pub use crate::tls::{TlsBackend, TlsRootStore, TlsVersion};
 
 #[cfg(feature = "_blocking")]
 pub mod blocking {
@@ -185,7 +186,7 @@ pub mod prelude {
     #[cfg(feature = "_async")]
     pub use crate::response::ResponseStream;
     pub use crate::retry::RetryPolicy;
-    pub use crate::tls::{TlsBackend, TlsRootStore};
+    pub use crate::tls::{TlsBackend, TlsRootStore, TlsVersion};
 }
 
 /// Advanced transport controls and extensibility points.
@@ -212,7 +213,7 @@ pub mod advanced {
             PermissiveRetryEligibility, RetryClassifier, RetryDecision, RetryEligibility,
             RetryReason, StrictRetryEligibility,
         },
-        tls::{TlsBackend, TlsRootStore},
+        tls::{TlsBackend, TlsRootStore, TlsVersion},
         upload::{
             BlockingResumableUploadBackend, BlockingResumableUploader, PartChecksumAlgorithm,
             RESUMABLE_UPLOAD_CHECKPOINT_VERSION, ResumableUploadCheckpoint, ResumableUploadError,
