@@ -1,3 +1,8 @@
+## [0.1.28] - 2026-03-20
+
+### 🚀 Features
+
+- Add async TLS version bounds and improve TLS error reporting
 ## [0.1.27] - 2026-03-06
 
 ### 🐛 Bug Fixes
@@ -13,6 +18,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(docs)* Add advanced time controls example
+- Release reqx version 0.1.27
 ## [0.1.26] - 2026-03-06
 
 ### 🚜 Refactor
