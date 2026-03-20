@@ -1,8 +1,17 @@
+## [0.1.29] - 2026-03-20
+
+### 🐛 Bug Fixes
+
+- Enable rustls tls12 in published builds
 ## [0.1.28] - 2026-03-20
 
 ### 🚀 Features
 
 - Add async TLS version bounds and improve TLS error reporting
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.28
 ## [0.1.27] - 2026-03-06
 
 ### 🐛 Bug Fixes
