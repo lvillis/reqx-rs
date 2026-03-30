@@ -105,20 +105,20 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 # TLS backends (feature-gated).
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
-rustls = { version = "0.23.36", default-features = false, features = ["std", "tls12"], optional = true }
+rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # Blocking transport backend (feature-gated).
-ureq = { version = "3.2.0", default-features = false, optional = true }
+ureq = { version = "3.3.0", default-features = false, optional = true }
 
 # Serialization helpers.
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
 serde_urlencoded = { version = "0.7.1", default-features = false }
 md5 = { version = "0.8.0", default-features = false }
-sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.0", default-features = false }
 
 # Content-encoding codecs.
 brotli = { version = "8.0.2", default-features = false, features = ["std"] }
