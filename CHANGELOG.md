@@ -3,6 +3,10 @@
 ### 🐛 Bug Fixes
 
 - Enable rustls tls12 in published builds
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.29
 ## [0.1.28] - 2026-03-20
 
 ### 🚀 Features
