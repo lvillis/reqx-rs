@@ -1,3 +1,18 @@
+## [0.1.31] - 2026-03-31
+
+### 🚜 Refactor
+
+- [**breaking**] Make public enums non-exhaustive and harden transport errors
+
+### ⚙️ Miscellaneous Tasks
+
+- *(docs)* Document public APIs and enforce missing-docs
+- Polish rustdoc navigation and feature docs
+## [0.1.30] - 2026-03-30
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.30
 ## [0.1.29] - 2026-03-20
 
 ### 🐛 Bug Fixes
