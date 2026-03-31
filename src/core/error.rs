@@ -37,6 +37,7 @@ pub(crate) fn transport_error(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TransportErrorKind {
     Dns,
     Connect,
@@ -59,6 +60,7 @@ impl std::fmt::Display for TransportErrorKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TimeoutPhase {
     Transport,
     ResponseBody,
@@ -75,6 +77,7 @@ impl std::fmt::Display for TimeoutPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum ErrorCode {
     InvalidUri,
     InvalidNoProxyRule,

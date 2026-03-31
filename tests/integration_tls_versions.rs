@@ -58,6 +58,7 @@ fn rustls_protocol_versions(
         .map(|version| match version {
             TlsVersion::V1_2 => &rustls::version::TLS12,
             TlsVersion::V1_3 => &rustls::version::TLS13,
+            _ => panic!("unexpected TLS version in integration test"),
         })
         .collect()
 }

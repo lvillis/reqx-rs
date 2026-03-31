@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "_async")]
+use std::error::Error as StdError;
 use std::fmt;
+#[cfg(feature = "_async")]
+use std::io;
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
@@ -19,12 +23,14 @@ use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
 use crate::tls::{TlsBackend, TlsOptions, TlsRootStore, TlsVersion, tls_version_bounds};
-#[cfg(feature = "_async")]
-use crate::util::classify_transport_error_text_for_test;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
     resolve_redirect_uri, resolve_uri, same_origin,
+};
+#[cfg(feature = "_async")]
+use crate::util::{
+    classify_transport_error_source_for_test, classify_transport_error_text_for_test,
 };
 
 #[test]
@@ -379,6 +385,71 @@ fn classify_transport_error_text_avoids_over_broad_read_matches() {
     assert_eq!(
         classify_transport_error_text_for_test("connection reset by peer", false),
         TransportErrorKind::Read
+    );
+}
+
+#[cfg(feature = "_async")]
+#[derive(Debug)]
+struct WrappedSourceError {
+    source: Box<dyn StdError + Send + Sync>,
+}
+
+#[cfg(feature = "_async")]
+impl fmt::Display for WrappedSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("wrapped source error")
+    }
+}
+
+#[cfg(feature = "_async")]
+impl StdError for WrappedSourceError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(feature = "_async")]
+#[test]
+fn classify_transport_error_source_chain_prefers_structured_io_errors() {
+    let dns = io::Error::new(io::ErrorKind::NotFound, "resolver failed");
+    assert_eq!(
+        classify_transport_error_source_for_test(&dns, true),
+        Some(TransportErrorKind::Dns)
+    );
+
+    let connect = WrappedSourceError {
+        source: Box::new(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        )),
+    };
+    assert_eq!(
+        classify_transport_error_source_for_test(&connect, true),
+        Some(TransportErrorKind::Connect)
+    );
+
+    let read = io::Error::new(io::ErrorKind::ConnectionReset, "connection reset");
+    assert_eq!(
+        classify_transport_error_source_for_test(&read, false),
+        Some(TransportErrorKind::Read)
+    );
+}
+
+#[cfg(all(
+    feature = "_async",
+    any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs"
+    )
+))]
+#[test]
+fn classify_transport_error_source_chain_detects_rustls_errors() {
+    let tls_error = WrappedSourceError {
+        source: Box::new(rustls::Error::General("handshake failed".into())),
+    };
+    assert_eq!(
+        classify_transport_error_source_for_test(&tls_error, true),
+        Some(TransportErrorKind::Tls)
     );
 }
 

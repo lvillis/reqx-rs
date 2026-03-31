@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -377,6 +378,10 @@ fn build_query_string(existing: &[(String, String)], appended: &[(String, String
 pub(crate) fn classify_transport_error(
     error: &hyper_util::client::legacy::Error,
 ) -> TransportErrorKind {
+    if let Some(kind) = classify_transport_error_source_chain(error, error.is_connect()) {
+        return kind;
+    }
+
     let mut text = error.to_string().to_ascii_lowercase();
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {
@@ -385,6 +390,88 @@ pub(crate) fn classify_transport_error(
         source = cause.source();
     }
     classify_transport_error_text(&text, error.is_connect())
+}
+
+#[cfg(feature = "_async")]
+fn classify_transport_error_source_chain(
+    error: &(dyn std::error::Error + 'static),
+    is_connect_path: bool,
+) -> Option<TransportErrorKind> {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(kind) = classify_transport_error_source(source, is_connect_path) {
+            return Some(kind);
+        }
+        current = source.source();
+    }
+    None
+}
+
+#[cfg(feature = "_async")]
+fn classify_transport_error_source(
+    error: &(dyn std::error::Error + 'static),
+    is_connect_path: bool,
+) -> Option<TransportErrorKind> {
+    if let Some(error) = error.downcast_ref::<io::Error>() {
+        return classify_io_transport_error_kind(error.kind(), is_connect_path);
+    }
+
+    if let Some(error) = error.downcast_ref::<hyper::Error>() {
+        if error.is_timeout() {
+            return Some(if is_connect_path {
+                TransportErrorKind::Connect
+            } else {
+                TransportErrorKind::Read
+            });
+        }
+        if error.is_incomplete_message() || error.is_body_write_aborted() {
+            return Some(TransportErrorKind::Read);
+        }
+        if !is_connect_path && (error.is_closed() || error.is_shutdown()) {
+            return Some(TransportErrorKind::Read);
+        }
+    }
+
+    #[cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
+    if error.downcast_ref::<rustls::Error>().is_some() {
+        return Some(TransportErrorKind::Tls);
+    }
+
+    #[cfg(feature = "async-tls-native")]
+    if error
+        .downcast_ref::<hyper_tls::native_tls::Error>()
+        .is_some()
+    {
+        return Some(TransportErrorKind::Tls);
+    }
+
+    None
+}
+
+#[cfg(feature = "_async")]
+fn classify_io_transport_error_kind(
+    kind: io::ErrorKind,
+    is_connect_path: bool,
+) -> Option<TransportErrorKind> {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Some(if is_connect_path {
+            TransportErrorKind::Connect
+        } else {
+            TransportErrorKind::Read
+        }),
+        io::ErrorKind::NotFound => Some(TransportErrorKind::Dns),
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::AddrNotAvailable => Some(TransportErrorKind::Connect),
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => Some(TransportErrorKind::Read),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "_async")]
@@ -476,6 +563,14 @@ pub(crate) fn classify_transport_error_text_for_test(
     is_connect_path: bool,
 ) -> TransportErrorKind {
     classify_transport_error_text(text, is_connect_path)
+}
+
+#[cfg(all(test, feature = "_async"))]
+pub(crate) fn classify_transport_error_source_for_test(
+    error: &(dyn std::error::Error + 'static),
+    is_connect_path: bool,
+) -> Option<TransportErrorKind> {
+    classify_transport_error_source_chain(error, is_connect_path)
 }
 
 pub(crate) fn join_base_path(base_url: &str, path: &str) -> String {

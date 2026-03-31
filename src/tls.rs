@@ -1,6 +1,7 @@
 use crate::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsBackend {
     RustlsRing,
     RustlsAwsLcRs,
@@ -18,6 +19,7 @@ impl TlsBackend {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum TlsVersion {
     V1_2,
     V1_3,
@@ -33,6 +35,7 @@ impl TlsVersion {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TlsRootStore {
     #[default]
     BackendDefault,

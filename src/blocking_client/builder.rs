@@ -97,8 +97,9 @@ impl ClientBuilder {
     ///
     /// This only affects how ambiguous boundary cases are classified between
     /// `Timeout(ResponseBody)` and `DeadlineExceeded` when the total deadline is
-    /// already the tighter bound for the current read; it does not shorten the
-    /// actual time spent waiting on the transport's socket timers.
+    /// already the tighter bound for the current read. The default is a small
+    /// 10ms jitter buffer; changing it does not shorten the actual time spent
+    /// waiting on the transport's socket timers.
     pub fn stream_deadline_slack(mut self, stream_deadline_slack: Duration) -> Self {
         self.stream_deadline_slack = stream_deadline_slack;
         self

@@ -75,7 +75,7 @@ pub(crate) trait StreamOutcomeHooks {
 }
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
-pub(crate) const DEFAULT_STREAM_DEADLINE_SLACK: Duration = Duration::from_millis(1);
+pub(crate) const DEFAULT_STREAM_DEADLINE_SLACK: Duration = Duration::from_millis(10);
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
 pub(crate) fn deadline_elapsed(deadline_at: Instant, now: Instant) -> bool {
