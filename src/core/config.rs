@@ -4,10 +4,14 @@ use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Preset transport defaults tuned for common SDK traffic patterns.
 pub enum ClientProfile {
     #[default]
+    /// Balanced defaults for general SDK API traffic.
     StandardSdk,
+    /// Lower timeouts and lighter retries for latency-sensitive calls.
     LowLatency,
+    /// Larger buffers and wider budgets for bulk throughput.
     HighThroughput,
 }
 

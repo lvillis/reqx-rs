@@ -16,6 +16,7 @@ use crate::metrics::StreamCompletion;
 use crate::util::truncate_body;
 
 #[derive(Clone, Debug)]
+/// Fully buffered HTTP response body and metadata.
 pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
@@ -31,18 +32,22 @@ impl Response {
         }
     }
 
+    /// Returns the HTTP status code.
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
+    /// Returns the response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
+    /// Returns the raw response body bytes.
     pub fn body(&self) -> &Bytes {
         &self.body
     }
 
+    /// Interprets the buffered body as UTF-8 text.
     pub fn text(&self) -> crate::Result<&str> {
         std::str::from_utf8(&self.body).map_err(|source| Error::DecodeText {
             source,
@@ -50,10 +55,12 @@ impl Response {
         })
     }
 
+    /// Decodes the buffered body as lossy UTF-8 text.
     pub fn text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
+    /// Deserializes the buffered body from JSON.
     pub fn json<T>(&self) -> crate::Result<T>
     where
         T: DeserializeOwned,

@@ -8,7 +8,9 @@ use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded
 use crate::error::Error;
 use crate::retry::RetryPolicy;
 
+/// Chooses the base URL used for an outbound request.
 pub trait EndpointSelector: Send + Sync {
+    /// Returns the base URL that should be used for this request.
     fn select_base_url(
         &self,
         method: &Method,
@@ -18,6 +20,7 @@ pub trait EndpointSelector: Send + Sync {
 }
 
 #[derive(Debug, Default)]
+/// Endpoint selector that always uses the configured base URL.
 pub struct PrimaryEndpointSelector;
 
 impl EndpointSelector for PrimaryEndpointSelector {
@@ -32,12 +35,14 @@ impl EndpointSelector for PrimaryEndpointSelector {
 }
 
 #[derive(Debug)]
+/// Endpoint selector that cycles through a fixed list of base URLs.
 pub struct RoundRobinEndpointSelector {
     endpoints: Vec<String>,
     next: AtomicUsize,
 }
 
 impl RoundRobinEndpointSelector {
+    /// Creates a selector that rotates through `endpoints`.
     pub fn new<I, S>(endpoints: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -66,11 +71,14 @@ impl EndpointSelector for RoundRobinEndpointSelector {
     }
 }
 
+/// Provides the delay used before retrying a failed request.
 pub trait BackoffSource: Send + Sync {
+    /// Returns the retry backoff for `attempt`.
     fn backoff_for_retry(&self, retry_policy: &RetryPolicy, attempt: usize) -> Duration;
 }
 
 #[derive(Debug, Default)]
+/// Backoff source that delegates to [`RetryPolicy`] backoff settings.
 pub struct PolicyBackoffSource;
 
 impl BackoffSource for PolicyBackoffSource {
@@ -85,14 +93,17 @@ impl BackoffSource for PolicyBackoffSource {
 /// Custom clocks should therefore track wall time monotonically rather than simulating
 /// arbitrary jumps unless they are only used in tests for pure control-flow components.
 pub trait Clock: Send + Sync {
+    /// Returns the current wall-clock time.
     fn now_system(&self) -> SystemTime;
 
+    /// Returns a monotonic instant for elapsed-time calculations.
     fn now_monotonic(&self) -> Instant {
         Instant::now()
     }
 }
 
 #[derive(Debug, Default)]
+/// Clock implementation backed by the system clock.
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -101,11 +112,14 @@ impl Clock for SystemClock {
     }
 }
 
+/// Normalizes request paths before they are attached to OpenTelemetry spans.
 pub trait OtelPathNormalizer: Send + Sync {
+    /// Returns a normalized path suitable for low-cardinality telemetry.
     fn normalize_path(&self, path: &str) -> String;
 }
 
 #[derive(Debug, Default)]
+/// Default path normalizer used by `reqx` OpenTelemetry spans.
 pub struct StandardOtelPathNormalizer;
 
 impl OtelPathNormalizer for StandardOtelPathNormalizer {
@@ -217,7 +231,9 @@ fn looks_like_token(segment: &str) -> bool {
     })
 }
 
+/// Decodes response bodies before buffered helpers expose them to callers.
 pub trait BodyCodec: Send + Sync {
+    /// Decodes a response body while enforcing `max_response_body_bytes`.
     fn decode_response_body_limited(
         &self,
         body: Bytes,
@@ -229,6 +245,7 @@ pub trait BodyCodec: Send + Sync {
 }
 
 #[derive(Debug, Default)]
+/// Standard response body codec that honors `Content-Encoding`.
 pub struct StandardBodyCodec;
 
 impl BodyCodec for StandardBodyCodec {

@@ -57,6 +57,10 @@ fn deadline_exceeded_error(
     }
 }
 
+/// Streaming blocking response body with request metadata.
+///
+/// Use this when you want to consume large responses incrementally without
+/// buffering them into memory first.
 pub struct BlockingResponseStream {
     status: StatusCode,
     headers: HeaderMap,
@@ -130,14 +134,17 @@ impl BlockingResponseStream {
         super::attach_completion(&mut self.lifecycle, completion);
     }
 
+    /// Returns the HTTP status code.
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
+    /// Returns the response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
+    /// Returns the originating request method.
     pub fn method(&self) -> &http::Method {
         &self.method
     }
@@ -218,6 +225,9 @@ impl BlockingResponseStream {
         Ok(())
     }
 
+    /// Reads the next chunk of body bytes into `buffer`.
+    ///
+    /// Returns `0` at end of stream.
     pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
         if let Err(error) = self.ensure_within_deadline() {
             self.complete_error(&error);
@@ -271,6 +281,7 @@ impl BlockingResponseStream {
         Ok(())
     }
 
+    /// Copies the streamed body into `writer`.
     pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
     where
         W: Write + ?Sized,
@@ -290,6 +301,7 @@ impl BlockingResponseStream {
         Ok(copied)
     }
 
+    /// Copies the streamed body into `writer`, enforcing `max_bytes`.
     pub fn copy_to_writer_limited<W>(
         mut self,
         writer: &mut W,
@@ -319,6 +331,7 @@ impl BlockingResponseStream {
         Ok(copied)
     }
 
+    /// Buffers the stream into memory, enforcing `max_bytes`.
     pub fn into_bytes_limited(mut self, max_bytes: usize) -> crate::Result<Bytes> {
         let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];
@@ -342,6 +355,7 @@ impl BlockingResponseStream {
         Ok(Bytes::from(collected))
     }
 
+    /// Buffers and decodes the stream into a [`Response`], enforcing `max_bytes`.
     pub fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
         let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];
@@ -384,16 +398,19 @@ impl BlockingResponseStream {
         Ok(Response::new(status, headers, body))
     }
 
+    /// Buffers the stream as UTF-8 text, enforcing `max_bytes`.
     pub fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
         let response = self.into_response_limited(max_bytes)?;
         response.text().map(ToOwned::to_owned)
     }
 
+    /// Buffers the stream as lossy UTF-8 text, enforcing `max_bytes`.
     pub fn into_text_lossy_limited(self, max_bytes: usize) -> crate::Result<String> {
         let response = self.into_response_limited(max_bytes)?;
         Ok(response.text_lossy())
     }
 
+    /// Buffers and deserializes the stream from JSON, enforcing `max_bytes`.
     pub fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
     where
         T: DeserializeOwned,

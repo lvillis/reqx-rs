@@ -2,13 +2,18 @@ use crate::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+/// TLS backend used by the transport.
 pub enum TlsBackend {
+    /// `rustls` backed by the `ring` crypto provider.
     RustlsRing,
+    /// `rustls` backed by the `aws-lc-rs` crypto provider.
     RustlsAwsLcRs,
+    /// The platform-native TLS stack exposed by `native-tls`.
     NativeTls,
 }
 
 impl TlsBackend {
+    /// Returns a stable backend identifier for logs, metrics, and errors.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RustlsRing => "rustls-ring",
@@ -20,12 +25,16 @@ impl TlsBackend {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+/// Supported TLS protocol versions.
 pub enum TlsVersion {
+    /// TLS 1.2.
     V1_2,
+    /// TLS 1.3.
     V1_3,
 }
 
 impl TlsVersion {
+    /// Returns the wire-format display name for this TLS version.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V1_2 => "TLS1.2",
@@ -36,11 +45,16 @@ impl TlsVersion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
+/// Root certificate source used when verifying TLS peers.
 pub enum TlsRootStore {
     #[default]
+    /// Use the backend's default trust store behavior.
     BackendDefault,
+    /// Use the bundled Mozilla roots from `webpki-roots`.
     WebPki,
+    /// Use the operating system trust store.
     System,
+    /// Use only certificates explicitly supplied with `tls_root_ca_*`.
     Specific,
 }
 

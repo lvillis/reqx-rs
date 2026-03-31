@@ -83,11 +83,13 @@ impl ClientBuilder {
         }
     }
 
+    /// Sets the per-attempt request timeout.
     pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout.max(Duration::from_millis(1));
         self
     }
 
+    /// Sets the overall request deadline, including retries and redirects.
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
         self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
         self
@@ -105,47 +107,56 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the default buffered response body size limit in bytes.
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
         self.max_response_body_bytes = max_response_body_bytes.max(1);
         self
     }
 
+    /// Sets the connect timeout used before a socket is established.
     pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
         self
     }
 
+    /// Sets how long idle pooled connections may be kept alive.
     pub fn pool_idle_timeout(mut self, pool_idle_timeout: Duration) -> Self {
         self.pool_idle_timeout = pool_idle_timeout.max(Duration::from_millis(1));
         self
     }
 
+    /// Sets the maximum number of idle pooled connections kept per host.
     pub fn pool_max_idle_per_host(mut self, pool_max_idle_per_host: usize) -> Self {
         self.pool_max_idle_per_host = pool_max_idle_per_host.max(1);
         self
     }
 
+    /// Sets the maximum number of idle pooled connections kept in total.
     pub fn pool_max_idle_connections(mut self, pool_max_idle_connections: usize) -> Self {
         self.pool_max_idle_connections = pool_max_idle_connections.max(1);
         self
     }
 
+    /// Routes requests through the given HTTP proxy.
     pub fn http_proxy(mut self, proxy_uri: Uri) -> Self {
         self.http_proxy = Some(proxy_uri);
         self
     }
 
+    /// Sets the `Proxy-Authorization` header sent to the configured HTTP proxy.
     pub fn proxy_authorization(mut self, mut proxy_authorization: HeaderValue) -> Self {
         proxy_authorization.set_sensitive(true);
         self.proxy_authorization = Some(proxy_authorization);
         self
     }
 
+    /// Parses and sets the `Proxy-Authorization` header.
     pub fn try_proxy_authorization(self, proxy_authorization: &str) -> crate::Result<Self> {
         let proxy_authorization = parse_header_value("proxy-authorization", proxy_authorization)?;
         Ok(self.proxy_authorization(proxy_authorization))
     }
 
+    /// Replaces the current `no_proxy` rule set.
     pub fn no_proxy<I, S>(mut self, rules: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -163,6 +174,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Replaces the current `no_proxy` rule set and validates every rule.
     pub fn try_no_proxy<I, S>(mut self, rules: I) -> crate::Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -173,6 +185,7 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Appends one `no_proxy` rule, deferring validation errors to [`Self::build`].
     pub fn add_no_proxy(mut self, rule: impl AsRef<str>) -> Self {
         let raw = rule.as_ref();
         if let Some(rule) = NoProxyRule::parse(raw) {
@@ -183,59 +196,70 @@ impl ClientBuilder {
         self
     }
 
+    /// Appends and validates one `no_proxy` rule immediately.
     pub fn try_add_no_proxy(mut self, rule: impl AsRef<str>) -> crate::Result<Self> {
         self.no_proxy_rules
             .push(parse_no_proxy_rule(rule.as_ref())?);
         Ok(self)
     }
 
+    /// Adds a default header included with every request.
     pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.default_headers.insert(name, value);
         self
     }
 
+    /// Enables or disables automatic `Accept-Encoding` injection for all request modes.
     pub fn auto_accept_encoding(mut self, enabled: bool) -> Self {
         self.buffered_auto_accept_encoding = enabled;
         self.stream_auto_accept_encoding = enabled;
         self
     }
 
+    /// Enables or disables automatic `Accept-Encoding` for buffered responses.
     pub fn buffered_auto_accept_encoding(mut self, enabled: bool) -> Self {
         self.buffered_auto_accept_encoding = enabled;
         self
     }
 
+    /// Enables or disables automatic `Accept-Encoding` for streaming responses.
     pub fn stream_auto_accept_encoding(mut self, enabled: bool) -> Self {
         self.stream_auto_accept_encoding = enabled;
         self
     }
 
+    /// Parses and adds a default header included with every request.
     pub fn try_default_header(self, name: &str, value: &str) -> crate::Result<Self> {
         let name = parse_header_name(name)?;
         let value = parse_header_value(name.as_str(), value)?;
         Ok(self.default_header(name, value))
     }
 
+    /// Sets the default retry policy.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Sets the predicate that decides whether a failure may be retried.
     pub fn retry_eligibility(mut self, retry_eligibility: Arc<dyn RetryEligibility>) -> Self {
         self.retry_eligibility = retry_eligibility;
         self
     }
 
+    /// Enables retry budget enforcement.
     pub fn retry_budget_policy(mut self, retry_budget_policy: RetryBudgetPolicy) -> Self {
         self.retry_budget_policy = Some(retry_budget_policy);
         self
     }
 
+    /// Enables circuit breaker protection for upstream failures.
     pub fn circuit_breaker_policy(mut self, circuit_breaker_policy: CircuitBreakerPolicy) -> Self {
         self.circuit_breaker_policy = Some(circuit_breaker_policy);
         self
     }
 
+    /// Enables adaptive concurrency control.
     pub fn adaptive_concurrency_policy(
         mut self,
         adaptive_concurrency_policy: AdaptiveConcurrencyPolicy,
@@ -244,11 +268,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Applies a client-wide rate limit policy.
     pub fn global_rate_limit_policy(mut self, global_rate_limit_policy: RateLimitPolicy) -> Self {
         self.global_rate_limit_policy = Some(global_rate_limit_policy);
         self
     }
 
+    /// Applies a host-scoped rate limit policy.
     pub fn per_host_rate_limit_policy(
         mut self,
         per_host_rate_limit_policy: RateLimitPolicy,
@@ -257,31 +283,37 @@ impl ClientBuilder {
         self
     }
 
+    /// Chooses how server throttling hints are mapped onto configured rate limiters.
     pub fn server_throttle_scope(mut self, server_throttle_scope: ServerThrottleScope) -> Self {
         self.server_throttle_scope = server_throttle_scope;
         self
     }
 
+    /// Sets the default redirect handling policy.
     pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
         self.redirect_policy = redirect_policy;
         self
     }
 
+    /// Sets the default status handling policy for requests.
     pub fn default_status_policy(mut self, default_status_policy: StatusPolicy) -> Self {
         self.default_status_policy = default_status_policy;
         self
     }
 
+    /// Selects the TLS backend used by this client.
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
         self
     }
 
+    /// Sets the endpoint selector used for multi-endpoint clients.
     pub fn endpoint_selector_arc(mut self, endpoint_selector: Arc<dyn EndpointSelector>) -> Self {
         self.endpoint_selector = endpoint_selector;
         self
     }
 
+    /// Sets the endpoint selector used for multi-endpoint clients.
     pub fn endpoint_selector<S>(self, endpoint_selector: S) -> Self
     where
         S: EndpointSelector + 'static,
@@ -289,11 +321,13 @@ impl ClientBuilder {
         self.endpoint_selector_arc(Arc::new(endpoint_selector))
     }
 
+    /// Sets the body codec used by convenience request helpers.
     pub fn body_codec_arc(mut self, body_codec: Arc<dyn BodyCodec>) -> Self {
         self.body_codec = body_codec;
         self
     }
 
+    /// Sets the body codec used by convenience request helpers.
     pub fn body_codec<C>(self, body_codec: C) -> Self
     where
         C: BodyCodec + 'static,
@@ -319,11 +353,13 @@ impl ClientBuilder {
         self.control_clock_arc(Arc::new(clock))
     }
 
+    /// Sets the backoff source used for retry sleeps and server throttle waits.
     pub fn backoff_source_arc(mut self, backoff_source: Arc<dyn BackoffSource>) -> Self {
         self.backoff_source = backoff_source;
         self
     }
 
+    /// Sets the backoff source used for retry sleeps and server throttle waits.
     pub fn backoff_source<B>(self, backoff_source: B) -> Self
     where
         B: BackoffSource + 'static,
@@ -331,11 +367,13 @@ impl ClientBuilder {
         self.backoff_source_arc(Arc::new(backoff_source))
     }
 
+    /// Selects which root trust store the TLS backend should use.
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
         self.tls_options.root_store = tls_root_store;
         self
     }
 
+    /// Adds a PEM-encoded root CA certificate.
     pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -343,6 +381,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Adds a DER-encoded root CA certificate.
     pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -350,11 +389,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Removes all explicitly configured root CA certificates.
     pub fn clear_tls_root_cas(mut self) -> Self {
         self.tls_options.root_certificates.clear();
         self
     }
 
+    /// Sets a PEM-encoded client certificate chain and private key for mTLS.
     pub fn tls_client_identity_pem(
         mut self,
         cert_chain_pem: impl Into<Vec<u8>>,
@@ -367,6 +408,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets a PKCS#12 client identity for mTLS.
     pub fn tls_client_identity_pkcs12(
         mut self,
         identity_der: impl Into<Vec<u8>>,
@@ -379,11 +421,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Removes any configured client TLS identity.
     pub fn clear_tls_client_identity(mut self) -> Self {
         self.tls_options.client_identity = None;
         self
     }
 
+    /// Allows retries for methods that are not normally considered idempotent.
     pub fn allow_non_idempotent_retries(mut self, allow: bool) -> Self {
         self.retry_eligibility = if allow {
             Arc::new(PermissiveRetryEligibility)
@@ -393,31 +437,37 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the client name used in metrics and user-facing diagnostics.
     pub fn client_name(mut self, client_name: impl Into<String>) -> Self {
         self.client_name = client_name.into();
         self
     }
 
+    /// Caps the total number of in-flight requests.
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
         self.max_in_flight = Some(max_in_flight.max(1));
         self
     }
 
+    /// Caps the number of in-flight requests per host.
     pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
         self.max_in_flight_per_host = Some(max_in_flight_per_host.max(1));
         self
     }
 
+    /// Enables in-process metrics collection.
     pub fn metrics_enabled(mut self, enabled: bool) -> Self {
         self.metrics_enabled = enabled;
         self
     }
 
+    /// Enables OpenTelemetry observer emission.
     pub fn otel_enabled(mut self, enabled: bool) -> Self {
         self.otel_enabled = enabled;
         self
     }
 
+    /// Sets the path normalizer used for OpenTelemetry attributes.
     pub fn otel_path_normalizer_arc(
         mut self,
         otel_path_normalizer: Arc<dyn OtelPathNormalizer>,
@@ -426,6 +476,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the path normalizer used for OpenTelemetry attributes.
     pub fn otel_path_normalizer<N>(self, otel_path_normalizer: N) -> Self
     where
         N: OtelPathNormalizer + 'static,
@@ -433,11 +484,13 @@ impl ClientBuilder {
         self.otel_path_normalizer_arc(Arc::new(otel_path_normalizer))
     }
 
+    /// Registers a request/response interceptor.
     pub fn interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
     }
 
+    /// Registers a request/response interceptor.
     pub fn interceptor<I>(self, interceptor: I) -> Self
     where
         I: Interceptor + 'static,
@@ -445,11 +498,13 @@ impl ClientBuilder {
         self.interceptor_arc(Arc::new(interceptor))
     }
 
+    /// Registers an observer that receives lifecycle callbacks.
     pub fn observer_arc(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observers.push(observer);
         self
     }
 
+    /// Registers an observer that receives lifecycle callbacks.
     pub fn observer<O>(self, observer: O) -> Self
     where
         O: Observer + 'static,
@@ -457,6 +512,7 @@ impl ClientBuilder {
         self.observer_arc(Arc::new(observer))
     }
 
+    /// Applies a bundle of profile defaults.
     pub fn profile(mut self, profile: ClientProfile) -> Self {
         let defaults = profile.defaults();
         self.request_timeout = defaults.request_timeout;
@@ -468,6 +524,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Validates the builder and constructs the client.
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
         if let Some(proxy_uri) = self.http_proxy.as_ref() {

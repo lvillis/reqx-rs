@@ -6,6 +6,7 @@ use crate::extensions::Clock;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Limits how many retries can be spent relative to recent successful traffic.
 pub struct RetryBudgetPolicy {
     window: Duration,
     retry_ratio: f64,
@@ -13,6 +14,7 @@ pub struct RetryBudgetPolicy {
 }
 
 impl RetryBudgetPolicy {
+    /// Returns the default retry budget used for SDK traffic.
     pub const fn standard() -> Self {
         Self {
             window: Duration::from_secs(10),
@@ -21,6 +23,7 @@ impl RetryBudgetPolicy {
         }
     }
 
+    /// Returns a policy that effectively disables retry budget enforcement.
     pub const fn disabled() -> Self {
         Self {
             window: Duration::from_secs(1),
@@ -29,16 +32,19 @@ impl RetryBudgetPolicy {
         }
     }
 
+    /// Sets the rolling window used to account for successes and retries.
     pub fn window(mut self, window: Duration) -> Self {
         self.window = window.max(Duration::from_millis(1));
         self
     }
 
+    /// Sets the retry allowance as a fraction of recent successful requests.
     pub fn retry_ratio(mut self, retry_ratio: f64) -> Self {
         self.retry_ratio = retry_ratio.clamp(0.0, 1.0);
         self
     }
 
+    /// Sets the minimum number of retries allowed in each accounting window.
     pub const fn min_retries_per_window(mut self, min_retries_per_window: usize) -> Self {
         self.min_retries_per_window = min_retries_per_window;
         self
@@ -134,6 +140,7 @@ fn refresh_retry_budget_window(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Circuit breaker thresholds for fast-failing unhealthy upstreams.
 pub struct CircuitBreakerPolicy {
     failure_threshold: usize,
     open_timeout: Duration,
@@ -142,6 +149,7 @@ pub struct CircuitBreakerPolicy {
 }
 
 impl CircuitBreakerPolicy {
+    /// Returns the default circuit breaker settings.
     pub const fn standard() -> Self {
         Self {
             failure_threshold: 5,
@@ -151,21 +159,25 @@ impl CircuitBreakerPolicy {
         }
     }
 
+    /// Sets how many consecutive failures open the circuit.
     pub const fn failure_threshold(mut self, failure_threshold: usize) -> Self {
         self.failure_threshold = failure_threshold;
         self
     }
 
+    /// Sets how long the circuit stays open before probing again.
     pub const fn open_timeout(mut self, open_timeout: Duration) -> Self {
         self.open_timeout = open_timeout;
         self
     }
 
+    /// Sets the maximum concurrent probe requests allowed while half-open.
     pub const fn half_open_max_requests(mut self, half_open_max_requests: usize) -> Self {
         self.half_open_max_requests = half_open_max_requests;
         self
     }
 
+    /// Sets how many successful probes close the circuit again.
     pub const fn half_open_success_threshold(mut self, half_open_success_threshold: usize) -> Self {
         self.half_open_success_threshold = half_open_success_threshold;
         self
@@ -357,6 +369,7 @@ impl Drop for CircuitAttempt {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Adaptive concurrency limits based on observed request latency.
 pub struct AdaptiveConcurrencyPolicy {
     min_limit: usize,
     initial_limit: usize,
@@ -374,6 +387,7 @@ pub(crate) struct AdaptiveConcurrencyState {
 }
 
 impl AdaptiveConcurrencyPolicy {
+    /// Returns the default adaptive concurrency settings.
     pub const fn standard() -> Self {
         Self {
             min_limit: 1,
@@ -385,31 +399,37 @@ impl AdaptiveConcurrencyPolicy {
         }
     }
 
+    /// Sets the minimum in-flight request limit.
     pub const fn min_limit(mut self, min_limit: usize) -> Self {
         self.min_limit = min_limit;
         self
     }
 
+    /// Sets the starting in-flight request limit.
     pub const fn initial_limit(mut self, initial_limit: usize) -> Self {
         self.initial_limit = initial_limit;
         self
     }
 
+    /// Sets the maximum in-flight request limit.
     pub const fn max_limit(mut self, max_limit: usize) -> Self {
         self.max_limit = max_limit;
         self
     }
 
+    /// Sets how much to raise the limit after a healthy control interval.
     pub const fn increase_step(mut self, increase_step: usize) -> Self {
         self.increase_step = increase_step;
         self
     }
 
+    /// Sets the multiplicative backoff applied after high-latency samples.
     pub fn decrease_ratio(mut self, decrease_ratio: f64) -> Self {
         self.decrease_ratio = decrease_ratio.clamp(0.1, 0.99);
         self
     }
 
+    /// Sets the latency threshold that triggers a limit decrease.
     pub const fn high_latency_threshold(mut self, high_latency_threshold: Duration) -> Self {
         self.high_latency_threshold = high_latency_threshold;
         self

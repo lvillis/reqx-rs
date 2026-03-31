@@ -12,53 +12,86 @@ use crate::response::Response;
 use crate::util::lock_unpoisoned;
 
 #[derive(Clone, Debug, Default)]
+/// Snapshot of client-side transport metrics.
 pub struct MetricsSnapshot {
+    /// Request lifecycle counters.
     pub requests: RequestMetrics,
+    /// Response status counters.
     pub responses: ResponseMetrics,
+    /// Timeout counters.
     pub timeouts: TimeoutMetrics,
+    /// Error counters.
     pub errors: ErrorMetrics,
+    /// Aggregate latency counters.
     pub latency: LatencyMetrics,
 }
 
 #[derive(Clone, Debug, Default)]
+/// Request lifecycle counters.
 pub struct RequestMetrics {
+    /// Requests started.
     pub started: u64,
+    /// Requests completed successfully.
     pub succeeded: u64,
+    /// Requests completed with an error.
     pub failed: u64,
+    /// Requests canceled before completion.
     pub canceled: u64,
+    /// Retry attempts scheduled after an initial request.
     pub retries: u64,
+    /// Requests currently in flight.
     pub in_flight: u64,
 }
 
 #[derive(Clone, Debug, Default)]
+/// Response status counters.
 pub struct ResponseMetrics {
+    /// Counts keyed by HTTP status code.
     pub status_counts: BTreeMap<u16, u64>,
 }
 
 #[derive(Clone, Debug, Default)]
+/// Timeout counters grouped by phase.
 pub struct TimeoutMetrics {
+    /// Timeouts that happened before handing out the response body stream.
     pub transport: u64,
+    /// Timeouts that happened while reading a response body stream.
     pub response_body: u64,
+    /// Overall request deadlines that elapsed.
     pub deadline_exceeded: u64,
 }
 
 #[derive(Clone, Debug, Default)]
+/// Error counters grouped by category.
 pub struct ErrorMetrics {
+    /// Transport-layer errors before a response was received.
     pub transport: u64,
+    /// Errors while reading a buffered response body.
     pub read_body: u64,
+    /// Errors while writing a streamed response body to a sink.
     pub write_body: u64,
+    /// Responses rejected for exceeding the configured body limit.
     pub response_body_too_large: u64,
+    /// Responses rejected by the active status policy.
     pub http_status: u64,
+    /// Counts keyed by stable [`ErrorCode`].
     pub by_code: BTreeMap<ErrorCode, u64>,
+    /// Counts keyed by [`TimeoutPhase`].
     pub by_timeout_phase: BTreeMap<TimeoutPhase, u64>,
+    /// Counts keyed by [`TransportErrorKind`].
     pub by_transport_kind: BTreeMap<TransportErrorKind, u64>,
+    /// HTTP status error counts keyed by status code.
     pub by_http_status: BTreeMap<u16, u64>,
 }
 
 #[derive(Clone, Debug, Default)]
+/// Aggregate latency counters.
 pub struct LatencyMetrics {
+    /// Number of latency samples recorded.
     pub samples: u64,
+    /// Sum of all request latencies in milliseconds.
     pub total_ms: u64,
+    /// Average request latency in milliseconds.
     pub average_ms: f64,
 }
 

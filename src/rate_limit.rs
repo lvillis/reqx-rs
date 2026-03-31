@@ -11,11 +11,16 @@ const PER_HOST_RATE_LIMIT_MAX_ENTRIES: usize = 1024;
 const PER_HOST_RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// How server-provided throttling hints should be scoped.
 pub enum ServerThrottleScope {
     #[default]
+    /// Infer the scope from response headers and configured rate limiters.
     Auto,
+    /// Apply throttling only to the current host or endpoint bucket.
     Host,
+    /// Apply throttling to the client-wide shared limiter.
     Global,
+    /// Apply throttling to both host-scoped and global limiters.
     Both,
 }
 
@@ -80,6 +85,7 @@ pub(crate) fn server_throttle_scope_from_headers(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+/// Token-bucket limits used for client-side request pacing.
 pub struct RateLimitPolicy {
     requests_per_second: f64,
     burst: usize,
@@ -87,6 +93,7 @@ pub struct RateLimitPolicy {
 }
 
 impl RateLimitPolicy {
+    /// Returns the standard SDK-friendly rate limiting defaults.
     pub const fn standard() -> Self {
         Self {
             requests_per_second: 50.0,
@@ -95,6 +102,9 @@ impl RateLimitPolicy {
         }
     }
 
+    /// Sets the sustained request rate.
+    ///
+    /// Non-finite and non-positive values are clamped to `1.0`.
     pub fn requests_per_second(mut self, requests_per_second: f64) -> Self {
         self.requests_per_second = if requests_per_second.is_finite() && requests_per_second > 0.0 {
             requests_per_second
@@ -104,11 +114,13 @@ impl RateLimitPolicy {
         self
     }
 
+    /// Sets the token bucket burst capacity.
     pub const fn burst(mut self, burst: usize) -> Self {
         self.burst = burst;
         self
     }
 
+    /// Caps how long a server throttle hint may delay a request.
     pub const fn max_throttle_delay(mut self, max_throttle_delay: Duration) -> Self {
         self.max_throttle_delay = max_throttle_delay;
         self

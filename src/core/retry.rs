@@ -9,14 +9,20 @@ use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::error::{TimeoutPhase, TransportErrorKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Reason a retry was considered.
 pub enum RetryReason {
+    /// A retryable HTTP status was returned.
     Status(StatusCode),
+    /// A retryable transport error occurred.
     Transport(TransportErrorKind),
+    /// A retryable timeout occurred.
     Timeout(TimeoutPhase),
+    /// Reading the response body failed after headers were received.
     ResponseBodyRead,
 }
 
 #[derive(Clone, Debug)]
+/// Immutable context describing a retry decision.
 pub struct RetryDecision {
     attempt: usize,
     max_attempts: usize,
@@ -42,26 +48,32 @@ impl RetryDecision {
         }
     }
 
+    /// Returns the current attempt number, starting at `1`.
     pub fn attempt(&self) -> usize {
         self.attempt
     }
 
+    /// Returns the maximum number of attempts allowed.
     pub fn max_attempts(&self) -> usize {
         self.max_attempts
     }
 
+    /// Returns the request method.
     pub fn method(&self) -> &Method {
         &self.method
     }
 
+    /// Returns the request URI with the crate's redaction rules applied.
     pub fn uri(&self) -> &str {
         &self.uri
     }
 
+    /// Returns the reason this retry was considered.
     pub fn reason(&self) -> RetryReason {
         self.reason
     }
 
+    /// Returns the retryable status, if the decision was triggered by status.
     pub fn status(&self) -> Option<StatusCode> {
         match self.reason {
             RetryReason::Status(status) => Some(status),
@@ -69,6 +81,7 @@ impl RetryDecision {
         }
     }
 
+    /// Returns the transport error kind, if the decision was transport-triggered.
     pub fn transport_error_kind(&self) -> Option<TransportErrorKind> {
         match self.reason {
             RetryReason::Transport(kind) => Some(kind),
@@ -76,6 +89,7 @@ impl RetryDecision {
         }
     }
 
+    /// Returns the timeout phase, if the decision was timeout-triggered.
     pub fn timeout_phase(&self) -> Option<TimeoutPhase> {
         match self.reason {
             RetryReason::Timeout(phase) => Some(phase),
@@ -83,20 +97,26 @@ impl RetryDecision {
         }
     }
 
+    /// Returns whether the retry was considered because body streaming failed.
     pub fn is_response_body_read_error(&self) -> bool {
         matches!(self.reason, RetryReason::ResponseBodyRead)
     }
 }
 
+/// Custom classifier that can override built-in retry decisions.
 pub trait RetryClassifier: Send + Sync {
+    /// Returns whether the request should be retried.
     fn should_retry(&self, decision: &RetryDecision) -> bool;
 }
 
+/// Predicate that decides whether a request is eligible for retries at all.
 pub trait RetryEligibility: Send + Sync {
+    /// Returns whether a request with `method` and `headers` may be retried.
     fn supports_retry(&self, method: &Method, headers: &HeaderMap) -> bool;
 }
 
 #[derive(Default)]
+/// Retry eligibility that only allows idempotent methods or explicit idempotency keys.
 pub struct StrictRetryEligibility;
 
 impl RetryEligibility for StrictRetryEligibility {
@@ -106,6 +126,7 @@ impl RetryEligibility for StrictRetryEligibility {
 }
 
 #[derive(Default)]
+/// Retry eligibility that treats every request as retryable.
 pub struct PermissiveRetryEligibility;
 
 impl RetryEligibility for PermissiveRetryEligibility {
@@ -115,6 +136,7 @@ impl RetryEligibility for PermissiveRetryEligibility {
 }
 
 #[derive(Clone)]
+/// Retry policy covering attempts, backoff, and retryable failure classes.
 pub struct RetryPolicy {
     max_attempts: usize,
     base_backoff: Duration,
@@ -161,6 +183,7 @@ impl std::fmt::Debug for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Returns a policy that disables retries.
     pub fn disabled() -> Self {
         Self {
             max_attempts: 1,
@@ -179,6 +202,7 @@ impl RetryPolicy {
         }
     }
 
+    /// Returns the default SDK retry policy.
     pub fn standard() -> Self {
         Self {
             max_attempts: 3,
@@ -197,11 +221,13 @@ impl RetryPolicy {
         }
     }
 
+    /// Sets the maximum number of attempts, including the first try.
     pub fn max_attempts(mut self, max_attempts: usize) -> Self {
         self.max_attempts = max_attempts.max(1);
         self
     }
 
+    /// Sets the base exponential backoff delay.
     pub fn base_backoff(mut self, base_backoff: Duration) -> Self {
         self.base_backoff = base_backoff.max(Duration::from_millis(1));
         if self.max_backoff < self.base_backoff {
@@ -210,21 +236,25 @@ impl RetryPolicy {
         self
     }
 
+    /// Sets the maximum backoff delay.
     pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
         self.max_backoff = max_backoff.max(self.base_backoff);
         self
     }
 
+    /// Sets the random jitter ratio applied to computed backoffs.
     pub fn jitter_ratio(mut self, jitter_ratio: f64) -> Self {
         self.jitter_ratio = jitter_ratio.clamp(0.0, 1.0);
         self
     }
 
+    /// Replaces the set of retryable HTTP status codes.
     pub fn retryable_status_codes(mut self, codes: impl IntoIterator<Item = u16>) -> Self {
         self.retryable_status_codes = codes.into_iter().collect();
         self
     }
 
+    /// Replaces the set of retryable transport error kinds.
     pub fn retryable_transport_error_kinds(
         mut self,
         kinds: impl IntoIterator<Item = TransportErrorKind>,
@@ -233,6 +263,7 @@ impl RetryPolicy {
         self
     }
 
+    /// Replaces the set of retryable timeout phases.
     pub fn retryable_timeout_phases(
         mut self,
         phases: impl IntoIterator<Item = TimeoutPhase>,
@@ -241,34 +272,40 @@ impl RetryPolicy {
         self
     }
 
+    /// Enables or disables retries after response body read failures.
     pub fn retry_on_response_body_read_error(mut self, retry: bool) -> Self {
         self.retry_on_response_body_read_error = retry;
         self
     }
 
+    /// Sets a per-status retry window measured in maximum attempts.
     pub fn status_retry_window(mut self, status: u16, max_attempts: usize) -> Self {
         self.status_retry_windows
             .insert(status, max_attempts.max(1));
         self
     }
 
+    /// Sets a per-transport-kind retry window measured in maximum attempts.
     pub fn transport_retry_window(mut self, kind: TransportErrorKind, max_attempts: usize) -> Self {
         self.transport_retry_windows
             .insert(kind, max_attempts.max(1));
         self
     }
 
+    /// Sets a per-timeout-phase retry window measured in maximum attempts.
     pub fn timeout_retry_window(mut self, phase: TimeoutPhase, max_attempts: usize) -> Self {
         self.timeout_retry_windows
             .insert(phase, max_attempts.max(1));
         self
     }
 
+    /// Sets the retry window for response body read failures.
     pub fn response_body_read_retry_window(mut self, max_attempts: usize) -> Self {
         self.response_body_read_retry_window = Some(max_attempts.max(1));
         self
     }
 
+    /// Sets a custom classifier that can override the built-in retry rules.
     pub fn retry_classifier(mut self, retry_classifier: Arc<dyn RetryClassifier>) -> Self {
         self.retry_classifier = Some(retry_classifier);
         self

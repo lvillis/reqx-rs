@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use thiserror::Error;
 
+/// Current resumable upload checkpoint schema version.
 pub const RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 2;
 const LEGACY_RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 1;
 
@@ -17,12 +18,16 @@ fn legacy_checkpoint_version() -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Checksum algorithm used for uploaded parts.
 pub enum PartChecksumAlgorithm {
+    /// MD5 checksum in lowercase hex form.
     Md5,
+    /// SHA-256 checksum in lowercase hex form.
     Sha256,
 }
 
 impl PartChecksumAlgorithm {
+    /// Returns the stable string identifier for this checksum algorithm.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Md5 => "md5",
@@ -61,26 +66,38 @@ fn normalize_token(value: &str) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Metadata recorded for one successfully uploaded part.
 pub struct UploadedPart {
+    /// One-based part number.
     pub part_number: u32,
+    /// Remote ETag returned by the upload backend.
     pub etag: String,
+    /// Number of bytes uploaded for this part.
     pub size: usize,
     #[serde(default)]
+    /// Optional checksum recorded for this part.
     pub checksum: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Serializable checkpoint used to resume multipart uploads.
 pub struct ResumableUploadCheckpoint {
     #[serde(default = "legacy_checkpoint_version")]
+    /// Checkpoint schema version.
     pub version: u32,
+    /// Backend upload identifier.
     pub upload_id: String,
+    /// Fixed part size used for this upload.
     pub part_size: usize,
     #[serde(default)]
+    /// Optional checksum algorithm used for uploaded parts.
     pub checksum_algorithm: Option<PartChecksumAlgorithm>,
+    /// Completed parts keyed by part number.
     pub completed_parts: BTreeMap<u32, UploadedPart>,
 }
 
 impl ResumableUploadCheckpoint {
+    /// Creates an empty checkpoint for a new upload.
     pub fn new(upload_id: impl Into<String>, part_size: usize) -> Self {
         Self {
             version: RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
@@ -93,15 +110,22 @@ impl ResumableUploadCheckpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Summary returned after a resumable upload completes.
 pub struct ResumableUploadResult {
+    /// Backend upload identifier.
     pub upload_id: String,
+    /// Total number of uploaded bytes.
     pub total_bytes: u64,
+    /// Total number of uploaded parts.
     pub total_parts: u32,
+    /// Whether the upload resumed from an existing checkpoint.
     pub resumed: bool,
+    /// Completed parts in order.
     pub completed_parts: Vec<UploadedPart>,
 }
 
 #[derive(Clone, Debug)]
+/// Options controlling resumable upload chunking, retries, and verification.
 pub struct ResumableUploadOptions {
     part_size: usize,
     max_attempts: usize,
@@ -114,20 +138,24 @@ pub struct ResumableUploadOptions {
 }
 
 impl ResumableUploadOptions {
+    /// Creates options with the default resumable upload settings.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the size of each uploaded part in bytes.
     pub fn with_part_size(mut self, part_size: usize) -> Self {
         self.part_size = part_size.max(1);
         self
     }
 
+    /// Sets how many attempts are allowed for each part upload.
     pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
         self.max_attempts = max_attempts.max(1);
         self
     }
 
+    /// Sets the base retry backoff used between part upload attempts.
     pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
         self.base_backoff = base_backoff.max(Duration::from_millis(1));
         if self.max_backoff < self.base_backoff {
@@ -136,21 +164,25 @@ impl ResumableUploadOptions {
         self
     }
 
+    /// Sets the maximum retry backoff used between part upload attempts.
     pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
         self.max_backoff = max_backoff.max(self.base_backoff);
         self
     }
 
+    /// Sets the backoff jitter ratio applied to retry delays.
     pub fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
         self.jitter_ratio = jitter_ratio.clamp(0.0, 1.0);
         self
     }
 
+    /// Aborts the remote upload when a terminal error is encountered.
     pub fn with_abort_on_error(mut self, abort_on_error: bool) -> Self {
         self.abort_on_error = abort_on_error;
         self
     }
 
+    /// Enables checksum verification for uploaded parts.
     pub fn with_part_checksum_algorithm(
         mut self,
         part_checksum_algorithm: PartChecksumAlgorithm,
@@ -159,28 +191,34 @@ impl ResumableUploadOptions {
         self
     }
 
+    /// Disables checksum generation and verification for uploaded parts.
     pub fn without_part_checksum_algorithm(mut self) -> Self {
         self.part_checksum_algorithm = None;
         self
     }
 
+    /// Verifies that the remote ETag matches the computed checksum when possible.
     pub fn with_verify_remote_etag(mut self, verify_remote_etag: bool) -> Self {
         self.verify_remote_etag = verify_remote_etag;
         self
     }
 
+    /// Returns the configured part size in bytes.
     pub fn part_size(&self) -> usize {
         self.part_size
     }
 
+    /// Returns the configured maximum attempts per part.
     pub fn max_attempts(&self) -> usize {
         self.max_attempts
     }
 
+    /// Returns the configured part checksum algorithm, if any.
     pub fn part_checksum_algorithm(&self) -> Option<PartChecksumAlgorithm> {
         self.part_checksum_algorithm
     }
 
+    /// Returns whether remote ETags are checked against the expected checksum.
     pub fn verify_remote_etag(&self) -> bool {
         self.verify_remote_etag
     }
@@ -281,81 +319,119 @@ impl Default for ResumableUploadOptions {
 }
 
 #[derive(Debug, Error)]
+/// Error returned by a resumable upload operation.
 pub enum ResumableUploadError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    /// Creating the remote upload session failed.
     #[error("failed to create resumable upload: {source}")]
     CreateFailed {
         #[source]
+        /// Source error returned by the backend.
         source: E,
     },
+    /// The checkpoint part size did not match the active options.
     #[error(
         "checkpoint part size mismatch: checkpoint={checkpoint_part_size} options={options_part_size}"
     )]
     CheckpointPartSizeMismatch {
+        /// Part size stored in the checkpoint.
         checkpoint_part_size: usize,
+        /// Part size configured in the active options.
         options_part_size: usize,
     },
+    /// The checkpoint checksum algorithm did not match the active options.
     #[error(
         "checkpoint checksum algorithm mismatch: checkpoint={checkpoint_checksum_algorithm} options={options_checksum_algorithm}"
     )]
     CheckpointChecksumAlgorithmMismatch {
+        /// Checksum algorithm stored in the checkpoint.
         checkpoint_checksum_algorithm: &'static str,
+        /// Checksum algorithm configured in the active options.
         options_checksum_algorithm: &'static str,
     },
+    /// The checkpoint version was newer than this crate understands.
     #[error(
         "unsupported checkpoint version {checkpoint_version}; max supported is {max_supported_version}"
     )]
     UnsupportedCheckpointVersion {
+        /// Version stored in the checkpoint.
         checkpoint_version: u32,
+        /// Highest checkpoint version supported by this crate.
         max_supported_version: u32,
     },
+    /// The checkpoint upload id was empty.
     #[error("checkpoint upload id is empty")]
     EmptyUploadId,
+    /// Reading the source stream failed.
     #[error("source read failed")]
     SourceRead {
         #[source]
+        /// Source I/O error.
         source: std::io::Error,
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
+    /// Uploading a part failed after exhausting retries.
     #[error("upload part {part_number} failed after {attempts} attempts: {source}")]
     PartUploadFailed {
+        /// One-based part number.
         part_number: u32,
+        /// Number of attempts that were made.
         attempts: usize,
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
         #[source]
+        /// Source error returned by the backend.
         source: E,
     },
+    /// A backend-reported checksum did not match the expected checksum.
     #[error(
         "upload part {part_number} checksum mismatch: expected={expected_checksum} actual={actual_checksum}"
     )]
     PartChecksumMismatch {
+        /// One-based part number.
         part_number: u32,
+        /// Expected checksum in normalized lowercase form.
         expected_checksum: String,
+        /// Actual checksum returned by the backend in normalized lowercase form.
         actual_checksum: String,
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
+    /// A backend-reported ETag did not match the expected checksum.
     #[error(
         "upload part {part_number} etag mismatch: expected={expected_etag} actual={actual_etag}"
     )]
     PartEtagMismatch {
+        /// One-based part number.
         part_number: u32,
+        /// Expected ETag in normalized lowercase form.
         expected_etag: String,
+        /// Actual ETag returned by the backend in normalized lowercase form.
         actual_etag: String,
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
+    /// Completing the remote upload session failed.
     #[error("failed to complete resumable upload: {source}")]
     CompleteFailed {
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
         #[source]
+        /// Source error returned by the backend.
         source: E,
     },
+    /// The source stream produced no uploadable data.
     #[error("upload body produced no parts")]
     EmptyUploadBody,
+    /// A required completed part was missing from the checkpoint.
     #[error("missing completed metadata for part {part_number}")]
     MissingCompletedPart {
+        /// Missing one-based part number.
         part_number: u32,
+        /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
 }
@@ -364,6 +440,7 @@ impl<E> ResumableUploadError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    /// Returns the checkpoint carried by this error, when available.
     pub fn checkpoint(&self) -> Option<&ResumableUploadCheckpoint> {
         match self {
             Self::SourceRead { checkpoint, .. }
@@ -376,6 +453,7 @@ where
         }
     }
 
+    /// Consumes the error and returns the checkpoint carried by it, when available.
     pub fn into_checkpoint(self) -> Option<ResumableUploadCheckpoint> {
         match self {
             Self::SourceRead { checkpoint, .. }
@@ -389,11 +467,15 @@ where
     }
 }
 
+/// Backend contract for blocking resumable uploads.
 pub trait BlockingResumableUploadBackend {
+    /// Backend-specific error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Starts a new remote upload session and returns its upload id.
     fn create_upload(&self) -> Result<String, Self::Error>;
 
+    /// Uploads one part and returns normalized metadata for the completed part.
     fn upload_part(
         &self,
         upload_id: &str,
@@ -401,8 +483,10 @@ pub trait BlockingResumableUploadBackend {
         chunk: &[u8],
     ) -> Result<UploadedPart, Self::Error>;
 
+    /// Finalizes the remote upload using the ordered completed parts.
     fn complete_upload(&self, upload_id: &str, parts: &[UploadedPart]) -> Result<(), Self::Error>;
 
+    /// Aborts a remote upload session after a terminal error.
     fn abort_upload(&self, _upload_id: &str) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -410,11 +494,15 @@ pub trait BlockingResumableUploadBackend {
 
 #[cfg(feature = "_async")]
 #[allow(async_fn_in_trait)]
+/// Backend contract for async resumable uploads.
 pub trait AsyncResumableUploadBackend {
+    /// Backend-specific error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Starts a new remote upload session and returns its upload id.
     async fn create_upload(&self) -> Result<String, Self::Error>;
 
+    /// Uploads one part and returns normalized metadata for the completed part.
     async fn upload_part(
         &self,
         upload_id: &str,
@@ -422,12 +510,14 @@ pub trait AsyncResumableUploadBackend {
         chunk: &[u8],
     ) -> Result<UploadedPart, Self::Error>;
 
+    /// Finalizes the remote upload using the ordered completed parts.
     async fn complete_upload(
         &self,
         upload_id: &str,
         parts: &[UploadedPart],
     ) -> Result<(), Self::Error>;
 
+    /// Aborts a remote upload session after a terminal error.
     async fn abort_upload(&self, _upload_id: &str) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -539,19 +629,23 @@ where
     Ok(buffer)
 }
 
+/// Blocking helper that drives a multipart upload with checkpoints and retries.
 pub struct BlockingResumableUploader {
     options: ResumableUploadOptions,
 }
 
 impl BlockingResumableUploader {
+    /// Creates a new uploader with the provided options.
     pub fn new(options: ResumableUploadOptions) -> Self {
         Self { options }
     }
 
+    /// Returns the options used by this uploader.
     pub fn options(&self) -> &ResumableUploadOptions {
         &self.options
     }
 
+    /// Starts a new resumable upload.
     pub fn upload<B, R>(
         &self,
         backend: &B,
@@ -569,6 +663,7 @@ impl BlockingResumableUploader {
         self.upload_with_checkpoint(backend, reader, checkpoint, false)
     }
 
+    /// Resumes an upload from an existing checkpoint.
     pub fn resume<B, R>(
         &self,
         backend: &B,
@@ -703,20 +798,24 @@ impl Default for BlockingResumableUploader {
 }
 
 #[cfg(feature = "_async")]
+/// Async helper that drives a multipart upload with checkpoints and retries.
 pub struct AsyncResumableUploader {
     options: ResumableUploadOptions,
 }
 
 #[cfg(feature = "_async")]
 impl AsyncResumableUploader {
+    /// Creates a new uploader with the provided options.
     pub fn new(options: ResumableUploadOptions) -> Self {
         Self { options }
     }
 
+    /// Returns the options used by this uploader.
     pub fn options(&self) -> &ResumableUploadOptions {
         &self.options
     }
 
+    /// Starts a new resumable upload.
     pub async fn upload<B, R>(
         &self,
         backend: &B,
@@ -736,6 +835,7 @@ impl AsyncResumableUploader {
             .await
     }
 
+    /// Resumes an upload from an existing checkpoint.
     pub async fn resume<B, R>(
         &self,
         backend: &B,

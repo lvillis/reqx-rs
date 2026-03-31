@@ -158,6 +158,8 @@ enum RequestBody {
     Reader(Box<dyn Read + Send>),
 }
 
+/// Builds a blocking [`Client`] with transport, timeout, retry, TLS, and
+/// observability settings.
 pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
@@ -201,6 +203,7 @@ pub struct ClientBuilder {
     observers: Vec<Arc<dyn Observer>>,
 }
 
+/// Reusable blocking HTTP client for SDK transports.
 pub struct Client {
     base_url: String,
     default_headers: HeaderMap,

@@ -205,42 +205,52 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
 }
 
 impl Client {
+    /// Starts building a client for requests rooted at `base_url`.
     pub fn builder(base_url: impl Into<String>) -> ClientBuilder {
         ClientBuilder::new(base_url)
     }
 
+    /// Starts building a request with an explicit HTTP method.
     pub fn request(&self, method: Method, path: impl Into<String>) -> RequestBuilder<'_> {
         RequestBuilder::new(self, method, path.into())
     }
 
+    /// Starts a `GET` request.
     pub fn get(&self, path: impl Into<String>) -> RequestBuilder<'_> {
         self.request(Method::GET, path)
     }
 
+    /// Starts a `POST` request.
     pub fn post(&self, path: impl Into<String>) -> RequestBuilder<'_> {
         self.request(Method::POST, path)
     }
 
+    /// Starts a `PUT` request.
     pub fn put(&self, path: impl Into<String>) -> RequestBuilder<'_> {
         self.request(Method::PUT, path)
     }
 
+    /// Starts a `PATCH` request.
     pub fn patch(&self, path: impl Into<String>) -> RequestBuilder<'_> {
         self.request(Method::PATCH, path)
     }
 
+    /// Starts a `DELETE` request.
     pub fn delete(&self, path: impl Into<String>) -> RequestBuilder<'_> {
         self.request(Method::DELETE, path)
     }
 
+    /// Returns the current client metrics snapshot.
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
     }
 
+    /// Returns the TLS backend chosen for this client.
     pub fn tls_backend(&self) -> TlsBackend {
         self.tls_backend
     }
 
+    /// Returns the default status policy applied to requests.
     pub fn default_status_policy(&self) -> StatusPolicy {
         self.default_status_policy
     }

@@ -48,26 +48,31 @@ impl<'a> RequestBuilder<'a> {
         }
     }
 
+    /// Adds a header to this request.
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
         self
     }
 
+    /// Parses and adds a header to this request.
     pub fn try_header(self, name: &str, value: &str) -> crate::Result<Self> {
         let name = parse_header_name(name)?;
         let value = parse_header_value(name.as_str(), value)?;
         Ok(self.header(name, value))
     }
 
+    /// Sets the `Idempotency-Key` header for retry-safe mutations.
     pub fn idempotency_key(self, key: &str) -> crate::Result<Self> {
         self.try_header(IDEMPOTENCY_KEY_HEADER, key)
     }
 
+    /// Appends one query parameter pair.
     pub fn query_pair(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.query_pairs.push((name.into(), value.into()));
         self
     }
 
+    /// Appends multiple query parameter pairs.
     pub fn query_pairs<K, V, I>(mut self, pairs: I) -> Self
     where
         K: Into<String>,
@@ -82,6 +87,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    /// Serializes and appends query parameters from `params`.
     pub fn query<T>(mut self, params: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
@@ -95,11 +101,13 @@ impl<'a> RequestBuilder<'a> {
         Ok(self)
     }
 
+    /// Sets a fully buffered request body.
     pub fn body(mut self, body: impl Into<Bytes>) -> Self {
         self.body = Some(RequestBody::Buffered(body.into()));
         self
     }
 
+    /// Sets a streaming request body.
     pub fn body_stream<S, E>(mut self, stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -109,6 +117,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    /// Streams an async reader as the request body.
     pub fn body_reader<R>(self, reader: R) -> Self
     where
         R: AsyncRead + Send + 'static,
@@ -116,6 +125,7 @@ impl<'a> RequestBuilder<'a> {
         self.body_stream(ReaderStream::new(reader))
     }
 
+    /// Streams an async reader as the request body and sets `Content-Length`.
     pub fn body_reader_with_length<R>(self, reader: R, content_length: u64) -> crate::Result<Self>
     where
         R: AsyncRead + Send + 'static,
@@ -134,6 +144,7 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    /// Serializes `payload` as JSON and sets `Content-Type: application/json`.
     pub fn json<T>(self, payload: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
@@ -144,6 +155,7 @@ impl<'a> RequestBuilder<'a> {
         Ok(with_body.header(CONTENT_TYPE, HeaderValue::from_static("application/json")))
     }
 
+    /// Serializes `payload` as form data and sets the form content type.
     pub fn form<T>(self, payload: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
@@ -157,31 +169,37 @@ impl<'a> RequestBuilder<'a> {
         ))
     }
 
+    /// Overrides the per-attempt request timeout for this request.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.execution_overrides.request_timeout = Some(timeout.max(Duration::from_millis(1)));
         self
     }
 
+    /// Overrides the overall deadline for this request.
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
         self.execution_overrides.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
         self
     }
 
+    /// Overrides the buffered response body size limit for this request.
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
         self.execution_overrides.max_response_body_bytes = Some(max_response_body_bytes.max(1));
         self
     }
 
+    /// Overrides the retry policy for this request.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.execution_overrides.retry_policy = Some(retry_policy);
         self
     }
 
+    /// Overrides redirect handling for this request.
     pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
         self.execution_overrides.redirect_policy = Some(redirect_policy);
         self
     }
 
+    /// Overrides status handling for this request.
     pub fn status_policy(mut self, status_policy: StatusPolicy) -> Self {
         self.execution_overrides.status_policy = Some(status_policy);
         self
@@ -241,6 +259,7 @@ impl<'a> RequestBuilder<'a> {
             .await
     }
 
+    /// Streams the response body into `writer`.
     pub async fn download_to_writer<W>(self, writer: &mut W) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
@@ -248,6 +267,7 @@ impl<'a> RequestBuilder<'a> {
         self.send_stream().await?.copy_to_writer(writer).await
     }
 
+    /// Streams the response body into `writer`, enforcing `max_bytes`.
     pub async fn download_to_writer_limited<W>(
         self,
         writer: &mut W,

@@ -1,5 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(any(feature = "_async", feature = "_blocking")), allow(dead_code))]
+#![warn(missing_docs)]
 
 //! `reqx` is an internal HTTP transport crate for API SDKs with HTTP/1.1 + HTTP/2 support.
 //!
@@ -166,11 +167,16 @@ pub use crate::response::ResponseStream;
 pub use crate::tls::{TlsBackend, TlsRootStore, TlsVersion};
 
 #[cfg(feature = "_blocking")]
+/// Blocking transport API.
+///
+/// This mirrors the async surface where the underlying transport supports the
+/// same behavior, but uses synchronous request execution and response streams.
 pub mod blocking {
     pub use crate::blocking_client::{Client, ClientBuilder, RequestBuilder};
     pub use crate::response::BlockingResponseStream as ResponseStream;
 }
 
+/// Convenient result alias used by `reqx` APIs.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Recommended imports for most SDK transport code.

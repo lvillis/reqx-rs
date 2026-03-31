@@ -384,6 +384,10 @@ impl std::fmt::Debug for StreamBody {
 }
 
 #[derive(Debug)]
+/// Streaming async response body with request metadata.
+///
+/// Use this when you want to process large response bodies incrementally
+/// without buffering them into memory first.
 pub struct ResponseStream {
     status: StatusCode,
     headers: HeaderMap,
@@ -411,14 +415,17 @@ impl ResponseStream {
         self.body.attach_completion(completion);
     }
 
+    /// Returns the HTTP status code.
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
+    /// Returns the response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
+    /// Returns the originating request method.
     pub fn method(&self) -> &http::Method {
         self.body.method()
     }
@@ -436,6 +443,7 @@ impl ResponseStream {
         self.body.uri_redacted()
     }
 
+    /// Buffers the stream into memory, enforcing `max_bytes`.
     pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
         let max_bytes = max_bytes.max(1);
         let mut this = self;
@@ -451,6 +459,7 @@ impl ResponseStream {
         }
     }
 
+    /// Copies the streamed body into `writer`.
     pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
@@ -458,6 +467,7 @@ impl ResponseStream {
         self.body.copy_to_writer(writer).await
     }
 
+    /// Copies the streamed body into `writer`, enforcing `max_bytes`.
     pub async fn copy_to_writer_limited<W>(
         mut self,
         writer: &mut W,
@@ -469,6 +479,7 @@ impl ResponseStream {
         self.body.copy_to_writer_limited(writer, max_bytes).await
     }
 
+    /// Buffers and decodes the stream into a [`Response`], enforcing `max_bytes`.
     pub async fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
         let max_bytes = max_bytes.max(1);
         let method = self.body.method().clone();
@@ -502,16 +513,19 @@ impl ResponseStream {
         Ok(Response::new(self.status, self.headers, body))
     }
 
+    /// Buffers the stream as UTF-8 text, enforcing `max_bytes`.
     pub async fn into_text_limited(self, max_bytes: usize) -> crate::Result<String> {
         let response = self.into_response_limited(max_bytes).await?;
         response.text().map(ToOwned::to_owned)
     }
 
+    /// Buffers the stream as lossy UTF-8 text, enforcing `max_bytes`.
     pub async fn into_text_lossy_limited(self, max_bytes: usize) -> crate::Result<String> {
         let response = self.into_response_limited(max_bytes).await?;
         Ok(response.text_lossy())
     }
 
+    /// Buffers and deserializes the stream from JSON, enforcing `max_bytes`.
     pub async fn into_json_limited<T>(self, max_bytes: usize) -> crate::Result<T>
     where
         T: DeserializeOwned,
