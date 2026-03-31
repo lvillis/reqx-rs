@@ -495,6 +495,14 @@ pub trait BlockingResumableUploadBackend {
 #[cfg(feature = "_async")]
 #[allow(async_fn_in_trait)]
 /// Backend contract for async resumable uploads.
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub trait AsyncResumableUploadBackend {
     /// Backend-specific error type.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -799,6 +807,14 @@ impl Default for BlockingResumableUploader {
 
 #[cfg(feature = "_async")]
 /// Async helper that drives a multipart upload with checkpoints and retries.
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub struct AsyncResumableUploader {
     options: ResumableUploadOptions,
 }

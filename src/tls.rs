@@ -49,8 +49,13 @@ impl TlsVersion {
 pub enum TlsRootStore {
     #[default]
     /// Use the backend's default trust store behavior.
+    ///
+    /// For `rustls` backends this uses bundled Mozilla roots. For `native-tls`
+    /// it uses the platform trust store.
     BackendDefault,
     /// Use the bundled Mozilla roots from `webpki-roots`.
+    ///
+    /// This is unsupported by the async `native-tls` backend.
     WebPki,
     /// Use the operating system trust store.
     System,

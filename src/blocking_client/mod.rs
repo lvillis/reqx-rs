@@ -160,6 +160,14 @@ enum RequestBody {
 
 /// Builds a blocking [`Client`] with transport, timeout, retry, TLS, and
 /// observability settings.
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 pub struct ClientBuilder {
     base_url: String,
     default_headers: HeaderMap,
@@ -204,6 +212,14 @@ pub struct ClientBuilder {
 }
 
 /// Reusable blocking HTTP client for SDK transports.
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 pub struct Client {
     base_url: String,
     default_headers: HeaderMap,

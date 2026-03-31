@@ -388,6 +388,30 @@ impl std::fmt::Debug for StreamBody {
 ///
 /// Use this when you want to process large response bodies incrementally
 /// without buffering them into memory first.
+///
+/// See also `examples/streaming.rs`.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "_async")]
+/// # async fn demo() -> reqx::Result<()> {
+/// use reqx::prelude::Client;
+///
+/// let client = Client::builder("https://api.example.com").build()?;
+/// let stream = client.get("/v1/logs").send_response_stream().await?;
+/// let _body = stream.into_text_limited(64 * 1024).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub struct ResponseStream {
     status: StatusCode,
     headers: HeaderMap,
@@ -444,6 +468,8 @@ impl ResponseStream {
     }
 
     /// Buffers the stream into memory, enforcing `max_bytes`.
+    ///
+    /// See also `examples/streaming.rs`.
     pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
         let max_bytes = max_bytes.max(1);
         let mut this = self;
@@ -460,6 +486,8 @@ impl ResponseStream {
     }
 
     /// Copies the streamed body into `writer`.
+    ///
+    /// See also `examples/streaming.rs`.
     pub async fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
@@ -480,6 +508,8 @@ impl ResponseStream {
     }
 
     /// Buffers and decodes the stream into a [`Response`], enforcing `max_bytes`.
+    ///
+    /// See also `examples/streaming.rs`.
     pub async fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
         let max_bytes = max_bytes.max(1);
         let method = self.body.method().clone();

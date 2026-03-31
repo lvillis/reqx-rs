@@ -282,10 +282,26 @@ mod async_stream;
 mod blocking_stream;
 
 #[cfg(feature = "_async")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub use async_stream::ResponseStream;
 #[cfg(feature = "_async")]
 pub(crate) use async_stream::{ResponseStreamContext, StreamPermits};
 #[cfg(feature = "_blocking")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 pub use blocking_stream::BlockingResponseStream;
 #[cfg(feature = "_blocking")]
 pub(crate) use blocking_stream::BlockingResponseStreamContext;

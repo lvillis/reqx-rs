@@ -61,6 +61,16 @@ fn deadline_exceeded_error(
 ///
 /// Use this when you want to consume large responses incrementally without
 /// buffering them into memory first.
+///
+/// See also `examples/blocking_streaming.rs`.
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 pub struct BlockingResponseStream {
     status: StatusCode,
     headers: HeaderMap,
@@ -282,6 +292,8 @@ impl BlockingResponseStream {
     }
 
     /// Copies the streamed body into `writer`.
+    ///
+    /// See also `examples/blocking_streaming.rs`.
     pub fn copy_to_writer<W>(mut self, writer: &mut W) -> crate::Result<u64>
     where
         W: Write + ?Sized,
@@ -356,6 +368,8 @@ impl BlockingResponseStream {
     }
 
     /// Buffers and decodes the stream into a [`Response`], enforcing `max_bytes`.
+    ///
+    /// See also `examples/blocking_streaming.rs`.
     pub fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
         let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];

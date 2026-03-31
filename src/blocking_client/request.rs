@@ -22,6 +22,19 @@ use super::{Client, RequestBody, RequestExecutionOptions};
 ///
 /// Create a builder from [`Client::request`] or the verb helpers such as
 /// [`Client::get`] and [`Client::post`].
+///
+/// See also:
+///
+/// - `examples/blocking_basic.rs`
+/// - `examples/blocking_streaming.rs`
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 #[must_use = "request builders do nothing until you call a send method"]
 pub struct RequestBuilder<'a> {
     client: &'a Client,

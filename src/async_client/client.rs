@@ -1055,6 +1055,14 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) auto_accept_encoding: Option<bool>,
 }
 
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 /// Builds an async [`Client`] with transport, timeout, retry, TLS, and
 /// observability settings.
 ///
@@ -1393,12 +1401,20 @@ impl ClientBuilder {
     }
 
     /// Selects the TLS backend used by this client.
+    ///
+    /// Async `rustls` backends support TLS version bounds. Async `native-tls`
+    /// supports only explicit TLS 1.2 constraints and rejects
+    /// [`TlsRootStore::WebPki`] at build time.
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
         self
     }
 
     /// Pins both the minimum and maximum TLS version to `version`.
+    ///
+    /// Async `rustls` backends accept both [`TlsVersion::V1_2`] and
+    /// [`TlsVersion::V1_3`]. Async `native-tls` currently accepts only
+    /// [`TlsVersion::V1_2`].
     pub fn tls_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.min_protocol_version = Some(version);
         self.tls_options.max_protocol_version = Some(version);
@@ -1406,12 +1422,16 @@ impl ClientBuilder {
     }
 
     /// Sets the minimum TLS version accepted for outbound connections.
+    ///
+    /// Async `native-tls` currently accepts only [`TlsVersion::V1_2`].
     pub fn tls_min_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.min_protocol_version = Some(version);
         self
     }
 
     /// Sets the maximum TLS version accepted for outbound connections.
+    ///
+    /// Async `native-tls` currently accepts only [`TlsVersion::V1_2`].
     pub fn tls_max_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.max_protocol_version = Some(version);
         self
@@ -1478,12 +1498,19 @@ impl ClientBuilder {
     }
 
     /// Selects which root trust store the TLS backend should use.
+    ///
+    /// Custom root CAs require [`TlsRootStore::System`] or
+    /// [`TlsRootStore::Specific`]. Async `native-tls` rejects
+    /// [`TlsRootStore::WebPki`].
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
         self.tls_options.root_store = tls_root_store;
         self
     }
 
     /// Adds a PEM-encoded root CA certificate.
+    ///
+    /// Pair this with [`Self::tls_root_store`] set to
+    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
     pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -1492,6 +1519,9 @@ impl ClientBuilder {
     }
 
     /// Adds a DER-encoded root CA certificate.
+    ///
+    /// Pair this with [`Self::tls_root_store`] set to
+    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
     pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -1642,6 +1672,9 @@ impl ClientBuilder {
     }
 
     /// Validates the builder and constructs the client.
+    ///
+    /// Unsupported backend-specific TLS combinations return
+    /// [`crate::Error::TlsConfig`].
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
         if let Some(proxy_uri) = self.http_proxy.as_ref() {
@@ -1734,6 +1767,14 @@ impl ClientBuilder {
 }
 
 #[derive(Clone)]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 /// Reusable async HTTP client for SDK transports.
 pub struct Client {
     base_url: String,

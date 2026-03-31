@@ -368,12 +368,18 @@ impl ClientBuilder {
     }
 
     /// Selects which root trust store the TLS backend should use.
+    ///
+    /// Custom root CAs require [`TlsRootStore::System`] or
+    /// [`TlsRootStore::Specific`].
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
         self.tls_options.root_store = tls_root_store;
         self
     }
 
     /// Adds a PEM-encoded root CA certificate.
+    ///
+    /// Pair this with [`Self::tls_root_store`] set to
+    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
     pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -382,6 +388,9 @@ impl ClientBuilder {
     }
 
     /// Adds a DER-encoded root CA certificate.
+    ///
+    /// Pair this with [`Self::tls_root_store`] set to
+    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
     pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -525,6 +534,9 @@ impl ClientBuilder {
     }
 
     /// Validates the builder and constructs the client.
+    ///
+    /// Blocking `ureq` transport currently rejects TLS version bounds, and
+    /// unsupported backend-specific combinations return [`crate::Error::TlsConfig`].
     pub fn build(self) -> crate::Result<Client> {
         validate_base_url(&self.base_url)?;
         if let Some(proxy_uri) = self.http_proxy.as_ref() {

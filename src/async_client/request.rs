@@ -24,6 +24,41 @@ use crate::util::{parse_header_name, parse_header_value};
 ///
 /// Create a builder from [`Client::request`] or the verb helpers such as
 /// [`Client::get`] and [`Client::post`].
+///
+/// See also:
+///
+/// - `examples/request_helpers.rs`
+/// - `examples/request_overrides.rs`
+/// - `examples/streaming.rs`
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "_async")]
+/// # async fn demo() -> reqx::Result<()> {
+/// use reqx::prelude::Client;
+///
+/// let client = Client::builder("https://api.example.com").build()?;
+/// let response = client
+///     .post("/v1/items")
+///     .idempotency_key("item-1")?
+///     .query_pair("verbose", "true")
+///     .json(&serde_json::json!({ "name": "demo" }))?
+///     .send_response()
+///     .await?;
+///
+/// let _status = response.status();
+/// # Ok(())
+/// # }
+/// ```
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 #[must_use = "request builders do nothing until you call a send method"]
 pub struct RequestBuilder<'a> {
     client: &'a Client,
@@ -49,6 +84,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Adds a header to this request.
+    ///
+    /// See also `examples/request_helpers.rs`.
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
         self
@@ -118,6 +155,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Streams an async reader as the request body.
+    ///
+    /// See also `examples/streaming.rs`.
     pub fn body_reader<R>(self, reader: R) -> Self
     where
         R: AsyncRead + Send + 'static,
@@ -145,6 +184,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Serializes `payload` as JSON and sets `Content-Type: application/json`.
+    ///
+    /// See also `examples/basic_json.rs`.
     pub fn json<T>(self, payload: &T) -> crate::Result<Self>
     where
         T: Serialize + ?Sized,
@@ -188,6 +229,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Overrides the retry policy for this request.
+    ///
+    /// See also `examples/request_overrides.rs`.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.execution_overrides.retry_policy = Some(retry_policy);
         self
@@ -245,6 +288,7 @@ impl<'a> RequestBuilder<'a> {
     /// Executes the request and returns a streaming response body.
     ///
     /// Non-success HTTP statuses still follow the effective [`StatusPolicy`].
+    /// See also `examples/streaming.rs`.
     pub async fn send_stream(self) -> crate::Result<crate::response::ResponseStream> {
         let PreparedRequest {
             client,
@@ -260,6 +304,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Streams the response body into `writer`.
+    ///
+    /// See also `examples/streaming.rs`.
     pub async fn download_to_writer<W>(self, writer: &mut W) -> crate::Result<u64>
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
@@ -268,6 +314,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Streams the response body into `writer`, enforcing `max_bytes`.
+    ///
+    /// See also `examples/streaming.rs`.
     pub async fn download_to_writer_limited<W>(
         self,
         writer: &mut W,

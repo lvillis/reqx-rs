@@ -2,7 +2,8 @@
 #![cfg_attr(not(any(feature = "_async", feature = "_blocking")), allow(dead_code))]
 #![warn(missing_docs)]
 
-//! `reqx` is an internal HTTP transport crate for API SDKs with HTTP/1.1 + HTTP/2 support.
+//! `reqx` is a reusable HTTP transport crate for Rust API SDKs with retry,
+//! timeout, idempotency, proxy, streaming, and pluggable TLS backends.
 //!
 //! # Quick Start
 //!
@@ -48,6 +49,62 @@
 //! - Set both request timeout and total timeout.
 //! - For `POST` retries, always set `idempotency_key(...)`.
 //! - Reach for [`advanced`] when you need non-default transport controls.
+//!
+//! # Common Tasks
+//!
+//! Start from these entry points:
+//!
+//! - Build an async client: [`Client::builder`]
+//! - Build a blocking client: `reqx::blocking::Client::builder(...)`
+//! - Prepare requests: [`RequestBuilder`] and `reqx::blocking::RequestBuilder`
+//! - Handle buffered responses: [`Response`]
+//! - Handle streaming responses: [`ResponseStream`] and `reqx::blocking::ResponseStream`
+//! - Tune retries: [`prelude::RetryPolicy`] and [`advanced::RetryClassifier`]
+//! - Configure TLS: [`TlsBackend`], [`TlsVersion`], and [`TlsRootStore`]
+//! - Add advanced hooks: [`advanced::Interceptor`], [`advanced::Observer`], and [`advanced::EndpointSelector`]
+//!
+//! # Feature Selection
+//!
+//! Transport modes are selected through concrete transport+TLS feature flags:
+//!
+//! - Async + `rustls` + `ring`: `async-tls-rustls-ring`
+//! - Async + `rustls` + `aws-lc-rs`: `async-tls-rustls-aws-lc-rs`
+//! - Async + `native-tls`: `async-tls-native`
+//! - Blocking + `ureq` + `rustls` + `ring`: `blocking-tls-rustls-ring`
+//! - Blocking + `ureq` + `rustls` + `aws-lc-rs`: `blocking-tls-rustls-aws-lc-rs`
+//! - Blocking + `ureq` + `native-tls`: `blocking-tls-native`
+//!
+//! The docs.rs build enables `async-tls-rustls-ring` and
+//! `blocking-tls-rustls-ring`, so async and blocking entry points are both
+//! visible there.
+//!
+//! # Cookbook
+//!
+//! Scenario-focused examples ship in `examples/`:
+//!
+//! - JSON request flow: `examples/basic_json.rs`
+//! - Per-request overrides: `examples/request_overrides.rs`
+//! - Streaming uploads/downloads: `examples/streaming.rs` and `examples/blocking_streaming.rs`
+//! - Proxy and `no_proxy`: `examples/proxy_and_no_proxy.rs`
+//! - TLS backend selection and mTLS: `examples/tls_backends.rs` and `examples/custom_ca_mtls.rs`
+//! - Metrics and observers: `examples/metrics_snapshot.rs` and `examples/profile_and_observer.rs`
+//! - Retry and resilience controls: `examples/resilience_controls.rs`, `examples/retry_classifier.rs`, and `examples/rate_limit_429.rs`
+//! - Resumable uploads: `examples/resumable_upload.rs`
+//!
+//! The full scenario index lives in `examples/README.md`.
+//!
+//! # TLS Backend Notes
+//!
+//! - Async `rustls` backends support TLS version bounds via
+//!   `Client::builder(...).tls_version(...)`,
+//!   `Client::builder(...).tls_min_version(...)`, and
+//!   `Client::builder(...).tls_max_version(...)`.
+//! - Async `native-tls` currently supports only explicit TLS 1.2 constraints
+//!   and does not support [`TlsRootStore::WebPki`].
+//! - Blocking `ureq` transport currently rejects TLS version bounds at
+//!   `build()` time.
+//! - Custom root CAs require [`TlsRootStore::System`] or
+//!   [`TlsRootStore::Specific`].
 
 #[cfg(all(
     feature = "strict-feature-guards",
@@ -157,16 +214,48 @@ pub(crate) use crate::core::util;
 pub(crate) use crate::http::response;
 
 #[cfg(feature = "_async")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub use crate::client::{Client, ClientBuilder};
 pub use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind};
 #[cfg(feature = "_async")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub use crate::request::RequestBuilder;
 pub use crate::response::Response;
 #[cfg(feature = "_async")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))
+)]
 pub use crate::response::ResponseStream;
 pub use crate::tls::{TlsBackend, TlsRootStore, TlsVersion};
 
 #[cfg(feature = "_blocking")]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs",
+        feature = "blocking-tls-native"
+    )))
+)]
 /// Blocking transport API.
 ///
 /// This mirrors the async surface where the underlying transport supports the
@@ -183,13 +272,37 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod prelude {
     pub use crate::Result;
     #[cfg(feature = "_blocking")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "blocking-tls-rustls-ring",
+            feature = "blocking-tls-rustls-aws-lc-rs",
+            feature = "blocking-tls-native"
+        )))
+    )]
     pub use crate::blocking;
     #[cfg(feature = "_async")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs",
+            feature = "async-tls-native"
+        )))
+    )]
     pub use crate::client::Client;
     pub use crate::error::{Error, ErrorCode};
     pub use crate::policy::{RedirectPolicy, StatusPolicy};
     pub use crate::response::Response;
     #[cfg(feature = "_async")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs",
+            feature = "async-tls-native"
+        )))
+    )]
     pub use crate::response::ResponseStream;
     pub use crate::retry::RetryPolicy;
     pub use crate::tls::{TlsBackend, TlsRootStore, TlsVersion};
@@ -205,6 +318,14 @@ pub mod advanced {
         StandardOtelPathNormalizer, SystemClock,
     };
     #[cfg(feature = "_async")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "async-tls-rustls-ring",
+            feature = "async-tls-rustls-aws-lc-rs",
+            feature = "async-tls-native"
+        )))
+    )]
     pub use crate::upload::{AsyncResumableUploadBackend, AsyncResumableUploader};
     pub use crate::{
         metrics::{

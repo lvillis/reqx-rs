@@ -137,6 +137,28 @@ impl RetryEligibility for PermissiveRetryEligibility {
 
 #[derive(Clone)]
 /// Retry policy covering attempts, backoff, and retryable failure classes.
+///
+/// See also:
+///
+/// - `examples/resilience_controls.rs`
+/// - `examples/retry_classifier.rs`
+///
+/// # Example
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use reqx::prelude::RetryPolicy;
+/// use reqx::TransportErrorKind;
+///
+/// let policy = RetryPolicy::standard()
+///     .max_attempts(4)
+///     .base_backoff(Duration::from_millis(100))
+///     .max_backoff(Duration::from_secs(1))
+///     .transport_retry_window(TransportErrorKind::Connect, 2);
+///
+/// let _ = policy;
+/// ```
 pub struct RetryPolicy {
     max_attempts: usize,
     base_backoff: Duration,
