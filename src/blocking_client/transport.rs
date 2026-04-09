@@ -165,9 +165,18 @@ fn build_sync_tls_config(
         TlsRootStore::BackendDefault => {
             if matches!(backend, TlsBackend::RustlsRing | TlsBackend::RustlsAwsLcRs) {
                 tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+            } else {
+                tls_config_builder =
+                    tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
             }
         }
         TlsRootStore::WebPki => {
+            if backend == TlsBackend::NativeTls {
+                return Err(tls_config_error(
+                    backend,
+                    "tls_root_store(TlsRootStore::WebPki) is unsupported for native-tls backend; use BackendDefault, System, or Specific",
+                ));
+            }
             tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
         }
         TlsRootStore::System => {
@@ -175,6 +184,12 @@ fn build_sync_tls_config(
                 tls_config_builder =
                     tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
             } else {
+                if backend == TlsBackend::NativeTls {
+                    return Err(tls_config_error(
+                        backend,
+                        "blocking native-tls backend cannot combine system roots with custom root CAs; use tls_root_store(TlsRootStore::Specific) to trust only explicit roots",
+                    ));
+                }
                 let mut combined_roots = load_system_root_certificates(backend)?;
                 combined_roots.extend(roots);
                 if combined_roots.is_empty() {
@@ -328,7 +343,10 @@ pub(super) fn classify_ureq_transport_error(error: &ureq::Error) -> TransportErr
             std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::AddrNotAvailable => TransportErrorKind::Connect,
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NetworkDown => TransportErrorKind::Connect,
             std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::UnexpectedEof => TransportErrorKind::Read,
@@ -336,12 +354,6 @@ pub(super) fn classify_ureq_transport_error(error: &ureq::Error) -> TransportErr
         },
         _ => TransportErrorKind::Other,
     }
-}
-
-pub(super) fn wrapped_ureq_error(io_error: &std::io::Error) -> Option<&ureq::Error> {
-    io_error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<ureq::Error>())
 }
 
 pub(super) enum ReadBodyError {
@@ -373,4 +385,83 @@ pub(super) fn read_all_body_limited(
     }
 
     Ok(Bytes::from(collected))
+}
+
+#[cfg(all(test, feature = "blocking-tls-native"))]
+mod tests {
+    use super::build_sync_tls_config;
+    use crate::error::Error;
+    use crate::tls::{TlsBackend, TlsOptions, TlsRootStore};
+
+    #[test]
+    fn native_tls_backend_default_uses_platform_roots() {
+        let config = build_sync_tls_config(TlsBackend::NativeTls, &TlsOptions::default())
+            .expect("native-tls config should build");
+
+        assert_eq!(config.provider(), ureq::tls::TlsProvider::NativeTls);
+        assert!(matches!(
+            config.root_certs(),
+            &ureq::tls::RootCerts::PlatformVerifier
+        ));
+    }
+
+    #[test]
+    fn native_tls_webpki_root_store_is_rejected_before_agent_build() {
+        let options = TlsOptions {
+            root_store: TlsRootStore::WebPki,
+            ..TlsOptions::default()
+        };
+
+        let error = build_sync_tls_config(TlsBackend::NativeTls, &options)
+            .expect_err("native-tls should reject WebPki roots");
+
+        match error {
+            Error::TlsConfig { message, .. } => {
+                assert!(message.contains("TlsRootStore::WebPki"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn native_tls_system_roots_cannot_be_extended_with_custom_roots() {
+        let options = TlsOptions {
+            root_store: TlsRootStore::System,
+            root_certificates: vec![crate::tls::TlsRootCertificate::Der(vec![1, 2, 3, 4])],
+            ..TlsOptions::default()
+        };
+
+        let error = build_sync_tls_config(TlsBackend::NativeTls, &options)
+            .expect_err("native-tls should reject system roots plus custom roots");
+
+        match error {
+            Error::TlsConfig { message, .. } => {
+                assert!(message.contains("cannot combine system roots"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_error_classification_tests {
+    use super::classify_ureq_transport_error;
+    use crate::error::TransportErrorKind;
+
+    #[test]
+    fn blocking_transport_maps_extended_connect_error_kinds() {
+        let host_unreachable =
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::HostUnreachable));
+        assert_eq!(
+            classify_ureq_transport_error(&host_unreachable),
+            TransportErrorKind::Connect
+        );
+
+        let network_unreachable =
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable));
+        assert_eq!(
+            classify_ureq_transport_error(&network_unreachable),
+            TransportErrorKind::Connect
+        );
+    }
 }

@@ -25,15 +25,15 @@ use crate::response::{
 use crate::retry::{RetryDecision, RetryPolicy};
 use crate::tls::TlsBackend;
 use crate::util::{
-    bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking, merge_headers,
-    phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri, total_timeout_deadline,
-    total_timeout_expired,
+    bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
+    is_timeout_io_error, merge_headers, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
+    resolve_uri, total_timeout_deadline, total_timeout_expired,
 };
 
 use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
 use super::transport::{
     ReadBodyError, classify_ureq_transport_error, is_proxy_bypassed, read_all_body_limited,
-    remove_content_encoding_headers, wrapped_ureq_error,
+    remove_content_encoding_headers,
 };
 use super::{
     AdaptiveConcurrencyPermit, Client, ClientBuilder, RequestBody, RequestBuilder,
@@ -633,10 +633,7 @@ impl Client {
                 Err(error)
             }
             Err(ReadBodyError::Read(source)) => {
-                if let Some(ureq_error) = wrapped_ureq_error(&source)
-                    && let ureq::Error::Timeout(timeout) = ureq_error
-                {
-                    let _ = timeout;
+                if is_timeout_io_error(&source) {
                     let timeout_phase = TimeoutPhase::ResponseBody;
                     let error = if total_timeout_expired(total_timeout, request_started_at) {
                         deadline_exceeded_error(total_timeout, current_method, current_redacted_uri)

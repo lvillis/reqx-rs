@@ -55,7 +55,7 @@ pub enum TlsRootStore {
     BackendDefault,
     /// Use the bundled Mozilla roots from `webpki-roots`.
     ///
-    /// This is unsupported by the async `native-tls` backend.
+    /// This is unsupported by `native-tls` backends.
     WebPki,
     /// Use the operating system trust store.
     System,

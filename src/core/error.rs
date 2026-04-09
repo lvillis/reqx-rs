@@ -152,8 +152,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// All currently defined error codes.
-    pub const ALL: [Self; 30] = [
+    const ALL: &'static [Self] = &[
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
         Self::InvalidProxyConfig,
@@ -188,7 +187,7 @@ impl ErrorCode {
 
     /// Returns a slice of all currently defined error codes.
     pub const fn all() -> &'static [Self] {
-        &Self::ALL
+        Self::ALL
     }
 
     /// Returns the stable string form of this error code.

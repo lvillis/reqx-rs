@@ -154,6 +154,22 @@ impl Write for FailingWriter {
     }
 }
 
+#[derive(Default)]
+struct FlushFailingWriter {
+    written: Vec<u8>,
+}
+
+impl Write for FlushFailingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("flush failed"))
+    }
+}
+
 struct BlockingProxyServer {
     uri: String,
     served: Arc<AtomicUsize>,
@@ -626,6 +642,7 @@ fn blocking_buffered_request_accept_encoding_can_be_disabled_per_request() {
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build()
         .expect("client should build");
 
@@ -652,6 +669,7 @@ fn blocking_head_empty_body_with_content_encoding_is_not_decoded() {
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build()
         .expect("client should build");
 
@@ -1751,6 +1769,7 @@ fn blocking_build_rejects_base_url_with_query() {
     }
 }
 
+#[cfg(not(feature = "blocking-tls-native"))]
 #[test]
 fn blocking_tls_root_store_system_accepts_custom_roots() {
     let custom_der = rustls_native_certs::load_native_certs()
@@ -1767,6 +1786,47 @@ fn blocking_tls_root_store_system_accepts_custom_roots() {
         .tls_root_ca_der(custom_der)
         .build();
     result.expect("system root store should allow appending custom roots");
+}
+
+#[cfg(feature = "blocking-tls-native")]
+#[test]
+fn blocking_native_tls_system_roots_cannot_be_extended_with_custom_roots() {
+    let result = Client::builder("https://api.example.com")
+        .tls_backend(reqx::TlsBackend::NativeTls)
+        .tls_root_store(TlsRootStore::System)
+        .tls_root_ca_der([1_u8, 2, 3, 4])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("blocking native tls should reject system roots plus custom roots"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("cannot combine system roots"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "blocking-tls-native")]
+#[test]
+fn blocking_native_tls_webpki_root_store_is_rejected() {
+    let result = Client::builder("https://api.example.com")
+        .tls_backend(reqx::TlsBackend::NativeTls)
+        .tls_root_store(TlsRootStore::WebPki)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("blocking native tls should reject webpki root store"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::WebPki"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
@@ -1968,6 +2028,53 @@ fn blocking_read_chunk_eof_marks_success_not_canceled() {
 }
 
 #[test]
+fn blocking_zero_length_read_chunk_does_not_mark_success() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"chunk-body".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/stream-read-empty-chunk")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let mut empty = [];
+    let read = stream
+        .read_chunk(&mut empty)
+        .expect("zero-length read should be a no-op");
+    assert_eq!(read, 0);
+
+    let in_flight_metrics = client.metrics_snapshot();
+    assert_eq!(in_flight_metrics.requests.started, 1);
+    assert_eq!(in_flight_metrics.requests.succeeded, 0);
+    assert_eq!(in_flight_metrics.requests.failed, 0);
+    assert_eq!(in_flight_metrics.requests.canceled, 0);
+    assert_eq!(in_flight_metrics.requests.in_flight, 1);
+
+    let mut out = Vec::new();
+    stream
+        .read_to_end(&mut out)
+        .expect("body should still be readable after zero-length read");
+    assert_eq!(out, b"chunk-body".to_vec());
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 0);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.in_flight, 0);
+}
+
+#[test]
 fn blocking_read_trait_eof_marks_success_not_canceled() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -1991,6 +2098,53 @@ fn blocking_read_trait_eof_marks_success_not_canceled() {
     stream
         .read_to_end(&mut out)
         .expect("body read should succeed");
+    assert_eq!(out, b"handoff-body".to_vec());
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 0);
+    assert_eq!(metrics.requests.canceled, 0);
+    assert_eq!(metrics.requests.in_flight, 0);
+}
+
+#[test]
+fn blocking_zero_length_read_trait_does_not_mark_success() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"handoff-body".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/stream-read-empty-trait")
+        .send_stream()
+        .expect("stream request should succeed");
+
+    let mut empty = [];
+    let read = stream
+        .read(&mut empty)
+        .expect("zero-length trait read should be a no-op");
+    assert_eq!(read, 0);
+
+    let in_flight_metrics = client.metrics_snapshot();
+    assert_eq!(in_flight_metrics.requests.started, 1);
+    assert_eq!(in_flight_metrics.requests.succeeded, 0);
+    assert_eq!(in_flight_metrics.requests.failed, 0);
+    assert_eq!(in_flight_metrics.requests.canceled, 0);
+    assert_eq!(in_flight_metrics.requests.in_flight, 1);
+
+    let mut out = Vec::new();
+    stream
+        .read_to_end(&mut out)
+        .expect("body should still be readable after zero-length trait read");
     assert_eq!(out, b"handoff-body".to_vec());
 
     let metrics = client.metrics_snapshot();
@@ -2371,6 +2525,7 @@ fn blocking_send_stream_keeps_raw_bytes_and_decode_is_explicit() {
     let client = Client::builder(server.base_url.clone())
         .request_timeout(Duration::from_secs(1))
         .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
         .build()
         .expect("client should build");
 
@@ -2409,6 +2564,18 @@ fn blocking_send_stream_keeps_raw_bytes_and_decode_is_explicit() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].headers.get("accept-encoding"), None);
     assert_eq!(requests[1].headers.get("accept-encoding"), None);
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests.started, 2);
+    assert_eq!(metrics.requests.succeeded, 1);
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(
+        metrics
+            .errors
+            .by_code
+            .get(&ErrorCode::DecodeContentEncoding),
+        Some(&1)
+    );
 }
 
 #[test]
@@ -2611,6 +2778,45 @@ fn blocking_download_to_writer_reports_write_body_error() {
     }
 
     let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests.failed, 1);
+    assert_eq!(metrics.errors.write_body, 1);
+    assert_eq!(metrics.errors.by_code.get(&ErrorCode::WriteBody), Some(&1));
+}
+
+#[test]
+fn blocking_download_to_writer_flush_failure_marks_request_failed() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"flush-fail".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let mut output = FlushFailingWriter::default();
+    let error = client
+        .get("/v1/download-flush-fail")
+        .download_to_writer(&mut output)
+        .expect_err("download_to_writer should surface flush failures as write_body");
+
+    match error {
+        Error::WriteBody { method, uri, .. } => {
+            assert_eq!(method.as_str(), "GET");
+            assert!(uri.contains("/v1/download-flush-fail"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    assert_eq!(output.written, b"flush-fail".to_vec());
+
+    let metrics = client.metrics_snapshot();
+    assert_eq!(metrics.requests.started, 1);
+    assert_eq!(metrics.requests.succeeded, 0);
     assert_eq!(metrics.requests.failed, 1);
     assert_eq!(metrics.errors.write_body, 1);
     assert_eq!(metrics.errors.by_code.get(&ErrorCode::WriteBody), Some(&1));

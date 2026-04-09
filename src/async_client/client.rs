@@ -707,6 +707,14 @@ fn build_rustls_aws_lc_rs_transport(
 }
 
 #[cfg(feature = "async-tls-native")]
+fn native_tls_protocol(version: TlsVersion) -> hyper_tls::native_tls::Protocol {
+    match version {
+        TlsVersion::V1_2 => hyper_tls::native_tls::Protocol::Tlsv12,
+        TlsVersion::V1_3 => hyper_tls::native_tls::Protocol::Tlsv13,
+    }
+}
+
+#[cfg(feature = "async-tls-native")]
 fn apply_native_tls_protocol_versions(
     connector_builder: &mut hyper_tls::native_tls::TlsConnectorBuilder,
     tls_options: &TlsOptions,
@@ -716,22 +724,15 @@ fn apply_native_tls_protocol_versions(
         return Ok(());
     }
 
-    match (bounds.min, bounds.max) {
-        (Some(TlsVersion::V1_2), Some(TlsVersion::V1_2)) | (None, Some(TlsVersion::V1_2)) => {
-            connector_builder.min_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
-            connector_builder.max_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
-            Ok(())
-        }
-        (Some(TlsVersion::V1_2), None) => {
-            connector_builder.min_protocol_version(Some(hyper_tls::native_tls::Protocol::Tlsv12));
-            Ok(())
-        }
-        (Some(TlsVersion::V1_3), _) | (_, Some(TlsVersion::V1_3)) => Err(tls_config_error(
-            TlsBackend::NativeTls,
-            "async native-tls backend currently supports only explicit TLS 1.2 constraints via tls_version(TlsVersion::V1_2), tls_min_version(TlsVersion::V1_2), or tls_max_version(TlsVersion::V1_2)",
-        )),
-        (None, None) => Ok(()),
+    if let Some(min) = bounds.min {
+        connector_builder.min_protocol_version(Some(native_tls_protocol(min)));
     }
+
+    if let Some(max) = bounds.max {
+        connector_builder.max_protocol_version(Some(native_tls_protocol(max)));
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "async-tls-native")]
@@ -1403,7 +1404,7 @@ impl ClientBuilder {
     /// Selects the TLS backend used by this client.
     ///
     /// Async `rustls` backends support TLS version bounds. Async `native-tls`
-    /// supports only explicit TLS 1.2 constraints and rejects
+    /// maps configured version bounds onto the platform TLS stack and rejects
     /// [`TlsRootStore::WebPki`] at build time.
     pub fn tls_backend(mut self, tls_backend: TlsBackend) -> Self {
         self.tls_backend = tls_backend;
@@ -1413,8 +1414,8 @@ impl ClientBuilder {
     /// Pins both the minimum and maximum TLS version to `version`.
     ///
     /// Async `rustls` backends accept both [`TlsVersion::V1_2`] and
-    /// [`TlsVersion::V1_3`]. Async `native-tls` currently accepts only
-    /// [`TlsVersion::V1_2`].
+    /// [`TlsVersion::V1_3`]. Async `native-tls` forwards the configured range
+    /// to the underlying platform TLS implementation.
     pub fn tls_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.min_protocol_version = Some(version);
         self.tls_options.max_protocol_version = Some(version);
@@ -1423,7 +1424,8 @@ impl ClientBuilder {
 
     /// Sets the minimum TLS version accepted for outbound connections.
     ///
-    /// Async `native-tls` currently accepts only [`TlsVersion::V1_2`].
+    /// Async `native-tls` forwards the configured range to the underlying
+    /// platform TLS implementation.
     pub fn tls_min_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.min_protocol_version = Some(version);
         self
@@ -1431,7 +1433,8 @@ impl ClientBuilder {
 
     /// Sets the maximum TLS version accepted for outbound connections.
     ///
-    /// Async `native-tls` currently accepts only [`TlsVersion::V1_2`].
+    /// Async `native-tls` forwards the configured range to the underlying
+    /// platform TLS implementation.
     pub fn tls_max_version(mut self, version: TlsVersion) -> Self {
         self.tls_options.max_protocol_version = Some(version);
         self

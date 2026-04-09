@@ -13,6 +13,7 @@ use crate::content_encoding::{
 };
 use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
+use crate::util::is_timeout_io_error;
 
 use super::{
     Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
@@ -25,12 +26,7 @@ fn map_read_error(
     uri: &str,
     timeout_ms: u128,
 ) -> Error {
-    if let Some(ureq_error) = source
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
-        && let ureq::Error::Timeout(timeout) = ureq_error
-    {
-        let _ = timeout;
+    if is_timeout_io_error(&source) {
         return Error::Timeout {
             phase: TimeoutPhase::ResponseBody,
             timeout_ms,
@@ -235,10 +231,14 @@ impl BlockingResponseStream {
         Ok(())
     }
 
-    /// Reads the next chunk of body bytes into `buffer`.
-    ///
-    /// Returns `0` at end of stream.
-    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
+    fn read_chunk_internal(
+        &mut self,
+        buffer: &mut [u8],
+        complete_success_on_eof: bool,
+    ) -> crate::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         if let Err(error) = self.ensure_within_deadline() {
             self.complete_error(&error);
             return Err(error);
@@ -255,7 +255,7 @@ impl BlockingResponseStream {
                     self.complete_error(&error);
                     return Err(error);
                 }
-                if read == 0 {
+                if read == 0 && complete_success_on_eof {
                     self.complete_success();
                 }
                 Ok(read)
@@ -265,6 +265,13 @@ impl BlockingResponseStream {
                 Err(error)
             }
         }
+    }
+
+    /// Reads the next chunk of body bytes into `buffer`.
+    ///
+    /// Returns `0` at end of stream.
+    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> crate::Result<usize> {
+        self.read_chunk_internal(buffer, true)
     }
 
     fn write_chunk<W>(&mut self, writer: &mut W, chunk: &[u8]) -> crate::Result<()>
@@ -301,7 +308,7 @@ impl BlockingResponseStream {
         let mut chunk = [0_u8; 8192];
         let mut copied = 0_u64;
         loop {
-            let read = self.read_chunk(&mut chunk)?;
+            let read = self.read_chunk_internal(&mut chunk, false)?;
             if read == 0 {
                 break;
             }
@@ -326,7 +333,7 @@ impl BlockingResponseStream {
         let mut chunk = [0_u8; 8192];
         let mut copied = 0_u64;
         loop {
-            let read = self.read_chunk(&mut chunk)?;
+            let read = self.read_chunk_internal(&mut chunk, false)?;
             if read == 0 {
                 break;
             }
@@ -351,7 +358,7 @@ impl BlockingResponseStream {
         let mut total_len = 0_usize;
 
         loop {
-            let read = self.read_chunk(&mut chunk)?;
+            let read = self.read_chunk_internal(&mut chunk, false)?;
             if read == 0 {
                 break;
             }
@@ -377,7 +384,7 @@ impl BlockingResponseStream {
         let mut total_len = 0_usize;
 
         loop {
-            let read = self.read_chunk(&mut chunk)?;
+            let read = self.read_chunk_internal(&mut chunk, false)?;
             if read == 0 {
                 break;
             }

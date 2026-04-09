@@ -99,12 +99,14 @@
 //!   `Client::builder(...).tls_version(...)`,
 //!   `Client::builder(...).tls_min_version(...)`, and
 //!   `Client::builder(...).tls_max_version(...)`.
-//! - Async `native-tls` currently supports only explicit TLS 1.2 constraints
-//!   and does not support [`TlsRootStore::WebPki`].
+//! - `native-tls` backends do not support [`TlsRootStore::WebPki`].
+//! - Async `native-tls` forwards TLS version bounds to the platform TLS stack.
 //! - Blocking `ureq` transport currently rejects TLS version bounds at
 //!   `build()` time.
 //! - Custom root CAs require [`TlsRootStore::System`] or
 //!   [`TlsRootStore::Specific`].
+//! - Blocking `native-tls` cannot merge custom root CAs into the system trust
+//!   store; use [`TlsRootStore::Specific`] when adding explicit roots there.
 
 #[cfg(all(
     feature = "strict-feature-guards",

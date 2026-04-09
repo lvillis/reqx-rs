@@ -261,6 +261,61 @@ impl Drop for SplitBodyServer {
     }
 }
 
+struct TruncatedBodyServer {
+    base_url: String,
+    join: Option<JoinHandle<()>>,
+}
+
+impl TruncatedBodyServer {
+    fn start(status: u16, declared_length: usize, body_prefix: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated body server");
+        let address = listener
+            .local_addr()
+            .expect("read truncated body server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set truncated body listener nonblocking");
+
+        let join = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = read_request(&mut stream);
+                        let head = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            status,
+                            status_text(status),
+                            declared_length
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body_prefix);
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            base_url: format!("http://{address}"),
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for TruncatedBodyServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 struct ChunkedBodyServer {
     base_url: String,
     join: Option<JoinHandle<()>>,
@@ -1948,6 +2003,36 @@ async fn send_stream_into_body_collect_reports_response_body_timeout() {
             assert_eq!(*phase, TimeoutPhase::ResponseBody);
             assert!(uri.contains("/slow-stream-collect"));
         }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_async_read_reports_unexpected_eof_for_truncated_body() {
+    let server = TruncatedBodyServer::start(200, 6, b"ok".to_vec());
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/truncated-stream")
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let mut body = Vec::new();
+    let error = stream
+        .read_to_end(&mut body)
+        .await
+        .expect_err("truncated body should surface an async read error");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    let inner = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+        .expect("io error should retain original reqx::Error");
+    match inner {
+        Error::ReadBody { .. } => {}
         other => panic!("unexpected error variant: {other}"),
     }
 }

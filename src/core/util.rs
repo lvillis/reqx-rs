@@ -1,3 +1,4 @@
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -46,6 +47,17 @@ pub(crate) fn ensure_accept_encoding_async(method: &Method, headers: &mut Header
 #[cfg(feature = "_blocking")]
 pub(crate) fn ensure_accept_encoding_blocking(method: &Method, headers: &mut HeaderMap) {
     ensure_accept_encoding(method, headers, "gzip, br, deflate, zstd");
+}
+
+#[cfg(feature = "_blocking")]
+pub(crate) fn is_timeout_io_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) || error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ureq::Error>())
+        .is_some_and(|source| matches!(source, ureq::Error::Timeout(_)))
 }
 
 fn invalid_base_url_error(base_url: &str) -> Error {
@@ -413,6 +425,15 @@ fn classify_transport_error_source(
     is_connect_path: bool,
 ) -> Option<TransportErrorKind> {
     if let Some(error) = error.downcast_ref::<io::Error>() {
+        if let Some(source) = error.get_ref()
+            && let Some(TransportErrorKind::Tls) =
+                classify_transport_error_source_chain(source, is_connect_path)
+        {
+            // TLS libraries are often wrapped inside io::Error by connector stacks.
+            // Keep the handshake/certificate classification instead of downgrading
+            // it to a generic read/connect bucket derived from io::ErrorKind.
+            return Some(TransportErrorKind::Tls);
+        }
         return classify_io_transport_error_kind(error.kind(), is_connect_path);
     }
 
@@ -466,7 +487,10 @@ fn classify_io_transport_error_kind(
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::NotConnected
-        | io::ErrorKind::AddrNotAvailable => Some(TransportErrorKind::Connect),
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NetworkDown => Some(TransportErrorKind::Connect),
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::BrokenPipe
         | io::ErrorKind::UnexpectedEof => Some(TransportErrorKind::Read),

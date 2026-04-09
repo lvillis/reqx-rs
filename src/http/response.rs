@@ -249,11 +249,54 @@ pub(super) fn map_decode_body_error(
 
 #[cfg(any(feature = "_async", feature = "_blocking"))]
 fn stream_read_io_error_kind(error: &Error) -> io::ErrorKind {
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
+    fn io_error_kind_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<io::ErrorKind> {
+        let mut current = Some(error);
+        while let Some(source) = current {
+            if let Some(io_error) = source.downcast_ref::<io::Error>() {
+                return Some(io_error.kind());
+            }
+            current = source.source();
+        }
+        None
+    }
+
+    #[cfg(feature = "_async")]
+    fn async_stream_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<io::ErrorKind> {
+        if let Some(kind) = io_error_kind_in_chain(error) {
+            return Some(kind);
+        }
+
+        let hyper_error = error.downcast_ref::<hyper::Error>()?;
+        if hyper_error.is_timeout() {
+            return Some(io::ErrorKind::TimedOut);
+        }
+        if hyper_error.is_incomplete_message()
+            || hyper_error.is_closed()
+            || hyper_error.is_shutdown()
+        {
+            return Some(io::ErrorKind::UnexpectedEof);
+        }
+        if hyper_error.is_body_write_aborted() {
+            return Some(io::ErrorKind::BrokenPipe);
+        }
+
+        None
+    }
+
     match error {
         Error::Timeout { .. } | Error::DeadlineExceeded { .. } => io::ErrorKind::TimedOut,
-        Error::ReadBody { source } | Error::WriteBody { source, .. } => source
-            .downcast_ref::<io::Error>()
-            .map_or(io::ErrorKind::Other, io::Error::kind),
+        Error::ReadBody { source } => {
+            #[cfg(feature = "_async")]
+            if let Some(kind) = async_stream_error_kind(source.as_ref()) {
+                return kind;
+            }
+
+            io_error_kind_in_chain(source.as_ref()).unwrap_or(io::ErrorKind::Other)
+        }
+        Error::WriteBody { source, .. } => {
+            io_error_kind_in_chain(source.as_ref()).unwrap_or(io::ErrorKind::Other)
+        }
         _ => io::ErrorKind::Other,
     }
 }

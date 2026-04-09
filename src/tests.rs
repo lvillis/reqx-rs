@@ -23,6 +23,8 @@ use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
 use crate::tls::{TlsBackend, TlsOptions, TlsRootStore, TlsVersion, tls_version_bounds};
+#[cfg(feature = "_blocking")]
+use crate::util::is_timeout_io_error;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
@@ -433,6 +435,18 @@ fn classify_transport_error_source_chain_prefers_structured_io_errors() {
         classify_transport_error_source_for_test(&read, false),
         Some(TransportErrorKind::Read)
     );
+
+    let host_unreachable = io::Error::new(io::ErrorKind::HostUnreachable, "host unreachable");
+    assert_eq!(
+        classify_transport_error_source_for_test(&host_unreachable, true),
+        Some(TransportErrorKind::Connect)
+    );
+
+    let network_down = io::Error::new(io::ErrorKind::NetworkDown, "network down");
+    assert_eq!(
+        classify_transport_error_source_for_test(&network_down, true),
+        Some(TransportErrorKind::Connect)
+    );
 }
 
 #[cfg(all(
@@ -449,6 +463,26 @@ fn classify_transport_error_source_chain_detects_rustls_errors() {
     };
     assert_eq!(
         classify_transport_error_source_for_test(&tls_error, true),
+        Some(TransportErrorKind::Tls)
+    );
+}
+
+#[cfg(all(
+    feature = "_async",
+    any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs"
+    )
+))]
+#[test]
+fn classify_transport_error_source_chain_prefers_nested_tls_over_io_kind() {
+    let tls_io = io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        rustls::Error::General("handshake failed".into()),
+    );
+
+    assert_eq!(
+        classify_transport_error_source_for_test(&tls_io, true),
         Some(TransportErrorKind::Tls)
     );
 }
@@ -801,19 +835,15 @@ fn selecting_tls_version_for_native_tls12_builds() {
 
 #[cfg(feature = "async-tls-native")]
 #[test]
-fn selecting_tls13_bounds_for_native_tls_returns_tls_config_error() {
-    let result = Client::builder("https://example.com")
+fn selecting_tls13_bounds_for_native_tls_builds() {
+    let client = Client::builder("https://example.com")
         .tls_backend(TlsBackend::NativeTls)
+        .tls_min_version(TlsVersion::V1_2)
         .tls_max_version(TlsVersion::V1_3)
-        .build();
+        .build()
+        .expect("native tls client should build with tls 1.2..=1.3 bounds");
 
-    match result {
-        Ok(_) => panic!("native tls should reject unsupported tls 1.3 bounds"),
-        Err(Error::TlsConfig { message, .. }) => {
-            assert!(message.contains("TLS 1.2 constraints"));
-        }
-        Err(other) => panic!("unexpected error: {other}"),
-    }
+    assert_eq!(client.tls_backend(), TlsBackend::NativeTls);
 }
 
 #[test]
@@ -839,6 +869,22 @@ fn error_safe_request_accessors_return_method_uri_and_path() {
         Some("https://api.example.com/v1/items")
     );
     assert_eq!(error.request_path().as_deref(), Some("/v1/items"));
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_timeout_io_error_helper_detects_plain_and_wrapped_timeouts() {
+    let plain = std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out");
+    assert!(is_timeout_io_error(&plain));
+
+    let would_block = std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block");
+    assert!(is_timeout_io_error(&would_block));
+
+    let wrapped = std::io::Error::other(ureq::Error::Timeout(ureq::Timeout::RecvBody));
+    assert!(is_timeout_io_error(&wrapped));
+
+    let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+    assert!(!is_timeout_io_error(&reset));
 }
 
 #[test]
@@ -1282,6 +1328,25 @@ fn native_tls_webpki_root_store_is_rejected() {
         .build();
     let error = match result {
         Ok(_) => panic!("native tls should reject webpki root store"),
+        Err(error) => error,
+    };
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::WebPki"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "blocking-tls-native")]
+#[test]
+fn blocking_native_tls_webpki_root_store_is_rejected() {
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .tls_backend(TlsBackend::NativeTls)
+        .tls_root_store(TlsRootStore::WebPki)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("blocking native tls should reject webpki root store"),
         Err(error) => error,
     };
     match error {
