@@ -11,6 +11,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Bump rust version
+- Release reqx version 0.1.32
 ## [0.1.31] - 2026-03-31
 
 ### 🚜 Refactor
