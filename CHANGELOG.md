@@ -1,3 +1,16 @@
+## [0.1.32] - 2026-04-09
+
+### 🐛 Bug Fixes
+
+- [**breaking**] Harden stream lifecycle, upload resume, and TLS error handling
+
+### ⚡ Performance
+
+- Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump rust version
 ## [0.1.31] - 2026-03-31
 
 ### 🚜 Refactor
@@ -8,6 +21,7 @@
 
 - *(docs)* Document public APIs and enforce missing-docs
 - Polish rustdoc navigation and feature docs
+- Release reqx version 0.1.31
 ## [0.1.30] - 2026-03-30
 
 ### ⚙️ Miscellaneous Tasks
