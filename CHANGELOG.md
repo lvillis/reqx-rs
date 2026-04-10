@@ -1,3 +1,13 @@
+## [0.1.34] - 2026-04-10
+
+### 🐛 Bug Fixes
+
+- Harden URI validation, redirect handling, and proxy safety
+## [0.1.33] - 2026-04-09
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.33
 ## [0.1.32] - 2026-04-09
 
 ### 🐛 Bug Fixes
