@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::extensions::Clock;
-use crate::util::lock_unpoisoned;
+use crate::util::{lock_unpoisoned, normalize_host_key};
 
 const PER_HOST_RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(300);
 const PER_HOST_RATE_LIMIT_MAX_ENTRIES: usize = 1024;
@@ -283,7 +283,7 @@ impl RateLimiter {
 
     pub(crate) fn acquire_delay(&self, host: Option<&str>) -> Duration {
         let now = self.clock.now_monotonic();
-        let host_key = host.map(|item| item.to_ascii_lowercase());
+        let host_key = host.and_then(normalize_host_key);
 
         let mut global_bucket = self.global.as_ref().map(lock_unpoisoned);
         let mut per_host = lock_unpoisoned(&self.per_host);
@@ -355,7 +355,7 @@ impl RateLimiter {
         configured_scope: ServerThrottleScope,
         header_scope_hint: Option<ServerThrottleScope>,
     ) -> ServerThrottleScope {
-        let host_key = host.map(|item| item.to_ascii_lowercase());
+        let host_key = host.and_then(normalize_host_key);
         let resolved_scope = resolve_server_throttle_scope(
             configured_scope,
             header_scope_hint,
@@ -582,6 +582,30 @@ mod tests {
             None,
         );
         assert!(limiter.acquire_delay(Some("api.example.com")) >= Duration::from_millis(110));
+    }
+
+    #[test]
+    fn throttle_delay_normalizes_trailing_dot_host_bucket() {
+        let clock = Arc::new(TestClock::default());
+        let limiter = RateLimiter::new(
+            None,
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(100.0)
+                    .burst(10)
+                    .max_throttle_delay(Duration::from_millis(500)),
+            ),
+            clock,
+        )
+        .expect("per-host limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api.example.com"),
+            Duration::from_millis(120),
+            ServerThrottleScope::Auto,
+            None,
+        );
+        assert!(limiter.acquire_delay(Some("api.example.com.")) >= Duration::from_millis(110));
     }
 
     #[test]

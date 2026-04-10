@@ -9,7 +9,7 @@ use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
     deadline_exceeded_error, is_redirect_status, parse_retry_after_capped, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, same_origin,
-    sanitize_headers_for_redirect, total_timeout_expired, truncate_body,
+    sanitize_headers_for_redirect, total_timeout_expired, truncate_body, validate_base_url,
 };
 
 #[derive(Debug)]
@@ -57,7 +57,9 @@ pub(crate) fn select_base_url(
     path: &str,
     configured_base_url: &str,
 ) -> crate::Result<String> {
-    endpoint_selector.select_base_url(method, path, configured_base_url)
+    let selected = endpoint_selector.select_base_url(method, path, configured_base_url)?;
+    validate_base_url(&selected)?;
+    Ok(selected)
 }
 
 pub(crate) fn status_retry_decision(

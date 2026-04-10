@@ -22,7 +22,10 @@ use tower_service::Service;
 use url::Url;
 
 use crate::error::Error;
-use crate::util::default_port;
+use crate::util::{
+    default_port, is_valid_absolute_http_uri_text, normalize_host_key,
+    redact_uri_without_url_normalization,
+};
 
 #[cfg(feature = "_async")]
 pub(crate) type BoxConnectError = Box<dyn StdError + Send + Sync>;
@@ -42,6 +45,17 @@ pub(crate) enum NoProxyRule {
 
 impl NoProxyRule {
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        fn looks_like_url_rule(value: &str) -> bool {
+            let bytes = value.as_bytes();
+            value.contains("://")
+                || bytes
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http:"))
+                || bytes
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https:"))
+        }
+
         let mut candidate = text.trim().to_owned();
         let mut port = None;
         if candidate.is_empty() {
@@ -53,8 +67,23 @@ impl NoProxyRule {
         if let Ok(url) = Url::parse(&candidate)
             && let Some(host) = url.host_str()
         {
+            if !matches!(url.scheme(), "http" | "https")
+                || !is_valid_absolute_http_uri_text(&candidate)
+            {
+                return None;
+            }
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+            {
+                return None;
+            }
             candidate = host.to_owned();
             port = url.port();
+        } else if looks_like_url_rule(&candidate) {
+            return None;
         }
         candidate = candidate.trim_start_matches('.').to_owned();
         if candidate.is_empty() {
@@ -80,11 +109,8 @@ impl NoProxyRule {
             port = Some(raw_port.parse::<u16>().ok()?);
             candidate = host.to_owned();
         }
-        if candidate.is_empty() {
-            return None;
-        }
         Some(Self::Domain {
-            host: candidate.to_ascii_lowercase(),
+            host: normalize_host_key(&candidate)?,
             port,
         })
     }
@@ -96,7 +122,10 @@ impl NoProxyRule {
                 host: domain,
                 port: rule_port,
             } => {
-                let host_matches = host == domain || host.ends_with(&format!(".{domain}"));
+                let Some(host) = normalize_host_key(host) else {
+                    return false;
+                };
+                let host_matches = host == *domain || host.ends_with(&format!(".{domain}"));
                 if !host_matches {
                     return false;
                 }
@@ -110,20 +139,21 @@ impl NoProxyRule {
     }
 }
 
+pub(crate) fn redact_no_proxy_rule_for_logs(rule: &str) -> String {
+    redact_uri_without_url_normalization(rule.trim())
+}
+
 pub(crate) fn should_bypass_proxy_uri(no_proxy_rules: &[NoProxyRule], uri: &Uri) -> bool {
     let Some(host) = uri.host() else {
         return false;
     };
-    let normalized = host.to_ascii_lowercase();
     let port = uri.port_u16().or_else(|| default_port(uri));
-    no_proxy_rules
-        .iter()
-        .any(|rule| rule.matches(&normalized, port))
+    no_proxy_rules.iter().any(|rule| rule.matches(host, port))
 }
 
 pub(crate) fn parse_no_proxy_rule(rule: &str) -> crate::Result<NoProxyRule> {
     NoProxyRule::parse(rule).ok_or_else(|| Error::InvalidNoProxyRule {
-        rule: rule.to_owned(),
+        rule: redact_no_proxy_rule_for_logs(rule),
     })
 }
 

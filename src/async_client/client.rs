@@ -59,7 +59,8 @@ use crate::policy::{Interceptor, RedirectPolicy, RequestContext, StatusPolicy};
 ))]
 use crate::proxy::ProxyConnector;
 use crate::proxy::{
-    NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules, should_bypass_proxy_uri,
+    NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules,
+    redact_no_proxy_rule_for_logs, should_bypass_proxy_uri,
 };
 use crate::rate_limit::{
     RateLimitPolicy, RateLimiter, ServerThrottleScope, resolve_server_throttle_scope,
@@ -1238,6 +1239,9 @@ impl ClientBuilder {
     }
 
     /// Routes requests through the given HTTP proxy.
+    ///
+    /// Async transport does not read proxy credentials from the URI. Use
+    /// [`Self::proxy_authorization`] for HTTP proxy authentication.
     pub fn http_proxy(mut self, proxy_uri: Uri) -> Self {
         self.http_proxy = Some(proxy_uri);
         self
@@ -1268,7 +1272,9 @@ impl ClientBuilder {
             let raw = rule.as_ref();
             match NoProxyRule::parse(raw) {
                 Some(rule) => self.no_proxy_rules.push(rule),
-                None => self.invalid_no_proxy_rules.push(raw.to_owned()),
+                None => self
+                    .invalid_no_proxy_rules
+                    .push(redact_no_proxy_rule_for_logs(raw)),
             }
         }
         self
@@ -1291,7 +1297,8 @@ impl ClientBuilder {
         if let Some(rule) = NoProxyRule::parse(raw) {
             self.no_proxy_rules.push(rule);
         } else {
-            self.invalid_no_proxy_rules.push(raw.to_owned());
+            self.invalid_no_proxy_rules
+                .push(redact_no_proxy_rule_for_logs(raw));
         }
         self
     }
@@ -1682,6 +1689,15 @@ impl ClientBuilder {
         validate_base_url(&self.base_url)?;
         if let Some(proxy_uri) = self.http_proxy.as_ref() {
             validate_http_proxy_uri(proxy_uri)?;
+            let proxy_uri_has_credentials = proxy_uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'));
+            if proxy_uri_has_credentials {
+                return Err(Error::InvalidProxyConfig {
+                    proxy_uri: redact_uri_for_logs(&proxy_uri.to_string()),
+                    message: "async http_proxy URI must not include credentials; use proxy_authorization(...) for HTTP proxy authentication".to_owned(),
+                });
+            }
         }
         if self.proxy_authorization.is_some() && self.http_proxy.is_none() {
             return Err(Error::ProxyAuthorizationRequiresHttpProxy);
@@ -2815,8 +2831,10 @@ impl Client {
                 }
             };
             let mut attempt_headers = current_headers.clone();
-            self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
             self.run_request_interceptors(&context, &mut attempt_headers);
+            // Never forward hop-by-hop proxy credentials to origin servers.
+            attempt_headers.remove(PROXY_AUTHORIZATION);
+            self.apply_http_proxy_auth_header(&current_uri, &mut attempt_headers);
             let request_body = if let Some(body) = &buffered_body {
                 buffered_req_body(body.clone())
             } else {

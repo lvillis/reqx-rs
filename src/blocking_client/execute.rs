@@ -852,16 +852,6 @@ impl Client {
         if proxy_config.authorization.is_none() {
             return Ok(());
         }
-        let proxy_uri_has_credentials = proxy_config
-            .uri
-            .authority()
-            .is_some_and(|authority| authority.as_str().contains('@'));
-        if proxy_uri_has_credentials {
-            // ureq applies CONNECT proxy auth from proxy URI credentials.
-            // Avoid forwarding Proxy-Authorization on end-to-end request messages.
-            return Ok(());
-        }
-
         Err(Error::InvalidProxyConfig {
             proxy_uri: redact_uri_for_logs(&proxy_config.uri.to_string()),
             message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
@@ -1201,6 +1191,8 @@ impl Client {
             };
             let mut attempt_headers = current_headers.clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
+            // Never forward hop-by-hop proxy credentials to origin servers.
+            attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
             let current_uri_text = current_uri.to_string();
 
             let mut response = match self.run_once(

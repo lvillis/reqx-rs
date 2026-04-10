@@ -12,6 +12,7 @@ mod enabled {
 
     use crate::error::Error;
     use crate::extensions::OtelPathNormalizer;
+    use crate::util::normalize_host_key;
 
     #[derive(Clone, Debug, Default)]
     pub(crate) struct OtelTelemetry {
@@ -235,7 +236,8 @@ mod enabled {
                 attributes.push(KeyValue::new("url.scheme", scheme.to_owned()));
             }
             if let Some(host) = parsed.host() {
-                attributes.push(KeyValue::new("server.address", host.to_owned()));
+                let host = normalize_host_key(host).unwrap_or_else(|| host.to_owned());
+                attributes.push(KeyValue::new("server.address", host));
             }
             if let Some(port) = parsed.port_u16() {
                 attributes.push(KeyValue::new("server.port", i64::from(port)));
@@ -295,6 +297,21 @@ mod enabled {
                 .find(|item| item.key.as_str() == "url.path")
                 .map(|item| item.value.to_string());
             assert_eq!(normalized.as_deref(), Some("/normalized"));
+        }
+
+        #[test]
+        fn request_span_attributes_normalize_trailing_dot_server_address() {
+            let attributes = request_span_attributes(
+                "sdk",
+                &FixedPathNormalizer,
+                &http::Method::GET,
+                "https://api.example.com./v1/orders",
+            );
+            let server_address = attributes
+                .iter()
+                .find(|item| item.key.as_str() == "server.address")
+                .map(|item| item.value.to_string());
+            assert_eq!(server_address.as_deref(), Some("api.example.com"));
         }
 
         #[test]

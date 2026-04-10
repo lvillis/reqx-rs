@@ -714,6 +714,34 @@ async fn post_without_idempotency_key_does_not_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_path_preserves_extra_leading_slashes() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+        Duration::ZERO,
+    )]);
+
+    let client = Client::builder(format!("{}/v1", server.base_url))
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response_json: Value = client
+        .get("//users")
+        .send_json()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response_json["ok"], Value::Bool(true));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1//users");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_timeout_reports_transport_phase() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -1408,6 +1436,36 @@ async fn body_stream_uploads_chunked_data_with_declared_length() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, b"hello world".to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_authorization_header_is_not_forwarded_to_origin() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/v1/direct")
+        .header(
+            HeaderName::from_static("proxy-authorization"),
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        )
+        .send()
+        .await
+        .expect("direct request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers.get("proxy-authorization"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2483,6 +2541,41 @@ async fn redirect_invalid_location_redacts_sensitive_tokens_in_error() {
     match error {
         Error::InvalidRedirectLocation { location, .. } => {
             assert_eq!(location, "https://example.com:invalid/v1/new");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_network_path_location_with_empty_port_is_rejected() {
+    let server = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![("Location", "//example.com:/v1/new?token=secret#frag")],
+        "redirect",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .send()
+        .await
+        .expect_err("invalid network-path redirect location should fail");
+    let display = error.to_string();
+    assert!(!display.contains("token=secret"));
+    assert!(!display.contains("#frag"));
+
+    match error {
+        Error::InvalidRedirectLocation { location, .. } => {
+            assert_eq!(location, "//example.com:/v1/new");
         }
         other => panic!("unexpected error: {other}"),
     }

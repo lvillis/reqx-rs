@@ -14,7 +14,10 @@ use crate::metrics::ClientMetrics;
 use crate::observe::Observer;
 use crate::otel::OtelTelemetry;
 use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
-use crate::proxy::{NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules};
+use crate::proxy::{
+    NoProxyRule, ProxyConfig, parse_no_proxy_rule, parse_no_proxy_rules,
+    redact_no_proxy_rule_for_logs,
+};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
     AdaptiveConcurrencyPolicy, CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
@@ -144,6 +147,9 @@ impl ClientBuilder {
     }
 
     /// Sets the `Proxy-Authorization` header sent to the configured HTTP proxy.
+    ///
+    /// Blocking `ureq` transport does not support this override. Use proxy URI
+    /// credentials in [`Self::http_proxy`] instead.
     pub fn proxy_authorization(mut self, mut proxy_authorization: HeaderValue) -> Self {
         proxy_authorization.set_sensitive(true);
         self.proxy_authorization = Some(proxy_authorization);
@@ -151,6 +157,9 @@ impl ClientBuilder {
     }
 
     /// Parses and sets the `Proxy-Authorization` header.
+    ///
+    /// Blocking `ureq` transport does not support this override. Use proxy URI
+    /// credentials in [`Self::http_proxy`] instead.
     pub fn try_proxy_authorization(self, proxy_authorization: &str) -> crate::Result<Self> {
         let proxy_authorization = parse_header_value("proxy-authorization", proxy_authorization)?;
         Ok(self.proxy_authorization(proxy_authorization))
@@ -168,7 +177,9 @@ impl ClientBuilder {
             let raw = rule.as_ref();
             match NoProxyRule::parse(raw) {
                 Some(rule) => self.no_proxy_rules.push(rule),
-                None => self.invalid_no_proxy_rules.push(raw.to_owned()),
+                None => self
+                    .invalid_no_proxy_rules
+                    .push(redact_no_proxy_rule_for_logs(raw)),
             }
         }
         self
@@ -191,7 +202,8 @@ impl ClientBuilder {
         if let Some(rule) = NoProxyRule::parse(raw) {
             self.no_proxy_rules.push(rule);
         } else {
-            self.invalid_no_proxy_rules.push(raw.to_owned());
+            self.invalid_no_proxy_rules
+                .push(redact_no_proxy_rule_for_logs(raw));
         }
         self
     }
@@ -550,15 +562,10 @@ impl ClientBuilder {
             let Some(proxy_uri) = self.http_proxy.as_ref() else {
                 return Err(Error::ProxyAuthorizationRequiresHttpProxy);
             };
-            let proxy_uri_has_credentials = proxy_uri
-                .authority()
-                .is_some_and(|authority| authority.as_str().contains('@'));
-            if !proxy_uri_has_credentials {
-                return Err(Error::InvalidProxyConfig {
-                    proxy_uri: redact_uri_for_logs(&proxy_uri.to_string()),
-                    message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
-                });
-            }
+            return Err(Error::InvalidProxyConfig {
+                proxy_uri: redact_uri_for_logs(&proxy_uri.to_string()),
+                message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
+            });
         }
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });

@@ -10,15 +10,21 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use http::{HeaderMap, StatusCode};
+use http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT,
+    HOST, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+};
+use http::{HeaderMap, StatusCode, header::HeaderName};
 
 use crate::advanced::{AdaptiveConcurrencyPolicy, ClientProfile, StatusPolicy};
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded_body_limited};
 use crate::error::{Error, ErrorCode, TimeoutPhase, TransportErrorKind, transport_error};
-use crate::execution::status_retry_delay;
-use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock};
+use crate::execution::{select_base_url, status_retry_delay};
+use crate::extensions::{
+    EndpointSelector, OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock,
+};
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
@@ -28,7 +34,7 @@ use crate::util::is_timeout_io_error;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
-    resolve_redirect_uri, resolve_uri, same_origin,
+    resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect,
 };
 #[cfg(feature = "_async")]
 use crate::util::{
@@ -40,6 +46,66 @@ fn join_base_path_handles_slashes() {
     assert_eq!(
         join_base_path("https://api.example.com/v1/", "/users"),
         "https://api.example.com/v1/users"
+    );
+}
+
+#[test]
+fn join_base_path_preserves_extra_leading_slashes() {
+    assert_eq!(
+        join_base_path("https://api.example.com/v1/", "//users"),
+        "https://api.example.com/v1//users"
+    );
+    assert_eq!(
+        join_base_path("https://api.example.com/v1/", "///users"),
+        "https://api.example.com/v1///users"
+    );
+}
+
+#[derive(Debug)]
+struct StaticEndpointSelector(&'static str);
+
+impl EndpointSelector for StaticEndpointSelector {
+    fn select_base_url(
+        &self,
+        _method: &http::Method,
+        _path: &str,
+        _configured_base_url: &str,
+    ) -> crate::Result<String> {
+        Ok(self.0.to_owned())
+    }
+}
+
+#[test]
+fn select_base_url_rejects_invalid_endpoint_selector_value() {
+    let selector = StaticEndpointSelector("https://api.example.com:/v1");
+    let error = select_base_url(
+        &selector,
+        &http::Method::GET,
+        "/users",
+        "https://fallback.example.com/v1",
+    )
+    .expect_err("invalid endpoint selector base url should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://api.example.com:/v1");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn join_base_path_keeps_query_and_fragment_on_base_resource() {
+    assert_eq!(
+        join_base_path("https://api.example.com/v1/", "?page=1"),
+        "https://api.example.com/v1?page=1"
+    );
+    assert_eq!(
+        join_base_path("https://api.example.com/v1/", "#section"),
+        "https://api.example.com/v1#section"
+    );
+    assert_eq!(
+        join_base_path("https://api.example.com/v1/", "?page=1#section"),
+        "https://api.example.com/v1?page=1#section"
     );
 }
 
@@ -78,6 +144,78 @@ fn resolve_uri_rejects_absolute_uri_with_userinfo() {
     match error {
         Error::InvalidUri { uri } => {
             assert_eq!(uri, "https://x.test/a");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn resolve_uri_rejects_malformed_http_absolute_uri() {
+    let error = resolve_uri("https://api.example.com/v1", "HTTPS:/x")
+        .expect_err("malformed absolute http URI should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "HTTPS:/x");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn resolve_uri_rejects_absolute_uri_with_invalid_authority() {
+    let error = resolve_uri(
+        "https://api.example.com/v1",
+        "https://example.com:invalid/v1/new?token=secret#frag",
+    )
+    .expect_err("absolute uri with invalid authority should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://example.com:invalid/v1/new");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn resolve_uri_rejects_absolute_uri_with_empty_port() {
+    let error = resolve_uri(
+        "https://api.example.com/v1",
+        "https://example.com:/v1/new?token=secret",
+    )
+    .expect_err("absolute uri with empty authority port should be rejected");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://example.com:/v1/new");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn resolve_uri_keeps_query_only_relative_on_base_resource() {
+    let (uri_text, uri) = resolve_uri("https://api.example.com/v1", "?page=1")
+        .expect("query-only relative URI should resolve against the base resource");
+    assert_eq!(uri_text, "https://api.example.com/v1?page=1");
+    assert_eq!(uri.to_string(), "https://api.example.com/v1?page=1");
+}
+
+#[test]
+fn resolve_uri_preserves_extra_leading_slashes_in_relative_path() {
+    let (uri_text, uri) = resolve_uri("https://api.example.com/v1", "//users")
+        .expect("double-slash relative path should resolve against the base resource");
+    assert_eq!(uri_text, "https://api.example.com/v1//users");
+    assert_eq!(uri.to_string(), "https://api.example.com/v1//users");
+}
+
+#[test]
+fn resolve_uri_rejects_malformed_http_absolute_uri_after_query_append() {
+    let query_pairs = vec![("page".to_owned(), "1".to_owned())];
+    let path = append_query_pairs("HTTPS:/x", &query_pairs);
+    let error = resolve_uri("https://api.example.com/v1", &path)
+        .expect_err("malformed absolute http URI should stay rejected after query append");
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "HTTPS:/x");
         }
         other => panic!("unexpected error variant: {other}"),
     }
@@ -155,8 +293,41 @@ fn rate_limit_bucket_key_uses_default_port_for_uppercase_scheme() {
 }
 
 #[test]
+fn rate_limit_bucket_key_normalizes_trailing_dot_hosts() {
+    let uri: http::Uri = "https://api.example.com./path"
+        .parse()
+        .expect("uri should parse");
+    assert_eq!(
+        rate_limit_bucket_key(&uri).as_deref(),
+        Some("api.example.com:443")
+    );
+}
+
+#[test]
+fn rate_limit_bucket_key_brackets_ipv6_hosts() {
+    let uri: http::Uri = "https://[2001:db8::1]/path"
+        .parse()
+        .expect("uri should parse");
+    assert_eq!(
+        rate_limit_bucket_key(&uri).as_deref(),
+        Some("[2001:db8::1]:443")
+    );
+}
+
+#[test]
 fn same_origin_handles_uppercase_scheme() {
     let left: http::Uri = "HTTPS://api.example.com/path"
+        .parse()
+        .expect("left uri should parse");
+    let right: http::Uri = "https://api.example.com:443/other"
+        .parse()
+        .expect("right uri should parse");
+    assert!(same_origin(&left, &right));
+}
+
+#[test]
+fn same_origin_normalizes_trailing_dot_hosts() {
+    let left: http::Uri = "https://api.example.com./path"
         .parse()
         .expect("left uri should parse");
     let right: http::Uri = "https://api.example.com:443/other"
@@ -180,6 +351,147 @@ fn resolve_redirect_uri_rejects_userinfo_location() {
         .parse()
         .expect("current uri should parse");
     assert!(resolve_redirect_uri(&current, "https://user:pass@example.com/v1/new").is_none());
+}
+
+#[test]
+fn resolve_redirect_uri_rejects_malformed_http_absolute_location() {
+    let current: http::Uri = "https://api.example.com/v1/old"
+        .parse()
+        .expect("current uri should parse");
+    assert!(resolve_redirect_uri(&current, "http:/x").is_none());
+    assert!(resolve_redirect_uri(&current, "https:/x").is_none());
+    assert!(resolve_redirect_uri(&current, "https:///x").is_none());
+    assert!(resolve_redirect_uri(&current, "http:foo").is_none());
+    assert!(resolve_redirect_uri(&current, "https://example.com:invalid/v1/new").is_none());
+}
+
+#[test]
+fn resolve_redirect_uri_rejects_network_path_location_with_empty_port() {
+    let current: http::Uri = "https://api.example.com/v1/old"
+        .parse()
+        .expect("current uri should parse");
+    assert!(resolve_redirect_uri(&current, "//example.com:/v1/new").is_none());
+}
+
+#[test]
+fn sanitize_headers_for_redirect_removes_proxy_authorization() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_ENCODING,
+        "gzip".parse().expect("content-encoding should parse"),
+    );
+    headers.insert(
+        CONTENT_LENGTH,
+        "3".parse().expect("content-length should parse"),
+    );
+    headers.insert(
+        CONTENT_TYPE,
+        "application/json"
+            .parse()
+            .expect("content-type should parse"),
+    );
+    headers.insert(EXPECT, "100-continue".parse().expect("expect should parse"));
+    headers.insert(
+        "content-digest",
+        "sha-256=:abc=:"
+            .parse()
+            .expect("content-digest should parse"),
+    );
+    headers.insert(
+        "content-md5",
+        "Q2hlY2sgSW50ZWdyaXR5IQ=="
+            .parse()
+            .expect("content-md5 should parse"),
+    );
+    headers.insert(
+        "digest",
+        "SHA-256=xyz".parse().expect("digest should parse"),
+    );
+    headers.insert(
+        TRAILER,
+        "x-checksum".parse().expect("trailer header should parse"),
+    );
+    headers.insert(
+        TRANSFER_ENCODING,
+        "chunked".parse().expect("transfer-encoding should parse"),
+    );
+    headers.insert(HOST, "api.example.com".parse().expect("host should parse"));
+    headers.insert(
+        AUTHORIZATION,
+        "Bearer token".parse().expect("authorization should parse"),
+    );
+    headers.insert(COOKIE, "session=abc".parse().expect("cookie should parse"));
+    headers.insert(
+        PROXY_AUTHORIZATION,
+        "Basic dXNlcjpwYXNz"
+            .parse()
+            .expect("proxy-authorization should parse"),
+    );
+
+    sanitize_headers_for_redirect(&mut headers, true, true);
+
+    assert!(!headers.contains_key(CONTENT_ENCODING));
+    assert!(!headers.contains_key(CONTENT_LENGTH));
+    assert!(!headers.contains_key(CONTENT_TYPE));
+    assert!(!headers.contains_key("content-digest"));
+    assert!(!headers.contains_key("content-md5"));
+    assert!(!headers.contains_key("digest"));
+    assert!(!headers.contains_key(EXPECT));
+    assert!(!headers.contains_key(TRAILER));
+    assert!(!headers.contains_key(TRANSFER_ENCODING));
+    assert!(!headers.contains_key(HOST));
+    assert!(headers.contains_key(AUTHORIZATION));
+    assert!(headers.contains_key(COOKIE));
+    assert!(!headers.contains_key(PROXY_AUTHORIZATION));
+}
+
+#[test]
+fn sanitize_headers_for_redirect_removes_hop_by_hop_headers() {
+    let mut headers = HeaderMap::new();
+    let connection_option = HeaderName::from_static("x-connection-option");
+    headers.insert(
+        CONNECTION,
+        "keep-alive, x-connection-option"
+            .parse()
+            .expect("connection header should parse"),
+    );
+    headers.insert(
+        "keep-alive",
+        "timeout=5".parse().expect("keep-alive should parse"),
+    );
+    headers.insert(
+        "proxy-connection",
+        "keep-alive".parse().expect("proxy-connection should parse"),
+    );
+    headers.insert(TE, "trailers".parse().expect("te should parse"));
+    headers.insert(TRAILER, "x-checksum".parse().expect("trailer should parse"));
+    headers.insert(
+        TRANSFER_ENCODING,
+        "chunked".parse().expect("transfer-encoding should parse"),
+    );
+    headers.insert(UPGRADE, "websocket".parse().expect("upgrade should parse"));
+    headers.insert(
+        connection_option,
+        "present"
+            .parse()
+            .expect("connection-scoped header should parse"),
+    );
+    headers.insert(
+        AUTHORIZATION,
+        "Bearer token".parse().expect("authorization should parse"),
+    );
+
+    sanitize_headers_for_redirect(&mut headers, false, true);
+
+    assert!(!headers.contains_key(CONNECTION));
+    assert!(!headers.contains_key("keep-alive"));
+    assert!(!headers.contains_key("proxy-connection"));
+    assert!(!headers.contains_key(TE));
+    assert!(!headers.contains_key(TRAILER));
+    assert!(!headers.contains_key(TRANSFER_ENCODING));
+    assert!(!headers.contains_key(UPGRADE));
+    assert!(!headers.contains_key("x-connection-option"));
+    assert!(headers.contains_key(AUTHORIZATION));
 }
 
 #[test]
@@ -275,6 +587,13 @@ fn append_query_pairs_handles_absolute_url() {
     assert_eq!(parsed_query.get("q"), Some(&"hello".to_owned()));
     assert_eq!(parsed_query.get("topic"), Some(&"rust sdk".to_owned()));
     assert_eq!(parsed_query.get("lang"), Some(&"zh".to_owned()));
+}
+
+#[test]
+fn append_query_pairs_preserves_malformed_http_absolute_shape() {
+    let query_pairs = vec![("page".to_owned(), "1".to_owned())];
+    let merged = append_query_pairs("HTTPS:/x", &query_pairs);
+    assert_eq!(merged, "HTTPS:/x?page=1");
 }
 
 #[test]
@@ -484,6 +803,29 @@ fn classify_transport_error_source_chain_prefers_nested_tls_over_io_kind() {
     assert_eq!(
         classify_transport_error_source_for_test(&tls_io, true),
         Some(TransportErrorKind::Tls)
+    );
+}
+
+#[test]
+fn classify_transport_error_text_maps_proxy_tunnel_connect_failures() {
+    assert_eq!(
+        classify_transport_error_text_for_test("tunnel error: unexpected end of file", true),
+        TransportErrorKind::Connect
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test("tunnel error: io error establishing tunnel", true),
+        TransportErrorKind::Connect
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test(
+            "tunnel error: failed to create underlying connection",
+            true
+        ),
+        TransportErrorKind::Connect
+    );
+    assert_eq!(
+        classify_transport_error_text_for_test("tunnel error: proxy authorization required", true),
+        TransportErrorKind::Other
     );
 }
 
@@ -1035,6 +1377,21 @@ fn build_rejects_invalid_base_url_early() {
 }
 
 #[test]
+fn build_rejects_base_url_with_empty_port_authority() {
+    let result = Client::builder("https://api.example.com:/v1").build();
+    let error = match result {
+        Ok(_) => panic!("base url with empty authority port should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidUri { uri } => {
+            assert_eq!(uri, "https://api.example.com:/v1");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn build_rejects_non_http_base_url_scheme() {
     let result = Client::builder("ftp://api.example.com").build();
     let error = match result {
@@ -1065,6 +1422,72 @@ fn build_rejects_non_http_proxy_scheme() {
         Error::InvalidProxyConfig { proxy_uri, message } => {
             assert_eq!(proxy_uri, "https://proxy.example.com:8443/");
             assert!(message.contains("http scheme"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_http_proxy_uri_with_invalid_authority() {
+    let proxy_uri: http::Uri = "http://proxy.example.com:invalid"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("http_proxy URI with invalid authority should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "http://proxy.example.com:invalid/");
+            assert!(message.contains("valid authority"));
+            assert!(message.contains("numeric port"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_http_proxy_uri_with_empty_port() {
+    let proxy_uri: http::Uri = "http://proxy.example.com:/"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("http_proxy URI with empty port should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "http://proxy.example.com:/");
+            assert!(message.contains("valid authority"));
+            assert!(message.contains("numeric port"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_http_proxy_uri_with_credentials() {
+    let proxy_uri: http::Uri = "http://user:pass@proxy.example.com:8080"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("async http_proxy URI with credentials should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "http://proxy.example.com:8080/");
+            assert!(message.contains("must not include credentials"));
+            assert!(message.contains("proxy_authorization"));
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -1366,6 +1789,14 @@ fn no_proxy_rule_matches_domain_and_subdomain() {
 }
 
 #[test]
+fn no_proxy_rule_matches_trailing_dot_fqdn_hosts() {
+    let rule = NoProxyRule::parse(".example.com.").expect("valid rule");
+    assert!(rule.matches("example.com.", None));
+    assert!(rule.matches("api.example.com.", None));
+    assert!(!rule.matches("another.com.", None));
+}
+
+#[test]
 fn no_proxy_rule_parses_bracketed_ipv6_with_port() {
     let rule = NoProxyRule::parse("[::1]:8080").expect("valid ipv6 rule");
     assert!(rule.matches("::1", Some(8080)));
@@ -1389,6 +1820,13 @@ fn no_proxy_rule_with_port_requires_matching_port() {
 }
 
 #[test]
+fn no_proxy_rule_accepts_url_authority_without_path() {
+    let rule = NoProxyRule::parse("https://api.example.com:8443").expect("valid url-shaped rule");
+    assert!(rule.matches("api.example.com", Some(8443)));
+    assert!(!rule.matches("api.example.com", Some(443)));
+}
+
+#[test]
 fn no_proxy_bypass_uses_default_uri_port_when_missing() {
     let rules = vec![NoProxyRule::parse("api.example.com:443").expect("valid host:port rule")];
     let https_uri: http::Uri = "https://api.example.com/v1"
@@ -1402,11 +1840,50 @@ fn no_proxy_bypass_uses_default_uri_port_when_missing() {
 }
 
 #[test]
+fn no_proxy_bypass_matches_trailing_dot_uri_host() {
+    let rules = vec![NoProxyRule::parse("api.example.com").expect("valid host rule")];
+    let uri: http::Uri = "https://api.example.com./v1"
+        .parse()
+        .expect("uri should parse");
+    assert!(should_bypass_proxy_uri(&rules, &uri));
+}
+
+#[test]
 fn no_proxy_rule_rejects_non_numeric_port_suffix() {
     assert!(
         NoProxyRule::parse("example.com:abc").is_none(),
         "non-numeric no_proxy port suffix must be rejected"
     );
+}
+
+#[test]
+fn no_proxy_rule_rejects_url_with_path_query_or_userinfo() {
+    assert!(NoProxyRule::parse("https://api.example.com/v1").is_none());
+    assert!(NoProxyRule::parse("https://api.example.com?scope=one").is_none());
+    assert!(NoProxyRule::parse("https://user:pass@api.example.com").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_url_with_non_http_scheme() {
+    assert!(NoProxyRule::parse("ftp://api.example.com").is_none());
+    assert!(NoProxyRule::parse("socks5://api.example.com:1080").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_malformed_http_url_shapes() {
+    assert!(NoProxyRule::parse("http:/api.example.com").is_none());
+    assert!(NoProxyRule::parse("https:api.example.com").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_url_with_invalid_authority() {
+    assert!(NoProxyRule::parse("https://api.example.com:invalid").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_url_with_empty_port() {
+    assert!(NoProxyRule::parse("https://api.example.com:/").is_none());
+    assert!(NoProxyRule::parse("https:///api.example.com").is_none());
 }
 
 #[test]
@@ -1420,6 +1897,100 @@ fn try_add_no_proxy_rejects_invalid_rule() {
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
     match error {
         Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "[::1]not-a-port"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_url_rule_with_path() {
+    let result =
+        Client::builder("https://api.example.com").try_no_proxy(["https://api.example.com/v1"]);
+    let error = match result {
+        Ok(_) => panic!("url-shaped no_proxy rule with path should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com/v1"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_redacts_sensitive_url_shaped_rule() {
+    let result = Client::builder("https://api.example.com")
+        .try_no_proxy(["https://user:pass@api.example.com/v1?token=secret"]);
+    let error = match result {
+        Ok(_) => panic!("sensitive invalid no_proxy rule should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com/v1"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_url_rule_with_non_http_scheme() {
+    let result = Client::builder("https://api.example.com").try_no_proxy(["ftp://api.example.com"]);
+    let error = match result {
+        Ok(_) => panic!("url-shaped no_proxy rule with non-http scheme should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "ftp://api.example.com"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_malformed_http_url_shape() {
+    let result = Client::builder("https://api.example.com").try_no_proxy(["http:/api.example.com"]);
+    let error = match result {
+        Ok(_) => panic!("malformed http no_proxy rule should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "http:/api.example.com"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_url_rule_with_invalid_authority() {
+    let result = Client::builder("https://api.example.com")
+        .try_no_proxy(["https://api.example.com:invalid"]);
+    let error = match result {
+        Ok(_) => panic!("url-shaped no_proxy rule with invalid authority should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com:invalid"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
+fn try_no_proxy_rejects_url_rule_with_empty_port() {
+    let result =
+        Client::builder("https://api.example.com").try_no_proxy(["https://api.example.com:/"]);
+    let error = match result {
+        Ok(_) => panic!("url-shaped no_proxy rule with empty port should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com:/"),
         other => panic!("unexpected error variant: {other}"),
     }
 }
@@ -1458,6 +2029,23 @@ fn no_proxy_records_invalid_rule_and_build_fails() {
     assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
 }
 
+#[test]
+fn no_proxy_build_error_redacts_sensitive_url_shaped_rule() {
+    let result = Client::builder("https://api.example.com")
+        .no_proxy(["https://user:pass@api.example.com/v1?token=secret"])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("sensitive invalid no_proxy rule should fail at build time"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com/v1"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
 #[cfg(feature = "_blocking")]
 #[test]
 fn blocking_try_add_no_proxy_rejects_invalid_rule() {
@@ -1486,6 +2074,24 @@ fn blocking_no_proxy_records_invalid_rule_and_build_fails() {
 
 #[cfg(feature = "_blocking")]
 #[test]
+fn blocking_no_proxy_build_error_redacts_sensitive_url_shaped_rule() {
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .no_proxy(["https://user:pass@api.example.com/v1?token=secret"])
+        .build();
+    let error = match result {
+        Ok(_) => panic!("sensitive invalid no_proxy rule should fail at build time"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::InvalidNoProxyRule);
+    match error {
+        Error::InvalidNoProxyRule { rule } => assert_eq!(rule, "https://api.example.com/v1"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
 fn blocking_build_rejects_non_http_proxy_scheme() {
     let proxy_uri: http::Uri = "https://proxy.example.com:8443"
         .parse()
@@ -1501,6 +2107,52 @@ fn blocking_build_rejects_non_http_proxy_scheme() {
         Error::InvalidProxyConfig { proxy_uri, message } => {
             assert_eq!(proxy_uri, "https://proxy.example.com:8443/");
             assert!(message.contains("http scheme"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_build_rejects_http_proxy_uri_with_invalid_authority() {
+    let proxy_uri: http::Uri = "http://proxy.example.com:invalid"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("http_proxy URI with invalid authority should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "http://proxy.example.com:invalid/");
+            assert!(message.contains("valid authority"));
+            assert!(message.contains("numeric port"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_build_rejects_http_proxy_uri_with_empty_port() {
+    let proxy_uri: http::Uri = "http://proxy.example.com:/"
+        .parse()
+        .expect("proxy uri should parse");
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .http_proxy(proxy_uri)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("http_proxy URI with empty port should fail at build time"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidProxyConfig { proxy_uri, message } => {
+            assert_eq!(proxy_uri, "http://proxy.example.com:/");
+            assert!(message.contains("valid authority"));
+            assert!(message.contains("numeric port"));
         }
         other => panic!("unexpected error: {other}"),
     }

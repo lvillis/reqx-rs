@@ -12,7 +12,7 @@ use crate::core::limiters::{
 };
 use crate::error::Error;
 use crate::extensions::Clock;
-use crate::util::lock_unpoisoned;
+use crate::util::{lock_unpoisoned, normalize_host_key};
 
 #[derive(Clone)]
 pub(crate) struct RequestLimiters {
@@ -86,7 +86,7 @@ impl RequestLimiters {
         &self,
         host: Option<&str>,
     ) -> Result<HostRequestPermit, Error> {
-        let host = host.map(|item| item.to_ascii_lowercase());
+        let host = host.and_then(normalize_host_key);
         let permit = match (self.per_host_limit, host) {
             (Some(limit), Some(host)) => {
                 let semaphore = {
@@ -123,6 +123,32 @@ impl RequestLimiters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn acquire_host_normalizes_trailing_dot_fqdn_keys() {
+        let limiters =
+            RequestLimiters::new(None, Some(1), Arc::new(crate::extensions::SystemClock))
+                .expect("limiters should be built");
+
+        let _permit = limiters
+            .acquire_host(Some("api.example.com"))
+            .await
+            .expect("first host permit should succeed");
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(50),
+            limiters.acquire_host(Some("api.example.com.")),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "trailing-dot host should share the same per-host concurrency bucket"
+        );
+
+        let entries = lock_unpoisoned(&limiters.per_host);
+        assert!(entries.contains_key("api.example.com"));
+        assert_eq!(entries.len(), 1);
+    }
 
     #[test]
     fn cleanup_keeps_stale_entry_while_permit_is_active() {

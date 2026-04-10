@@ -659,6 +659,61 @@ fn blocking_buffered_request_accept_encoding_can_be_disabled_per_request() {
 }
 
 #[test]
+fn blocking_proxy_authorization_header_is_not_forwarded_to_origin() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/v1/direct")
+        .header(
+            HeaderName::from_static("proxy-authorization"),
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        )
+        .send()
+        .expect("direct request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers.get("proxy-authorization"), None);
+}
+
+#[test]
+fn blocking_request_path_preserves_extra_leading_slashes() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        br#"{"ok":true}"#.to_vec(),
+    )]);
+
+    let client = Client::builder(format!("{}/v1", server.base_url))
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .get("//users")
+        .send_json()
+        .expect("blocking json call should succeed");
+
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1//users");
+}
+
+#[test]
 fn blocking_head_empty_body_with_content_encoding_is_not_decoded() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -2982,6 +3037,40 @@ fn blocking_redirect_invalid_location_redacts_sensitive_tokens_in_error() {
 }
 
 #[test]
+fn blocking_redirect_network_path_location_with_empty_port_is_rejected() {
+    let server = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![("Location", "//example.com:/v1/new?token=secret#frag")],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .send()
+        .expect_err("invalid network-path redirect location should fail");
+    let display = error.to_string();
+    assert!(!display.contains("token=secret"));
+    assert!(!display.contains("#frag"));
+
+    match error {
+        Error::InvalidRedirectLocation { location, .. } => {
+            assert_eq!(location, "//example.com:/v1/new");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
 fn blocking_redirect_http_location_with_userinfo_is_rejected() {
     let server = MockServer::start(vec![MockResponse::new(
         302,
@@ -3148,6 +3237,33 @@ fn blocking_proxy_authorization_requires_proxy_uri_credentials_for_http_proxy() 
         .build();
     let error = match build_result {
         Ok(_) => panic!("http proxy auth should fail at build time in blocking mode"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidProxyConfig { message, .. } => {
+            assert!(message.contains("proxy_authorization"));
+            assert!(message.contains("http_proxy URI"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_proxy_authorization_is_rejected_even_when_proxy_uri_has_credentials() {
+    let proxy_uri: Uri = "http://user:pass@127.0.0.1:1"
+        .parse()
+        .expect("parse proxy uri");
+
+    let build_result = Client::builder("http://example.com")
+        .http_proxy(proxy_uri)
+        .try_proxy_authorization("Basic Zm9vOmJhcg==")
+        .expect("valid proxy authorization header")
+        .request_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build();
+    let error = match build_result {
+        Ok(_) => panic!("blocking proxy authorization override should fail at build time"),
         Err(error) => error,
     };
 

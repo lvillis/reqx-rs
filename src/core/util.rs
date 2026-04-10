@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName, HeaderValue,
-    LOCATION, RETRY_AFTER,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    COOKIE, EXPECT, HOST, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, RETRY_AFTER, TE,
+    TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{HeaderMap, Method, StatusCode, Uri};
 
@@ -78,6 +79,18 @@ fn uri_has_userinfo(uri: &Uri) -> bool {
         .is_some_and(|authority| authority.as_str().contains('@'))
 }
 
+pub(crate) fn normalize_host_key(host: &str) -> Option<String> {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn normalized_uri_host(uri: &Uri) -> Option<String> {
+    normalize_host_key(uri.host()?)
+}
+
 fn strip_query_and_fragment(uri_text: &str) -> &str {
     let query_index = uri_text.find('?');
     let fragment_index = uri_text.find('#');
@@ -88,6 +101,12 @@ fn strip_query_and_fragment(uri_text: &str) -> &str {
         (None, None) => uri_text.len(),
     };
     &uri_text[..cutoff]
+}
+
+pub(crate) fn redact_uri_without_url_normalization(uri_text: &str) -> String {
+    let stripped = strip_query_and_fragment(uri_text);
+    let authority_redacted = redact_userinfo_in_authority(stripped);
+    redact_non_authority_credentials(&authority_redacted)
 }
 
 fn redact_userinfo_in_authority(uri_text: &str) -> String {
@@ -209,10 +228,19 @@ fn redact_sensitive_path_segments(parsed: &mut url::Url) {
 }
 
 pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
+    let bytes = uri_text.as_bytes();
+    let looks_like_http_absolute = bytes
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+        || bytes
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
+    if looks_like_http_absolute && !is_valid_absolute_http_uri_text(uri_text) {
+        return redact_uri_without_url_normalization(uri_text);
+    }
+
     let Ok(mut parsed) = url::Url::parse(uri_text) else {
-        let stripped = strip_query_and_fragment(uri_text);
-        let authority_redacted = redact_userinfo_in_authority(stripped);
-        return redact_non_authority_credentials(&authority_redacted);
+        return redact_uri_without_url_normalization(uri_text);
     };
 
     let _ = parsed.set_username("");
@@ -226,12 +254,100 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     redact_non_authority_credentials(&authority_redacted)
 }
 
+fn looks_like_malformed_http_absolute_uri(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http:"))
+        || bytes
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https:"))
+}
+
+fn has_valid_raw_http_authority_syntax(uri_text: &str, allow_network_path_reference: bool) -> bool {
+    let bytes = uri_text.as_bytes();
+    let prefix_len = if bytes
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+    {
+        7
+    } else if bytes
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
+    {
+        8
+    } else if allow_network_path_reference && uri_text.starts_with("//") {
+        2
+    } else {
+        return false;
+    };
+
+    let remainder = &uri_text[prefix_len..];
+    if remainder.is_empty() || remainder.starts_with('/') {
+        return false;
+    }
+
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host_port)| host_port)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return false;
+    }
+
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        let Some(end) = stripped.find(']') else {
+            return false;
+        };
+        if end == 0 {
+            return false;
+        }
+        let suffix = &stripped[end + 1..];
+        return suffix.is_empty()
+            || suffix.strip_prefix(':').is_some_and(|port| {
+                !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit())
+            });
+    }
+
+    if host_port.starts_with('.') {
+        return false;
+    }
+    if host_port.matches(':').count() > 1 {
+        return false;
+    }
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        return !host.is_empty() && !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit());
+    }
+    true
+}
+
+fn is_valid_http_network_path_reference(uri_text: &str) -> bool {
+    has_valid_raw_http_authority_syntax(uri_text, true)
+}
+
+pub(crate) fn is_valid_absolute_http_uri_text(uri_text: &str) -> bool {
+    if !has_valid_raw_http_authority_syntax(uri_text, false) {
+        return false;
+    }
+
+    let Ok(parsed) = url::Url::parse(uri_text) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+}
+
 pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), Error> {
     let uri_text = match path.parse::<Uri>() {
         Ok(uri) if uri.host().is_some() => {
             let Some(scheme) = uri.scheme_str() else {
                 return Err(Error::InvalidUri {
-                    uri: redact_uri_for_logs(path),
+                    uri: redact_uri_without_url_normalization(path),
                 });
             };
             if uri_has_userinfo(&uri) {
@@ -239,13 +355,25 @@ pub(crate) fn resolve_uri(base_url: &str, path: &str) -> Result<(String, Uri), E
                     uri: redact_uri_for_logs(path),
                 });
             }
-            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            if (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                && is_valid_absolute_http_uri_text(path)
+            {
                 path.to_owned()
             } else {
                 return Err(Error::InvalidUri {
                     uri: redact_uri_for_logs(path),
                 });
             }
+        }
+        Ok(uri) if uri.scheme_str().is_some() => {
+            return Err(Error::InvalidUri {
+                uri: redact_uri_for_logs(path),
+            });
+        }
+        Err(_) if looks_like_malformed_http_absolute_uri(path) => {
+            return Err(Error::InvalidUri {
+                uri: redact_uri_without_url_normalization(path),
+            });
         }
         _ => join_base_path(base_url, path),
     };
@@ -281,6 +409,9 @@ pub(crate) fn validate_base_url(base_url: &str) -> Result<(), Error> {
         return Err(invalid_base_url_error(base_url));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid_base_url_error(base_url));
+    }
+    if !is_valid_absolute_http_uri_text(normalized) {
         return Err(invalid_base_url_error(base_url));
     }
 
@@ -328,6 +459,12 @@ pub(crate) fn validate_http_proxy_uri(proxy_uri: &Uri) -> Result<(), Error> {
             ));
         }
     }
+    if !is_valid_absolute_http_uri_text(&proxy_uri.to_string()) {
+        return Err(invalid_proxy_uri_error(
+            proxy_uri,
+            "http_proxy URI must include a valid authority and numeric port",
+        ));
+    }
     Ok(())
 }
 
@@ -336,7 +473,9 @@ pub(crate) fn append_query_pairs(path: &str, query_pairs: &[(String, String)]) -
         return path.to_owned();
     }
 
-    if let Ok(mut url) = url::Url::parse(path) {
+    if !looks_like_malformed_http_absolute_uri(path)
+        && let Ok(mut url) = url::Url::parse(path)
+    {
         let existing = url
             .query()
             .map(|query| {
@@ -530,6 +669,9 @@ fn classify_transport_error_text(text: &str, is_connect_path: bool) -> Transport
         "host unreachable",
         "connect error",
         "proxy connect",
+        "tunnel error: unexpected end of file",
+        "tunnel error: io error establishing tunnel",
+        "tunnel error: failed to create underlying connection",
         "timed out while connecting",
         "connection timeout",
         "connect timeout",
@@ -599,7 +741,21 @@ pub(crate) fn classify_transport_error_source_for_test(
 
 pub(crate) fn join_base_path(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let relative = path.trim_start_matches('/');
+    if let Some(suffix) = path.strip_prefix('?') {
+        return if base.is_empty() {
+            format!("?{suffix}")
+        } else {
+            format!("{base}?{suffix}")
+        };
+    }
+    if let Some(suffix) = path.strip_prefix('#') {
+        return if base.is_empty() {
+            format!("#{suffix}")
+        } else {
+            format!("{base}#{suffix}")
+        };
+    }
+    let relative = path.strip_prefix('/').unwrap_or(path);
     match (base.is_empty(), relative.is_empty()) {
         (true, true) => String::new(),
         (true, false) => relative.to_owned(),
@@ -750,10 +906,13 @@ pub(crate) fn default_port(uri: &Uri) -> Option<u16> {
 }
 
 pub(crate) fn rate_limit_bucket_key(uri: &Uri) -> Option<String> {
-    let host = uri.host()?.to_ascii_lowercase();
+    let host = normalized_uri_host(uri)?;
     let Some(port) = default_port(uri) else {
         return Some(host);
     };
+    if host.contains(':') && !host.starts_with('[') {
+        return Some(format!("[{host}]:{port}"));
+    }
     Some(format!("{host}:{port}"))
 }
 
@@ -764,16 +923,66 @@ pub(crate) fn same_origin(left: &Uri, right: &Uri) -> bool {
         return false;
     }
 
-    let left_host = left.host().unwrap_or_default();
-    let right_host = right.host().unwrap_or_default();
-    if !left_host.eq_ignore_ascii_case(right_host) {
+    let Some(left_host) = normalized_uri_host(left) else {
+        return false;
+    };
+    let Some(right_host) = normalized_uri_host(right) else {
+        return false;
+    };
+    if left_host != right_host {
         return false;
     }
 
     default_port(left) == default_port(right)
 }
 
+fn remove_hop_by_hop_redirect_headers(headers: &mut HeaderMap) {
+    let connection_scoped_headers: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            HeaderName::from_bytes(token.as_bytes()).ok()
+        })
+        .collect();
+    for header_name in connection_scoped_headers {
+        headers.remove(header_name);
+    }
+
+    headers.remove(CONNECTION);
+    headers.remove("keep-alive");
+    headers.remove("proxy-connection");
+    headers.remove(TE);
+    headers.remove(TRAILER);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(UPGRADE);
+}
+
 pub(crate) fn resolve_redirect_uri(current_uri: &Uri, location: &str) -> Option<Uri> {
+    match location.parse::<Uri>() {
+        Ok(uri) if uri.host().is_some() => {
+            let scheme = uri.scheme_str()?;
+            if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+                return None;
+            }
+            if uri_has_userinfo(&uri) || !is_valid_absolute_http_uri_text(location) {
+                return None;
+            }
+            return Some(uri);
+        }
+        Ok(uri) if uri.scheme_str().is_some() => return None,
+        Err(_) if looks_like_malformed_http_absolute_uri(location) => return None,
+        _ => {}
+    }
+    if location.starts_with("//") && !is_valid_http_network_path_reference(location) {
+        return None;
+    }
+
     let base = url::Url::parse(&current_uri.to_string()).ok()?;
     let joined = base.join(location).ok()?;
     if !matches!(joined.scheme(), "http" | "https") {
@@ -794,14 +1003,22 @@ pub(crate) fn sanitize_headers_for_redirect(
     method_changed_to_get: bool,
     same_origin_redirect: bool,
 ) {
+    remove_hop_by_hop_redirect_headers(headers);
+    headers.remove(HOST);
     if method_changed_to_get {
+        headers.remove(CONTENT_ENCODING);
         headers.remove(CONTENT_LENGTH);
         headers.remove(CONTENT_TYPE);
+        headers.remove("content-digest");
+        headers.remove("content-md5");
+        headers.remove("digest");
+        headers.remove(EXPECT);
     }
     if !same_origin_redirect {
         headers.remove(AUTHORIZATION);
         headers.remove(COOKIE);
     }
+    headers.remove(PROXY_AUTHORIZATION);
 }
 
 pub(crate) fn truncate_body(body: &[u8]) -> String {
