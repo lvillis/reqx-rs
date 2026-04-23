@@ -2,7 +2,7 @@
 name = "reqx"
 version = "0.1.34"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95.0"
 description = "Rust HTTP transport client for API SDK libraries with retry, timeout, idempotency, proxy, and pluggable TLS backends"
 readme = "README.md"
 license = "MIT"
@@ -88,7 +88,7 @@ otel = ["dep:opentelemetry"]
 
 [dependencies]
 # Async runtime and stream primitives.
-tokio = { version = "1.51.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1.52.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-util = { version = "0.7.18", default-features = false, features = ["io"], optional = true }
 futures-core = { version = "0.3.32", default-features = false, features = ["alloc", "std"], optional = true }
 futures-util = { version = "0.3.32", default-features = false, features = ["alloc", "std"], optional = true }
@@ -104,11 +104,11 @@ tower-service = { version = "0.3.3", default-features = false, optional = true }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 # TLS backends (feature-gated).
-hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
 rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
-webpki-roots = { version = "1.0.6", optional = true }
+webpki-roots = { version = "1.0.7", optional = true }
 
 # Blocking transport backend (feature-gated).
 ureq = { version = "3.3.0", default-features = false, optional = true }
@@ -127,7 +127,7 @@ zstd = { version = "0.13.3" }
 
 # Error handling, backoff jitter, and telemetry.
 thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
-rand = { version = "0.10.0", default-features = false, features = ["std", "thread_rng"] }
+rand = { version = "0.10.1", default-features = false, features = ["std", "thread_rng"] }
 tracing = { version = "0.1.44", default-features = false, features = ["attributes", "std"] }
 opentelemetry = { version = "0.31.0", default-features = false, features = ["metrics", "trace"], optional = true }
 
