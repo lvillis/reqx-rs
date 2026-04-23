@@ -1,6 +1,6 @@
 [package]
 name = "reqx"
-version = "0.1.34"
+version = "0.1.35"
 edition = "2024"
 rust-version = "1.95.0"
 description = "Rust HTTP transport client for API SDK libraries with retry, timeout, idempotency, proxy, and pluggable TLS backends"
