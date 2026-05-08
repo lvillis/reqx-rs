@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
@@ -7,8 +8,8 @@ use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
-    deadline_exceeded_error, is_redirect_status, parse_retry_after_capped, redact_uri_for_logs,
-    redirect_location, redirect_method, resolve_redirect_uri, same_origin,
+    bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after_capped,
+    redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, same_origin,
     sanitize_headers_for_redirect, total_timeout_expired, truncate_body, validate_base_url,
 };
 
@@ -227,6 +228,140 @@ pub(crate) struct StatusRetryPlan {
     pub(crate) delay: Duration,
 }
 
+pub(crate) enum BodyReadOutcome {
+    Body(Bytes),
+    Retry(Duration),
+}
+
+pub(crate) trait AttemptOutcome {
+    fn mark_success(self);
+    fn mark_failure(self);
+    fn cancel(self);
+}
+
+pub(crate) struct AttemptGuards<C, A> {
+    circuit: Option<C>,
+    adaptive: Option<A>,
+}
+
+impl<C, A> AttemptGuards<C, A> {
+    pub(crate) const fn new(circuit: Option<C>, adaptive: Option<A>) -> Self {
+        Self { circuit, adaptive }
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.circuit.is_none() && self.adaptive.is_none()
+    }
+
+    pub(crate) fn set_adaptive(&mut self, adaptive: Option<A>) {
+        self.adaptive = adaptive;
+    }
+
+    pub(crate) fn take(&mut self) -> Self {
+        Self {
+            circuit: self.circuit.take(),
+            adaptive: self.adaptive.take(),
+        }
+    }
+}
+
+impl<C, A> AttemptGuards<C, A>
+where
+    C: AttemptOutcome,
+    A: AttemptOutcome,
+{
+    pub(crate) fn mark_success(&mut self) {
+        if let Some(circuit) = self.circuit.take() {
+            circuit.mark_success();
+        }
+        if let Some(adaptive) = self.adaptive.take() {
+            adaptive.mark_success();
+        }
+    }
+
+    pub(crate) fn mark_failure(&mut self) {
+        if let Some(circuit) = self.circuit.take() {
+            circuit.mark_failure();
+        }
+        if let Some(adaptive) = self.adaptive.take() {
+            adaptive.mark_failure();
+        }
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if let Some(circuit) = self.circuit.take() {
+            circuit.cancel();
+        }
+        if let Some(adaptive) = self.adaptive.take() {
+            adaptive.cancel();
+        }
+    }
+
+    pub(crate) fn record(&mut self, success: bool) {
+        if success {
+            self.mark_success();
+        } else {
+            self.mark_failure();
+        }
+    }
+}
+
+pub(crate) enum RetrySchedule {
+    NotScheduled,
+    Scheduled { delay: Duration },
+}
+
+impl RetrySchedule {
+    pub(crate) const fn delay(self) -> Option<Duration> {
+        match self {
+            Self::NotScheduled => None,
+            Self::Scheduled { delay } => Some(delay),
+        }
+    }
+}
+
+pub(crate) struct RetryScheduleInput<'a> {
+    pub(crate) retry_policy: &'a RetryPolicy,
+    pub(crate) retry_decision: &'a RetryDecision,
+    pub(crate) requested_delay: Duration,
+    pub(crate) attempt: &'a mut usize,
+    pub(crate) max_attempts: usize,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) request_started_at: Instant,
+    pub(crate) method: &'a Method,
+    pub(crate) redacted_uri: &'a str,
+}
+
+pub(crate) fn prepare_retry_schedule(
+    input: RetryScheduleInput<'_>,
+    consume_retry_budget: impl FnOnce() -> Result<(), Error>,
+) -> Result<RetrySchedule, Error> {
+    let RetryScheduleInput {
+        retry_policy,
+        retry_decision,
+        requested_delay,
+        attempt,
+        max_attempts,
+        total_timeout,
+        request_started_at,
+        method,
+        redacted_uri,
+    } = input;
+
+    if *attempt >= max_attempts || !retry_policy.should_retry_decision(retry_decision) {
+        return Ok(RetrySchedule::NotScheduled);
+    }
+
+    consume_retry_budget()?;
+    let Some(delay) = bounded_retry_delay(requested_delay, total_timeout, request_started_at)
+    else {
+        return Err(deadline_exceeded_error(total_timeout, method, redacted_uri));
+    };
+
+    *attempt += 1;
+    Ok(RetrySchedule::Scheduled { delay })
+}
+
 pub(crate) struct StreamTiming {
     pub(crate) total_timeout_ms: Option<u128>,
     pub(crate) deadline_at: Option<Instant>,
@@ -389,11 +524,57 @@ pub(crate) fn apply_redirect_transition(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
     use http::HeaderMap;
     use http::header::{HeaderName, HeaderValue};
 
-    use super::status_retry_delay;
+    use super::{
+        RetrySchedule, RetryScheduleInput, prepare_retry_schedule, status_retry_delay,
+        transport_retry_decision,
+    };
+    use crate::error::TransportErrorKind;
     use crate::extensions::SystemClock;
+    use crate::retry::RetryPolicy;
+
+    struct TestAttempt {
+        name: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestAttempt {
+        fn new(name: &'static str, events: &Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                name,
+                events: Arc::clone(events),
+            }
+        }
+    }
+
+    impl super::AttemptOutcome for TestAttempt {
+        fn mark_success(self) {
+            self.events
+                .lock()
+                .expect("lock events")
+                .push(format!("{}:success", self.name));
+        }
+
+        fn mark_failure(self) {
+            self.events
+                .lock()
+                .expect("lock events")
+                .push(format!("{}:failure", self.name));
+        }
+
+        fn cancel(self) {
+            self.events
+                .lock()
+                .expect("lock events")
+                .push(format!("{}:cancel", self.name));
+        }
+    }
 
     #[test]
     fn status_retry_delay_caps_retry_after_to_max_delay() {
@@ -423,5 +604,123 @@ mod tests {
         );
 
         assert_eq!(delay, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn prepare_retry_schedule_skips_budget_when_decision_is_not_retryable() {
+        let method = http::Method::GET;
+        let redacted_uri = "https://example.com";
+        let mut attempt = 1;
+        let retry_policy =
+            RetryPolicy::standard().retryable_transport_error_kinds([TransportErrorKind::Connect]);
+        let retry_decision =
+            transport_retry_decision(attempt, 3, &method, redacted_uri, TransportErrorKind::Dns);
+        let budget_consumed = AtomicUsize::new(0);
+
+        let schedule = prepare_retry_schedule(
+            RetryScheduleInput {
+                retry_policy: &retry_policy,
+                retry_decision: &retry_decision,
+                requested_delay: Duration::from_millis(10),
+                attempt: &mut attempt,
+                max_attempts: 3,
+                total_timeout: Some(Duration::from_secs(1)),
+                request_started_at: Instant::now(),
+                method: &method,
+                redacted_uri,
+            },
+            || {
+                budget_consumed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect("schedule should not fail");
+
+        assert!(matches!(schedule, RetrySchedule::NotScheduled));
+        assert_eq!(attempt, 1);
+        assert_eq!(budget_consumed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepare_retry_schedule_consumes_budget_and_advances_attempt() {
+        let method = http::Method::GET;
+        let redacted_uri = "https://example.com";
+        let mut attempt = 1;
+        let retry_policy = RetryPolicy::standard()
+            .max_attempts(3)
+            .retryable_transport_error_kinds([TransportErrorKind::Connect]);
+        let retry_decision = transport_retry_decision(
+            attempt,
+            3,
+            &method,
+            redacted_uri,
+            TransportErrorKind::Connect,
+        );
+        let budget_consumed = AtomicUsize::new(0);
+
+        let schedule = prepare_retry_schedule(
+            RetryScheduleInput {
+                retry_policy: &retry_policy,
+                retry_decision: &retry_decision,
+                requested_delay: Duration::from_millis(10),
+                attempt: &mut attempt,
+                max_attempts: 3,
+                total_timeout: Some(Duration::from_secs(1)),
+                request_started_at: Instant::now(),
+                method: &method,
+                redacted_uri,
+            },
+            || {
+                budget_consumed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect("schedule should succeed");
+
+        assert!(matches!(
+            schedule,
+            RetrySchedule::Scheduled {
+                delay
+            } if delay == Duration::from_millis(10)
+        ));
+        assert_eq!(attempt, 2);
+        assert_eq!(budget_consumed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attempt_guards_records_both_outcomes_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+
+        attempts.mark_failure();
+        attempts.mark_success();
+
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attempt_guards_take_moves_unrecorded_attempts() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+
+        let mut moved = attempts.take();
+        assert!(attempts.is_empty());
+
+        moved.cancel();
+        attempts.mark_failure();
+
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:cancel".to_owned(), "adaptive:cancel".to_owned()]
+        );
     }
 }

@@ -1765,6 +1765,89 @@ async fn circuit_breaker_does_not_open_on_local_host_limiter_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_open_state_bypasses_adaptive_queue_wait() {
+    let held_server = DelayedBodyServer::start(
+        1,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"held".to_vec(),
+            Duration::from_millis(400),
+        ),
+    );
+    let failing_server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", held_server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .adaptive_concurrency_policy(
+            AdaptiveConcurrencyPolicy::standard()
+                .min_limit(1)
+                .initial_limit(2)
+                .max_limit(2)
+                .decrease_ratio(0.5)
+                .high_latency_threshold(Duration::from_secs(30)),
+        )
+        .total_timeout(Duration::from_millis(250))
+        .request_timeout(Duration::from_millis(800))
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-adaptive-permit")
+        .send_response_stream()
+        .await
+        .expect("first stream should hold an adaptive permit");
+
+    let first_failure = client
+        .get(format!(
+            "http://{}/open-circuit",
+            failing_server.authority()
+        ))
+        .send()
+        .await
+        .expect_err("503 should open the circuit");
+    match first_failure {
+        Error::HttpStatus { status, .. } => assert_eq!(status, 503),
+        other => panic!("unexpected first failure: {other}"),
+    }
+
+    let started = Instant::now();
+    let second_failure = client
+        .get(format!("http://{}/after-open", failing_server.authority()))
+        .send()
+        .await
+        .expect_err("open circuit should fail before adaptive queue wait");
+    match second_failure {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second failure: {other}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "open circuit should not wait for adaptive capacity"
+    );
+
+    drop(held_stream);
+    assert_eq!(
+        failing_server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn circuit_breaker_error_mode_does_not_open_on_non_success_buffered() {
     let server = CountingServer::start(
         2,
@@ -1990,6 +2073,54 @@ async fn circuit_breaker_response_mode_opens_on_retryable_non_success_stream() {
         .send_response_stream()
         .await
         .expect_err("retryable non-success stream should open circuit");
+    match second {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    assert_eq!(
+        server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_response_mode_opens_on_dropped_retryable_non_success_stream() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/response-mode-stream-503-drop")
+        .send_response_stream()
+        .await
+        .expect("retryable non-success stream should be returned");
+    assert_eq!(first.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    drop(first);
+
+    let second = client
+        .get("/response-mode-stream-503-drop")
+        .send_response_stream()
+        .await
+        .expect_err("dropped retryable non-success stream should open circuit");
     match second {
         Error::CircuitOpen { .. } => {}
         other => panic!("unexpected second error variant: {other}"),

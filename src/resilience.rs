@@ -326,6 +326,19 @@ impl CircuitBreaker {
             _ => {}
         }
     }
+
+    fn record_cancel(&self, kind: CircuitAttemptKind) {
+        let mut state = lock_unpoisoned(&self.state);
+        if let (
+            CircuitState::HalfOpen {
+                active_requests, ..
+            },
+            CircuitAttemptKind::HalfOpen,
+        ) = (&mut *state, kind)
+        {
+            *active_requests = active_requests.saturating_sub(1);
+        }
+    }
 }
 
 impl std::fmt::Debug for CircuitBreaker {
@@ -355,7 +368,22 @@ impl CircuitAttempt {
     }
 
     pub(crate) fn cancel(mut self) {
+        self.breaker.record_cancel(self.kind);
         self.completed = true;
+    }
+}
+
+impl crate::core::execution::AttemptOutcome for CircuitAttempt {
+    fn mark_success(self) {
+        Self::mark_success(self);
+    }
+
+    fn mark_failure(self) {
+        Self::mark_failure(self);
+    }
+
+    fn cancel(self) {
+        Self::cancel(self);
     }
 }
 
@@ -728,6 +756,44 @@ mod tests {
         assert!(
             breaker.begin().is_ok(),
             "breaker should allow requests again after half-open success"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_cancel_releases_half_open_slot() {
+        let clock = Arc::new(TestClock::default());
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_millis(20))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+            clock.clone(),
+        ));
+
+        breaker
+            .begin()
+            .expect("closed attempt should be allowed")
+            .mark_failure();
+        clock.advance(Duration::from_millis(25));
+
+        let half_open_attempt = breaker
+            .begin()
+            .expect("breaker should allow one half-open request");
+        assert!(
+            breaker.begin().is_err(),
+            "half-open request should occupy the only probe slot"
+        );
+
+        half_open_attempt.cancel();
+
+        let replacement_attempt = breaker
+            .begin()
+            .expect("cancelled half-open request should release the probe slot");
+        replacement_attempt.mark_success();
+        assert!(
+            breaker.begin().is_ok(),
+            "breaker should allow requests again after replacement probe succeeds"
         );
     }
 }

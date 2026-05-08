@@ -1502,6 +1502,76 @@ async fn global_rate_limit_applies_between_parallel_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_retry_backoff_releases_per_host_in_flight_slot() {
+    let server = MockServer::start(vec![
+        MockResponse::new(503, Vec::<(String, String)>::new(), "busy", Duration::ZERO),
+        MockResponse::new(
+            200,
+            Vec::<(String, String)>::new(),
+            "second",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            Vec::<(String, String)>::new(),
+            "retried",
+            Duration::ZERO,
+        ),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .max_in_flight_per_host(1)
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::from_millis(350))
+                .max_backoff(Duration::from_millis(350))
+                .jitter_ratio(0.0),
+        )
+        .build()
+        .expect("client should build");
+
+    let first_client = client.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .get("/first")
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while server.served_count() < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "first request did not reach the server"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let started = Instant::now();
+    let second = client
+        .get("/second")
+        .send()
+        .await
+        .expect("second request should not wait for first retry backoff");
+    let elapsed = started.elapsed();
+    assert_eq!(second.status().as_u16(), 200);
+    assert!(
+        elapsed < Duration::from_millis(220),
+        "second request waited behind retry backoff: {elapsed:?}"
+    );
+
+    let first_status = first
+        .await
+        .expect("join first request")
+        .expect("first request should eventually succeed");
+    assert_eq!(first_status, 200);
+    assert_eq!(server.served_count(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_after_429_backpressures_following_request() {
     let server = MockServer::start(vec![
         MockResponse::new(429, vec![("Retry-After", "1")], "busy", Duration::ZERO),
