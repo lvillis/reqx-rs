@@ -602,6 +602,7 @@ fn checkpoint_part_matches(
     existing: &UploadedPart,
     expected_size: usize,
     expected_checksum: Option<&str>,
+    verify_remote_etag: bool,
 ) -> bool {
     if existing.size != expected_size {
         return false;
@@ -615,7 +616,12 @@ fn checkpoint_part_matches(
         return false;
     };
 
-    normalize_token(existing_checksum) == normalize_token(expected_checksum)
+    let normalized_expected = normalize_token(expected_checksum);
+    if normalize_token(existing_checksum) != normalized_expected {
+        return false;
+    }
+
+    !verify_remote_etag || normalize_token(&existing.etag) == normalized_expected
 }
 
 fn checkpoint_has_remaining_parts(
@@ -751,7 +757,12 @@ impl BlockingResumableUploader {
 
             let expected_checksum = self.options.expected_checksum(&chunk);
             if let Some(existing) = checkpoint.completed_parts.get(&part_number)
-                && checkpoint_part_matches(existing, chunk.len(), expected_checksum.as_deref())
+                && checkpoint_part_matches(
+                    existing,
+                    chunk.len(),
+                    expected_checksum.as_deref(),
+                    self.options.verify_remote_etag(),
+                )
             {
                 part_number = part_number.saturating_add(1);
                 continue;
@@ -970,7 +981,12 @@ impl AsyncResumableUploader {
 
             let expected_checksum = self.options.expected_checksum(&chunk);
             if let Some(existing) = checkpoint.completed_parts.get(&part_number)
-                && checkpoint_part_matches(existing, chunk.len(), expected_checksum.as_deref())
+                && checkpoint_part_matches(
+                    existing,
+                    chunk.len(),
+                    expected_checksum.as_deref(),
+                    self.options.verify_remote_etag(),
+                )
             {
                 part_number = part_number.saturating_add(1);
                 continue;
@@ -1305,6 +1321,42 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn blocking_resume_reuploads_checkpoint_part_when_verified_etag_mismatches() {
+        let backend = BlockingMockBackend::default();
+        let uploader = BlockingResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_verify_remote_etag(true)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+        checkpoint.completed_parts.insert(
+            1,
+            UploadedPart {
+                part_number: 1,
+                etag: "stale-etag".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"abcd")),
+            },
+        );
+
+        let mut reader = std::io::Cursor::new(b"abcdefgh".to_vec());
+        let result = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .expect("resume should repair stale checkpoint etag");
+
+        assert!(result.resumed);
+        assert_eq!(result.total_parts, 2);
+        let attempts = backend.attempts.lock().expect("lock attempts");
+        assert_eq!(attempts.get(&1).copied(), Some(1));
+        assert_eq!(attempts.get(&2).copied(), Some(1));
     }
 
     #[test]
@@ -1726,6 +1778,44 @@ mod tests {
         assert!(resumed.resumed);
         assert_eq!(resumed.total_parts, 2);
         assert_eq!(backend.completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "_async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resume_reuploads_checkpoint_part_when_verified_etag_mismatches() {
+        let backend = AsyncMockBackend::default();
+        let uploader = AsyncResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_verify_remote_etag(true)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-async-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+        checkpoint.completed_parts.insert(
+            1,
+            UploadedPart {
+                part_number: 1,
+                etag: "stale-etag".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"abcd")),
+            },
+        );
+
+        let mut reader = std::io::Cursor::new(b"abcdefgh".to_vec());
+        let result = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .await
+            .expect("resume should repair stale checkpoint etag");
+
+        assert!(result.resumed);
+        assert_eq!(result.total_parts, 2);
+        let attempts = backend.attempts.lock().expect("lock attempts");
+        assert_eq!(attempts.get(&1).copied(), Some(1));
+        assert_eq!(attempts.get(&2).copied(), Some(1));
     }
 
     #[cfg(feature = "_async")]
