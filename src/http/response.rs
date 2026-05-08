@@ -1,7 +1,9 @@
 use bytes::Bytes;
 #[cfg(any(feature = "_async", feature = "_blocking"))]
+use http::Method;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH};
-use http::{HeaderMap, Method, StatusCode};
+use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 #[cfg(any(feature = "_async", feature = "_blocking"))]
 use std::io;

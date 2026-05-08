@@ -1709,6 +1709,62 @@ async fn circuit_breaker_stream_body_failure_opens_circuit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_does_not_open_on_local_host_limiter_timeout() {
+    let server = CountingServer::start(
+        2,
+        ResponseSpec::new(
+            200,
+            Vec::<(String, String)>::new(),
+            b"ok".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .max_in_flight_per_host(1)
+        .total_timeout(Duration::from_millis(80))
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-host-permit")
+        .send_stream()
+        .await
+        .expect("first stream should acquire host permit");
+
+    let second = client
+        .get("/queued-behind-host-permit")
+        .send()
+        .await
+        .expect_err("second request should time out locally");
+    match second {
+        Error::DeadlineExceeded { .. } => {}
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    drop(held_stream);
+
+    let third = client
+        .get("/after-local-timeout")
+        .send()
+        .await
+        .expect("local timeout must not open circuit");
+    assert_eq!(third.status().as_u16(), 200);
+    assert_eq!(
+        server.wait_for_served_count(2, Duration::from_millis(200)),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn circuit_breaker_error_mode_does_not_open_on_non_success_buffered() {
     let server = CountingServer::start(
         2,
@@ -1803,6 +1859,53 @@ async fn circuit_breaker_response_mode_does_not_open_on_non_success_buffered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_response_mode_opens_on_retryable_non_success_buffered() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/response-mode-buffered-503")
+        .send_response()
+        .await
+        .expect("retryable non-success response should be returned");
+    assert_eq!(first.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+    let second = client
+        .get("/response-mode-buffered-503")
+        .send_response()
+        .await
+        .expect_err("retryable non-success response should open circuit");
+    match second {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    assert_eq!(
+        server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
     let server = CountingServer::start(
         2,
@@ -1843,6 +1946,58 @@ async fn circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
     assert_eq!(
         server.wait_for_served_count(2, Duration::from_millis(200)),
         2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_response_mode_opens_on_retryable_non_success_stream() {
+    let server = CountingServer::start(
+        1,
+        ResponseSpec::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"busy".to_vec(),
+            Duration::ZERO,
+        ),
+    );
+    let client = Client::builder(format!("http://{}", server.authority()))
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/response-mode-stream-503")
+        .send_response_stream()
+        .await
+        .expect("retryable non-success stream should be returned");
+    assert_eq!(first.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = first
+        .into_bytes_limited(1024)
+        .await
+        .expect("stream body should be readable");
+    assert_eq!(body.as_ref(), b"busy");
+
+    let second = client
+        .get("/response-mode-stream-503")
+        .send_response_stream()
+        .await
+        .expect_err("retryable non-success stream should open circuit");
+    match second {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error variant: {other}"),
+    }
+
+    assert_eq!(
+        server.wait_for_served_count(1, Duration::from_millis(200)),
+        1
     );
 }
 

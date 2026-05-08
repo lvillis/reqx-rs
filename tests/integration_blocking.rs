@@ -1516,6 +1516,38 @@ fn blocking_retry_budget_is_credited_by_non_retryable_send_response() {
 }
 
 #[test]
+fn blocking_buffered_status_retry_happens_before_body_limit() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            503,
+            Vec::<(String, String)>::new(),
+            b"body-that-exceeds-limit".to_vec(),
+        ),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .max_response_body_bytes(4)
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::ZERO)
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/v1/retry-before-body-limit")
+        .send()
+        .expect("retryable status should retry before reading oversized body");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
 fn blocking_build_rejects_invalid_adaptive_concurrency_policy() {
     let result = Client::builder("https://api.example.com")
         .adaptive_concurrency_policy(
@@ -1640,6 +1672,52 @@ fn blocking_circuit_breaker_stream_body_failure_opens_circuit() {
 }
 
 #[test]
+fn blocking_circuit_breaker_does_not_open_on_local_host_limiter_timeout() {
+    let server = MockServer::start(vec![
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"ok".to_vec()),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .max_in_flight_per_host(1)
+        .total_timeout(Duration::from_millis(80))
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/v1/hold-host-permit")
+        .send_stream()
+        .expect("first stream should acquire host permit");
+
+    let second = client
+        .get("/v1/queued-behind-host-permit")
+        .send()
+        .expect_err("second request should time out locally");
+    match second {
+        Error::DeadlineExceeded { .. } => {}
+        other => panic!("unexpected second error: {other}"),
+    }
+
+    drop(held_stream);
+
+    let third = client
+        .get("/v1/after-local-timeout")
+        .send()
+        .expect("local timeout must not open circuit");
+    assert_eq!(third.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 2);
+}
+
+#[test]
 fn blocking_circuit_breaker_error_mode_does_not_open_on_non_success_buffered() {
     let server = MockServer::start(vec![
         MockResponse::new(
@@ -1732,6 +1810,45 @@ fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_buffered(
 }
 
 #[test]
+fn blocking_circuit_breaker_response_mode_opens_on_retryable_non_success_buffered() {
+    let server = MockServer::start(vec![MockResponse::new(
+        503,
+        Vec::<(String, String)>::new(),
+        b"busy".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/v1/response-mode-buffered-503")
+        .send_response()
+        .expect("retryable non-success response should be returned");
+    assert_eq!(first.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+    let second = client
+        .get("/v1/response-mode-buffered-503")
+        .send_response()
+        .expect_err("retryable non-success response should open circuit");
+    match second {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error: {other}"),
+    }
+
+    assert_eq!(server.served_count(), 1);
+}
+
+#[test]
 fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_stream() {
     let server = MockServer::start(vec![
         MockResponse::new(
@@ -1772,6 +1889,49 @@ fn blocking_circuit_breaker_response_mode_does_not_open_on_non_success_stream() 
     assert_eq!(second.status(), http::StatusCode::NOT_FOUND);
 
     assert_eq!(server.served_count(), 2);
+}
+
+#[test]
+fn blocking_circuit_breaker_response_mode_opens_on_retryable_non_success_stream() {
+    let server = MockServer::start(vec![MockResponse::new(
+        503,
+        Vec::<(String, String)>::new(),
+        b"busy".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .circuit_breaker_policy(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_secs(30))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+        )
+        .request_timeout(Duration::from_millis(400))
+        .build()
+        .expect("client should build");
+
+    let first = client
+        .get("/v1/response-mode-stream-503")
+        .send_response_stream()
+        .expect("retryable non-success stream should be returned");
+    assert_eq!(first.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = first
+        .into_bytes_limited(1024)
+        .expect("stream body should be readable");
+    assert_eq!(body.as_ref(), b"busy");
+
+    let second = client
+        .get("/v1/response-mode-stream-503")
+        .send_response_stream()
+        .expect_err("retryable non-success stream should open circuit");
+    match second {
+        Error::CircuitOpen { .. } => {}
+        other => panic!("unexpected second error: {other}"),
+    }
+
+    assert_eq!(server.served_count(), 1);
 }
 
 #[test]

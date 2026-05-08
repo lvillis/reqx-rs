@@ -127,6 +127,7 @@ struct StreamResponseInput {
 struct StreamResilienceHooks {
     retry_budget: Option<std::sync::Arc<crate::resilience::RetryBudget>>,
     record_retry_budget_success: bool,
+    record_attempt_success: bool,
     circuit_attempt: Option<crate::resilience::CircuitAttempt>,
     adaptive_attempt: Option<AdaptiveConcurrencyPermit>,
 }
@@ -139,10 +140,18 @@ impl StreamOutcomeHooks for StreamResilienceHooks {
             retry_budget.record_success();
         }
         if let Some(circuit_attempt) = self.circuit_attempt.take() {
-            circuit_attempt.mark_success();
+            if self.record_attempt_success {
+                circuit_attempt.mark_success();
+            } else {
+                circuit_attempt.mark_failure();
+            }
         }
         if let Some(adaptive_attempt) = self.adaptive_attempt.take() {
-            adaptive_attempt.mark_success();
+            if self.record_attempt_success {
+                adaptive_attempt.mark_success();
+            } else {
+                adaptive_attempt.mark_failure();
+            }
         }
     }
 
@@ -325,6 +334,7 @@ impl Client {
     fn stream_lifecycle(
         &self,
         record_retry_budget_success: bool,
+        record_attempt_success: bool,
         circuit_attempt: Option<crate::resilience::CircuitAttempt>,
         adaptive_attempt: Option<AdaptiveConcurrencyPermit>,
     ) -> Option<StreamLifecycle> {
@@ -336,10 +346,36 @@ impl Client {
             StreamResilienceHooks {
                 retry_budget: self.retry_budget.clone(),
                 record_retry_budget_success,
+                record_attempt_success,
                 circuit_attempt,
                 adaptive_attempt,
             },
         ))))
+    }
+
+    fn record_non_success_response_outcome(
+        &self,
+        status: http::StatusCode,
+        retry_policy: &RetryPolicy,
+        circuit_attempt: &mut Option<crate::resilience::CircuitAttempt>,
+        adaptive_attempt: &mut Option<AdaptiveConcurrencyPermit>,
+    ) {
+        if retry_policy.is_retryable_status(status) {
+            if let Some(attempt_guard) = circuit_attempt.take() {
+                attempt_guard.mark_failure();
+            }
+            if let Some(adaptive_guard) = adaptive_attempt.take() {
+                adaptive_guard.mark_failure();
+            }
+        } else {
+            self.record_successful_request_for_resilience();
+            if let Some(attempt_guard) = circuit_attempt.take() {
+                attempt_guard.mark_success();
+            }
+            if let Some(adaptive_guard) = adaptive_attempt.take() {
+                adaptive_guard.mark_success();
+            }
+        }
     }
 
     fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
@@ -1147,14 +1183,6 @@ impl Client {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             };
-            let mut circuit_attempt =
-                match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
-                    Ok(attempt) => attempt,
-                    Err(error) => {
-                        self.run_error_interceptors(&context, &error);
-                        return Err(error);
-                    }
-                };
             let host_permit = match self.acquire_host_request_permit(
                 rate_limit_host.as_deref(),
                 total_timeout,
@@ -1194,6 +1222,17 @@ impl Client {
             // Never forward hop-by-hop proxy credentials to origin servers.
             attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
             let current_uri_text = current_uri.to_string();
+            let mut circuit_attempt =
+                match self.begin_circuit_attempt(&current_method, &current_redacted_uri) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if let Some(adaptive_guard) = adaptive_attempt.take() {
+                            adaptive_guard.cancel();
+                        }
+                        self.run_error_interceptors(&context, &error);
+                        return Err(error);
+                    }
+                };
 
             let mut response = match self.run_once(
                 current_method.clone(),
@@ -1315,6 +1354,7 @@ impl Client {
                 if status.is_success() {
                     let stream_lifecycle = self.stream_lifecycle(
                         true,
+                        true,
                         circuit_attempt.take(),
                         adaptive_attempt.take(),
                     );
@@ -1364,8 +1404,10 @@ impl Client {
                     continue;
                 }
                 if should_return_non_success_response(status_policy) {
+                    let record_success = !retry_policy.is_retryable_status(status);
                     let stream_lifecycle = self.stream_lifecycle(
-                        !retry_policy.is_retryable_status(status),
+                        record_success,
+                        record_success,
                         circuit_attempt.take(),
                         adaptive_attempt.take(),
                     );
@@ -1385,6 +1427,42 @@ impl Client {
                         stream_global_permit: stream_global_permit.take(),
                         host_permit,
                     }));
+                }
+            }
+
+            if matches!(response_mode, ResponseMode::Buffered) && !status.is_success() {
+                if !ran_response_interceptors {
+                    self.run_response_interceptors(&context, status, &response_headers);
+                    ran_response_interceptors = true;
+                }
+                if !observed_server_throttle {
+                    self.observe_server_throttle(
+                        &context,
+                        status,
+                        &response_headers,
+                        rate_limit_host.as_deref(),
+                        self.backoff_source
+                            .backoff_for_retry(&retry_policy, attempt),
+                        retry_policy.configured_max_backoff(),
+                    );
+                    observed_server_throttle = true;
+                }
+                evaluated_status_retry = true;
+                if self.schedule_status_retry(
+                    StatusRetryContext {
+                        context: &context,
+                        retry_policy: &retry_policy,
+                        total_timeout,
+                        request_started_at,
+                        current_method: &current_method,
+                        current_redacted_uri: &current_redacted_uri,
+                        status,
+                        response_headers: &response_headers,
+                        max_attempts,
+                    },
+                    &mut attempt,
+                )? {
+                    continue;
                 }
             }
 
@@ -1425,8 +1503,8 @@ impl Client {
                         retry_policy.configured_max_backoff(),
                     );
                 }
-                if !evaluated_status_retry {
-                    if self.schedule_status_retry(
+                if !evaluated_status_retry
+                    && self.schedule_status_retry(
                         StatusRetryContext {
                             context: &context,
                             retry_policy: &retry_policy,
@@ -1439,25 +1517,24 @@ impl Client {
                             max_attempts,
                         },
                         &mut attempt,
-                    )? {
-                        continue;
-                    }
-                    if should_return_non_success_response(status_policy)
-                        && matches!(response_mode, ResponseMode::Buffered)
-                    {
-                        self.maybe_record_terminal_response_success(status, &retry_policy);
-                        if let Some(attempt_guard) = circuit_attempt.take() {
-                            attempt_guard.mark_success();
-                        }
-                        if let Some(adaptive_guard) = adaptive_attempt.take() {
-                            adaptive_guard.mark_success();
-                        }
-                        return Ok(RetryResponse::Buffered(Response::new(
-                            status,
-                            response_headers,
-                            response_body,
-                        )));
-                    }
+                    )?
+                {
+                    continue;
+                }
+                if should_return_non_success_response(status_policy)
+                    && matches!(response_mode, ResponseMode::Buffered)
+                {
+                    self.record_non_success_response_outcome(
+                        status,
+                        &retry_policy,
+                        &mut circuit_attempt,
+                        &mut adaptive_attempt,
+                    );
+                    return Ok(RetryResponse::Buffered(Response::new(
+                        status,
+                        response_headers,
+                        response_body,
+                    )));
                 }
 
                 let terminal = terminal_non_success(

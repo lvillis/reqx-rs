@@ -2249,6 +2249,40 @@ async fn metrics_snapshot_tracks_success_and_error_buckets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_status_retry_happens_before_body_limit() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            503,
+            Vec::<(String, String)>::new(),
+            "body-that-exceeds-limit",
+            Duration::ZERO,
+        ),
+        MockResponse::new(200, Vec::<(String, String)>::new(), "ok", Duration::ZERO),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .max_response_body_bytes(4)
+        .retry_policy(
+            RetryPolicy::standard()
+                .max_attempts(2)
+                .base_backoff(Duration::ZERO)
+                .max_backoff(Duration::from_millis(1))
+                .jitter_ratio(0.0),
+        )
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .get("/retry-before-body-limit")
+        .send()
+        .await
+        .expect("retryable status should retry before reading oversized body");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(server.served_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_snapshot_is_noop_when_metrics_disabled() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
