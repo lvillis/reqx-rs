@@ -13,7 +13,7 @@ use crate::content_encoding::{
 };
 use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
-use crate::util::is_timeout_io_error;
+use crate::util::{duration_from_millis_saturating, is_timeout_io_error};
 
 use super::{
     Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
@@ -191,7 +191,7 @@ impl BlockingResponseStream {
             return false;
         };
         deadline_limits_wait(
-            Duration::from_millis(self.timeout_ms.max(1) as u64),
+            duration_from_millis_saturating(self.timeout_ms.max(1)),
             deadline_at,
             self.clock.now_monotonic(),
         )

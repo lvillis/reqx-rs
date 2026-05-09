@@ -17,6 +17,7 @@ use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::extensions::Clock;
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
+use crate::util::duration_from_millis_saturating;
 
 use super::{
     Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
@@ -145,7 +146,7 @@ impl StreamBody {
     }
 
     fn effective_frame_timeout(&self) -> crate::Result<(Duration, bool)> {
-        let phase_timeout = Duration::from_millis(self.timeout_ms.max(1) as u64);
+        let phase_timeout = duration_from_millis_saturating(self.timeout_ms.max(1));
         let Some(deadline_at) = self.deadline_at else {
             return Ok((phase_timeout, false));
         };

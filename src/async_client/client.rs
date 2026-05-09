@@ -92,9 +92,10 @@ use crate::tls::{
 };
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
-    ensure_accept_encoding_async, lock_unpoisoned, merge_headers, parse_header_name,
-    parse_header_value, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs, resolve_uri,
-    total_timeout_deadline, total_timeout_expired, validate_base_url, validate_http_proxy_uri,
+    duration_millis_u64_saturating, ensure_accept_encoding_async, lock_unpoisoned, merge_headers,
+    parse_header_name, parse_header_value, phase_timeout, rate_limit_bucket_key,
+    redact_uri_for_logs, resolve_uri, total_timeout_deadline, total_timeout_expired,
+    validate_base_url, validate_http_proxy_uri,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2193,7 +2194,7 @@ impl Client {
             return Ok(None);
         };
 
-        let delay_ms = retry_delay.as_millis() as u64;
+        let delay_ms = duration_millis_u64_saturating(retry_delay);
         match retry_decision.reason() {
             RetryReason::Status(status) => {
                 warn!(
@@ -3171,7 +3172,7 @@ impl Client {
                 debug!(
                     parent: &span,
                     status = status.as_u16(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = duration_millis_u64_saturating(started.elapsed()),
                     "request completed"
                 );
             }

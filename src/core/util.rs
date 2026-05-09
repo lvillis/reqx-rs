@@ -796,6 +796,15 @@ pub(crate) fn phase_timeout(
     Some(per_attempt_timeout.min(remaining))
 }
 
+#[cfg(feature = "_async")]
+pub(crate) fn duration_millis_u64_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn duration_from_millis_saturating(milliseconds: u128) -> Duration {
+    Duration::from_millis(milliseconds.min(u64::MAX as u128) as u64)
+}
+
 pub(crate) fn total_timeout_expired(
     total_timeout: Option<Duration>,
     request_started_at: Instant,

@@ -237,7 +237,9 @@ impl TokenBucket {
         if capped_delay.is_zero() {
             return;
         }
-        let throttle_until = now + capped_delay;
+        let Some(throttle_until) = now.checked_add(capped_delay) else {
+            return;
+        };
         self.throttle_until = Some(match self.throttle_until {
             Some(existing) => existing.max(throttle_until),
             None => throttle_until,
@@ -606,6 +608,23 @@ mod tests {
             None,
         );
         assert!(limiter.acquire_delay(Some("api.example.com.")) >= Duration::from_millis(110));
+    }
+
+    #[test]
+    fn unrepresentable_throttle_deadline_does_not_panic_or_clear_existing_throttle() {
+        let now = Instant::now();
+        let mut bucket = TokenBucket::new(
+            RateLimitPolicy::standard()
+                .requests_per_second(100.0)
+                .burst(10)
+                .max_throttle_delay(Duration::MAX),
+            now,
+        );
+
+        bucket.apply_throttle(now, Duration::from_millis(50));
+        bucket.apply_throttle(now, Duration::MAX);
+
+        assert!(bucket.wait_duration(now) >= Duration::from_millis(50));
     }
 
     #[test]
