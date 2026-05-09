@@ -2583,6 +2583,58 @@ async fn redirect_303_allows_non_replayable_stream_body_when_method_changes_to_g
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_after_303_treats_dropped_stream_body_as_replayable() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            303,
+            vec![("Location", "/v1/middle")],
+            "redirect",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            307,
+            vec![("Location", "/v1/final")],
+            "redirect",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            "ok",
+            Duration::ZERO,
+        ),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/old")
+        .body_stream(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"payload"))
+        }))
+        .send()
+        .await
+        .expect("redirect chain should keep following after 303 drops the body");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(requests[1].path, "/v1/middle");
+    assert_eq!(requests[2].path, "/v1/final");
+    assert!(requests[1].body.is_empty());
+    assert!(requests[2].body.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirect_307_rejects_non_replayable_stream_body() {
     let server = MockServer::start(vec![MockResponse::new(
         307,
@@ -2608,6 +2660,39 @@ async fn redirect_307_rejects_non_replayable_stream_body() {
 
     match error {
         Error::RedirectBodyNotReplayable { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_307_rejects_non_replayable_get_stream_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        307,
+        vec![("Location", "/v1/new")],
+        "redirect",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .body_stream(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"payload"))
+        }))
+        .send()
+        .await
+        .expect_err("307 redirect should fail for a non-replayable GET body");
+
+    match error {
+        Error::RedirectBodyNotReplayable { method, .. } => assert_eq!(method, http::Method::GET),
         other => panic!("unexpected error: {other}"),
     }
 

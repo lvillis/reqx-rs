@@ -2,6 +2,7 @@
 use std::error::Error as StdError;
 #[cfg(feature = "_async")]
 use std::future::Future;
+use std::net::IpAddr;
 #[cfg(feature = "_async")]
 use std::pin::Pin;
 #[cfg(feature = "_async")]
@@ -41,6 +42,35 @@ pub(crate) struct ProxyConfig {
 pub(crate) enum NoProxyRule {
     Any,
     Domain { host: String, port: Option<u16> },
+}
+
+fn normalize_no_proxy_host(host: &str) -> Option<String> {
+    let normalized = normalize_host_key(host)?;
+    if let Some(unbracketed) = normalized
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        && unbracketed.parse::<IpAddr>().is_ok()
+    {
+        return Some(unbracketed.to_owned());
+    }
+    Some(normalized)
+}
+
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    host.parse().ok()
+}
+
+fn host_matches_no_proxy_rule(host: &str, rule_host: &str) -> bool {
+    let host_ip = parse_ip_literal(host);
+    let rule_ip = parse_ip_literal(rule_host);
+    if host_ip.is_some() || rule_ip.is_some() {
+        return host_ip.is_some() && host_ip == rule_ip;
+    }
+
+    host == rule_host
+        || host
+            .strip_suffix(rule_host)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 impl NoProxyRule {
@@ -92,6 +122,9 @@ impl NoProxyRule {
         if let Some(stripped) = candidate.strip_prefix('[') {
             let end = stripped.find(']')?;
             let host = &stripped[..end];
+            if host.parse::<IpAddr>().is_err() {
+                return None;
+            }
             let suffix = &stripped[end + 1..];
             if suffix.is_empty() {
                 port = None;
@@ -110,7 +143,7 @@ impl NoProxyRule {
             candidate = host.to_owned();
         }
         Some(Self::Domain {
-            host: normalize_host_key(&candidate)?,
+            host: normalize_no_proxy_host(&candidate)?,
             port,
         })
     }
@@ -122,10 +155,10 @@ impl NoProxyRule {
                 host: domain,
                 port: rule_port,
             } => {
-                let Some(host) = normalize_host_key(host) else {
+                let Some(host) = normalize_no_proxy_host(host) else {
                     return false;
                 };
-                let host_matches = host == *domain || host.ends_with(&format!(".{domain}"));
+                let host_matches = host_matches_no_proxy_rule(&host, domain);
                 if !host_matches {
                     return false;
                 }

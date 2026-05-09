@@ -2712,7 +2712,7 @@ impl Client {
             RequestBody::Buffered(body) => (Some(body), None),
             RequestBody::Streaming(body) => (None, Some(body)),
         };
-        let body_replayable = buffered_body.is_some();
+        let mut body_replayable = buffered_body.is_some();
         let retry_policy = execution_options
             .retry_policy
             .unwrap_or_else(|| self.retry_policy.clone());
@@ -2978,7 +2978,7 @@ impl Client {
             if let Some(redirect_action) = redirect_action {
                 self.run_response_interceptors(&context, status, &response_headers);
                 attempts.mark_success();
-                let method_changed_to_get = apply_redirect_transition(
+                let drops_body = apply_redirect_transition(
                     RedirectTransitionInput {
                         retry_eligibility: self.retry_eligibility.as_ref(),
                         retry_policy: &retry_policy,
@@ -2992,9 +2992,10 @@ impl Client {
                     },
                     redirect_action,
                 );
-                if method_changed_to_get {
+                if drops_body {
                     buffered_body = None;
                     streaming_body = None;
+                    body_replayable = true;
                 }
                 continue;
             }

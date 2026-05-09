@@ -595,7 +595,19 @@ where
         checkpoint.version = RESUMABLE_UPLOAD_CHECKPOINT_VERSION;
     }
 
+    normalize_checkpoint_part_numbers(checkpoint);
+
     Ok(())
+}
+
+fn normalize_checkpoint_part_numbers(checkpoint: &mut ResumableUploadCheckpoint) {
+    checkpoint.completed_parts.retain(|part_number, part| {
+        if *part_number == 0 {
+            return false;
+        }
+        part.part_number = *part_number;
+        true
+    });
 }
 
 fn checkpoint_part_matches(
@@ -1122,6 +1134,7 @@ mod tests {
         aborts: AtomicUsize,
         create_calls: AtomicUsize,
         completed: AtomicUsize,
+        completed_payloads: Mutex<Vec<Vec<UploadedPart>>>,
     }
 
     impl BlockingMockBackend {
@@ -1203,11 +1216,15 @@ mod tests {
         fn complete_upload(
             &self,
             _upload_id: &str,
-            _parts: &[UploadedPart],
+            parts: &[UploadedPart],
         ) -> Result<(), Self::Error> {
             if self.fail_complete.load(Ordering::SeqCst) {
                 return Err(MockError::new("complete upload failed"));
             }
+            self.completed_payloads
+                .lock()
+                .expect("lock completed_payloads")
+                .push(parts.to_vec());
             self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1357,6 +1374,64 @@ mod tests {
         let attempts = backend.attempts.lock().expect("lock attempts");
         assert_eq!(attempts.get(&1).copied(), Some(1));
         assert_eq!(attempts.get(&2).copied(), Some(1));
+    }
+
+    #[test]
+    fn blocking_resume_normalizes_checkpoint_part_numbers_before_completion() {
+        let backend = BlockingMockBackend::default();
+        let uploader = BlockingResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+        checkpoint.completed_parts.insert(
+            0,
+            UploadedPart {
+                part_number: 0,
+                etag: "unused".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"zero")),
+            },
+        );
+        checkpoint.completed_parts.insert(
+            1,
+            UploadedPart {
+                part_number: 99,
+                etag: "etag-1".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"abcd")),
+            },
+        );
+
+        let mut reader = std::io::Cursor::new(b"abcd".to_vec());
+        let result = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .expect("resume should normalize checkpoint part metadata");
+
+        assert_eq!(result.total_parts, 1);
+        assert_eq!(result.completed_parts[0].part_number, 1);
+        assert_eq!(
+            backend
+                .attempts
+                .lock()
+                .expect("lock attempts")
+                .get(&1)
+                .copied(),
+            None
+        );
+
+        let completed_payloads = backend
+            .completed_payloads
+            .lock()
+            .expect("lock completed_payloads");
+        assert_eq!(completed_payloads.len(), 1);
+        assert_eq!(completed_payloads[0].len(), 1);
+        assert_eq!(completed_payloads[0][0].part_number, 1);
     }
 
     #[test]
@@ -1663,6 +1738,7 @@ mod tests {
         aborts: Arc<AtomicUsize>,
         create_calls: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
+        completed_payloads: Arc<Mutex<Vec<Vec<UploadedPart>>>>,
     }
 
     #[cfg(feature = "_async")]
@@ -1717,11 +1793,15 @@ mod tests {
         async fn complete_upload(
             &self,
             _upload_id: &str,
-            _parts: &[UploadedPart],
+            parts: &[UploadedPart],
         ) -> Result<(), Self::Error> {
             if self.fail_complete.load(Ordering::SeqCst) {
                 return Err(MockError::new("complete upload failed"));
             }
+            self.completed_payloads
+                .lock()
+                .expect("lock completed_payloads")
+                .push(parts.to_vec());
             self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1816,6 +1896,66 @@ mod tests {
         let attempts = backend.attempts.lock().expect("lock attempts");
         assert_eq!(attempts.get(&1).copied(), Some(1));
         assert_eq!(attempts.get(&2).copied(), Some(1));
+    }
+
+    #[cfg(feature = "_async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_resume_normalizes_checkpoint_part_numbers_before_completion() {
+        let backend = AsyncMockBackend::default();
+        let uploader = AsyncResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-async-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+        checkpoint.completed_parts.insert(
+            0,
+            UploadedPart {
+                part_number: 0,
+                etag: "unused".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"zero")),
+            },
+        );
+        checkpoint.completed_parts.insert(
+            1,
+            UploadedPart {
+                part_number: 99,
+                etag: "etag-1".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"abcd")),
+            },
+        );
+
+        let mut reader = std::io::Cursor::new(b"abcd".to_vec());
+        let result = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .await
+            .expect("resume should normalize checkpoint part metadata");
+
+        assert_eq!(result.total_parts, 1);
+        assert_eq!(result.completed_parts[0].part_number, 1);
+        assert_eq!(
+            backend
+                .attempts
+                .lock()
+                .expect("lock attempts")
+                .get(&1)
+                .copied(),
+            None
+        );
+
+        let completed_payloads = backend
+            .completed_payloads
+            .lock()
+            .expect("lock completed_payloads");
+        assert_eq!(completed_payloads.len(), 1);
+        assert_eq!(completed_payloads[0].len(), 1);
+        assert_eq!(completed_payloads[0][0].part_number, 1);
     }
 
     #[cfg(feature = "_async")]

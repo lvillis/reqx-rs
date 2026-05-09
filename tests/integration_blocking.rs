@@ -3298,6 +3298,40 @@ fn blocking_redirect_303_allows_non_replayable_reader_body_when_method_changes_t
 }
 
 #[test]
+fn blocking_redirect_after_303_treats_dropped_reader_body_as_replayable() {
+    let server = MockServer::start(vec![
+        MockResponse::new(303, vec![("Location", "/v1/middle")], b"redirect".to_vec()),
+        MockResponse::new(307, vec![("Location", "/v1/final")], b"redirect".to_vec()),
+        MockResponse::new(200, vec![("Content-Type", "text/plain")], b"ok".to_vec()),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/old")
+        .body_reader(Cursor::new(b"payload".to_vec()))
+        .send()
+        .expect("redirect chain should keep following after 303 drops the body");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text_lossy(), "ok");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(requests[1].path, "/v1/middle");
+    assert_eq!(requests[2].path, "/v1/final");
+    assert!(requests[1].body.is_empty());
+    assert!(requests[2].body.is_empty());
+}
+
+#[test]
 fn blocking_redirect_307_rejects_non_replayable_reader_body() {
     let server = MockServer::start(vec![MockResponse::new(
         307,
@@ -3320,6 +3354,36 @@ fn blocking_redirect_307_rejects_non_replayable_reader_body() {
 
     match error {
         Error::RedirectBodyNotReplayable { .. } => {}
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn blocking_redirect_307_rejects_non_replayable_get_reader_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        307,
+        vec![("Location", "/v1/new")],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/old")
+        .body_reader(Cursor::new(b"payload".to_vec()))
+        .send()
+        .expect_err("307 redirect should fail for a non-replayable GET body");
+
+    match error {
+        Error::RedirectBodyNotReplayable { method, .. } => assert_eq!(method, http::Method::GET),
         other => panic!("unexpected error: {other}"),
     }
 

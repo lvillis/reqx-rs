@@ -1805,10 +1805,32 @@ fn no_proxy_rule_parses_bracketed_ipv6_with_port() {
 }
 
 #[test]
+fn no_proxy_rule_rejects_bracketed_non_ip_host() {
+    assert!(NoProxyRule::parse("[example.com]").is_none());
+}
+
+#[test]
 fn no_proxy_rule_keeps_plain_ipv6_without_port() {
     let rule = NoProxyRule::parse("2001:db8::1").expect("valid ipv6 rule");
     assert!(rule.matches("2001:db8::1", None));
     assert!(!rule.matches("2001:db8::2", None));
+}
+
+#[test]
+fn no_proxy_rule_ip_literals_do_not_match_suffixes() {
+    let ipv4_rule = NoProxyRule::parse("127.0.0.1").expect("valid ipv4 rule");
+    assert!(ipv4_rule.matches("127.0.0.1", None));
+    assert!(!ipv4_rule.matches("api.127.0.0.1", None));
+
+    let suffix_like_rule = NoProxyRule::parse("0.0.1").expect("valid numeric domain rule");
+    assert!(!suffix_like_rule.matches("127.0.0.1", None));
+}
+
+#[test]
+fn no_proxy_rule_ipv6_matches_canonical_equivalents_only() {
+    let rule = NoProxyRule::parse("::1").expect("valid ipv6 rule");
+    assert!(rule.matches("0:0:0:0:0:0:0:1", None));
+    assert!(!rule.matches("2001:db8::1", None));
 }
 
 #[test]
@@ -1846,6 +1868,13 @@ fn no_proxy_bypass_matches_trailing_dot_uri_host() {
         .parse()
         .expect("uri should parse");
     assert!(should_bypass_proxy_uri(&rules, &uri));
+}
+
+#[test]
+fn no_proxy_bypass_does_not_treat_ipv4_suffix_as_match() {
+    let rules = vec![NoProxyRule::parse("0.0.1").expect("valid numeric domain rule")];
+    let uri: http::Uri = "http://127.0.0.1/v1".parse().expect("uri should parse");
+    assert!(!should_bypass_proxy_uri(&rules, &uri));
 }
 
 #[test]

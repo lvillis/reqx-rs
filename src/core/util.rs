@@ -888,7 +888,7 @@ pub(crate) fn is_redirect_status(status: StatusCode) -> bool {
 
 pub(crate) fn redirect_method(method: &Method, status: StatusCode) -> Method {
     match status {
-        StatusCode::SEE_OTHER => Method::GET,
+        StatusCode::SEE_OTHER if *method != Method::HEAD => Method::GET,
         StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => Method::GET,
         _ => method.clone(),
     }
@@ -1009,12 +1009,12 @@ pub(crate) fn resolve_redirect_uri(current_uri: &Uri, location: &str) -> Option<
 
 pub(crate) fn sanitize_headers_for_redirect(
     headers: &mut HeaderMap,
-    method_changed_to_get: bool,
+    drops_body: bool,
     same_origin_redirect: bool,
 ) {
     remove_hop_by_hop_redirect_headers(headers);
     headers.remove(HOST);
-    if method_changed_to_get {
+    if drops_body {
         headers.remove(CONTENT_ENCODING);
         headers.remove(CONTENT_LENGTH);
         headers.remove(CONTENT_TYPE);

@@ -19,7 +19,7 @@ pub(crate) struct RedirectAction {
     pub(crate) next_method: Method,
     pub(crate) next_uri: Uri,
     pub(crate) next_redacted_uri: String,
-    pub(crate) method_changed_to_get: bool,
+    pub(crate) drops_body: bool,
     pub(crate) same_origin_redirect: bool,
 }
 
@@ -361,12 +361,12 @@ pub(crate) fn prepare_retry_schedule(
         return Ok(RetrySchedule::NotScheduled);
     }
 
-    consume_retry_budget()?;
     let Some(delay) = bounded_retry_delay(requested_delay, total_timeout, request_started_at)
     else {
         return Err(deadline_exceeded_error(total_timeout, method, redacted_uri));
     };
 
+    consume_retry_budget()?;
     *attempt += 1;
     Ok(RetrySchedule::Scheduled { delay })
 }
@@ -459,14 +459,8 @@ pub(crate) fn next_redirect_action(
     }
 
     let next_method = redirect_method(current_method, status);
-    let method_changed_to_get = next_method == Method::GET && *current_method != Method::GET;
-    if !body_replayable
-        && !method_changed_to_get
-        && !matches!(
-            *current_method,
-            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
-        )
-    {
+    let drops_body = redirect_drops_body(current_method, status);
+    if !body_replayable && !drops_body {
         return Err(Error::RedirectBodyNotReplayable {
             method: current_method.clone(),
             uri: current_redacted_uri.to_owned(),
@@ -493,8 +487,14 @@ pub(crate) fn next_redirect_action(
         same_origin_redirect: same_origin(current_uri, &next_uri),
         next_redacted_uri: redact_uri_for_logs(&next_uri.to_string()),
         next_uri,
-        method_changed_to_get,
+        drops_body,
     }))
+}
+
+fn redirect_drops_body(current_method: &Method, status: StatusCode) -> bool {
+    matches!(status, StatusCode::SEE_OTHER)
+        || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+            && *current_method == Method::POST)
 }
 
 pub(crate) fn apply_redirect_transition(
@@ -514,21 +514,21 @@ pub(crate) fn apply_redirect_transition(
     } = input;
     sanitize_headers_for_redirect(
         current_headers,
-        redirect_action.method_changed_to_get,
+        redirect_action.drops_body,
         redirect_action.same_origin_redirect,
     );
-    let method_changed_to_get = redirect_action.method_changed_to_get;
+    let drops_body = redirect_action.drops_body;
     *current_method = redirect_action.next_method;
     *current_uri = redirect_action.next_uri;
     *current_redacted_uri = redirect_action.next_redacted_uri;
     *redirect_count = redirect_count.saturating_add(1);
     if *max_attempts == 1
-        && (body_replayable || method_changed_to_get)
+        && (body_replayable || drops_body)
         && retry_eligibility.supports_retry(current_method, current_headers)
     {
         *max_attempts = retry_policy.configured_max_attempts();
     }
-    method_changed_to_get
+    drops_body
 }
 
 #[cfg(test)]
@@ -541,11 +541,14 @@ mod tests {
     use http::header::{HeaderName, HeaderValue};
 
     use super::{
-        RetrySchedule, RetryScheduleInput, prepare_retry_schedule, server_throttle_delay,
-        status_retry_delay, transport_retry_decision,
+        RedirectInput, RetrySchedule, RetryScheduleInput, next_redirect_action,
+        prepare_retry_schedule, server_throttle_delay, status_retry_delay,
+        transport_retry_decision,
     };
+    use crate::error::Error;
     use crate::error::TransportErrorKind;
     use crate::extensions::SystemClock;
+    use crate::policy::RedirectPolicy;
     use crate::retry::RetryPolicy;
 
     struct TestAttempt {
@@ -629,6 +632,97 @@ mod tests {
     }
 
     #[test]
+    fn redirect_rejects_non_replayable_body_when_method_is_preserved() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("location"),
+            HeaderValue::from_static("/next"),
+        );
+        let current_uri = "http://example.com/old"
+            .parse()
+            .expect("current URI should parse");
+        let method = http::Method::GET;
+
+        let error = next_redirect_action(RedirectInput {
+            redirect_policy: RedirectPolicy::limited(1),
+            redirect_count: 0,
+            status: http::StatusCode::TEMPORARY_REDIRECT,
+            current_method: &method,
+            current_uri: &current_uri,
+            current_redacted_uri: "http://example.com/old",
+            response_headers: &headers,
+            body_replayable: false,
+        })
+        .expect_err("preserving a non-replayable body should fail");
+
+        match error {
+            Error::RedirectBodyNotReplayable {
+                method: error_method,
+                ..
+            } => assert_eq!(error_method, method),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn redirect_303_drops_non_replayable_body_even_when_method_is_get() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("location"),
+            HeaderValue::from_static("/next"),
+        );
+        let current_uri = "http://example.com/old"
+            .parse()
+            .expect("current URI should parse");
+        let method = http::Method::GET;
+
+        let action = next_redirect_action(RedirectInput {
+            redirect_policy: RedirectPolicy::limited(1),
+            redirect_count: 0,
+            status: http::StatusCode::SEE_OTHER,
+            current_method: &method,
+            current_uri: &current_uri,
+            current_redacted_uri: "http://example.com/old",
+            response_headers: &headers,
+            body_replayable: false,
+        })
+        .expect("303 redirect should be accepted")
+        .expect("303 redirect should produce an action");
+
+        assert_eq!(action.next_method, http::Method::GET);
+        assert!(action.drops_body);
+    }
+
+    #[test]
+    fn redirect_303_preserves_head_method() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("location"),
+            HeaderValue::from_static("/next"),
+        );
+        let current_uri = "http://example.com/old"
+            .parse()
+            .expect("current URI should parse");
+        let method = http::Method::HEAD;
+
+        let action = next_redirect_action(RedirectInput {
+            redirect_policy: RedirectPolicy::limited(1),
+            redirect_count: 0,
+            status: http::StatusCode::SEE_OTHER,
+            current_method: &method,
+            current_uri: &current_uri,
+            current_redacted_uri: "http://example.com/old",
+            response_headers: &headers,
+            body_replayable: true,
+        })
+        .expect("303 redirect should be accepted")
+        .expect("303 redirect should produce an action");
+
+        assert_eq!(action.next_method, http::Method::HEAD);
+        assert!(action.drops_body);
+    }
+
+    #[test]
     fn prepare_retry_schedule_skips_budget_when_decision_is_not_retryable() {
         let method = http::Method::GET;
         let redacted_uri = "https://example.com";
@@ -707,6 +801,52 @@ mod tests {
         ));
         assert_eq!(attempt, 2);
         assert_eq!(budget_consumed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_retry_schedule_skips_budget_when_deadline_prevents_retry() {
+        let method = http::Method::GET;
+        let redacted_uri = "https://example.com";
+        let mut attempt = 1;
+        let retry_policy = RetryPolicy::standard()
+            .max_attempts(3)
+            .retryable_transport_error_kinds([TransportErrorKind::Connect]);
+        let retry_decision = transport_retry_decision(
+            attempt,
+            3,
+            &method,
+            redacted_uri,
+            TransportErrorKind::Connect,
+        );
+        let budget_consumed = AtomicUsize::new(0);
+        let request_started_at = Instant::now()
+            .checked_sub(Duration::from_millis(20))
+            .expect("test start time should be representable");
+
+        let error = match prepare_retry_schedule(
+            RetryScheduleInput {
+                retry_policy: &retry_policy,
+                retry_decision: &retry_decision,
+                requested_delay: Duration::from_millis(10),
+                attempt: &mut attempt,
+                max_attempts: 3,
+                total_timeout: Some(Duration::from_millis(5)),
+                request_started_at,
+                method: &method,
+                redacted_uri,
+            },
+            || {
+                budget_consumed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("expired deadline should prevent retry scheduling"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::DeadlineExceeded { .. }));
+        assert_eq!(attempt, 1);
+        assert_eq!(budget_consumed.load(Ordering::SeqCst), 0);
     }
 
     #[test]
