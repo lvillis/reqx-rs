@@ -8,9 +8,10 @@ use crate::extensions::{Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
-    bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after_capped,
-    redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, same_origin,
-    sanitize_headers_for_redirect, total_timeout_expired, truncate_body, validate_base_url,
+    bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after,
+    parse_retry_after_capped, redact_uri_for_logs, redirect_location, redirect_method,
+    resolve_redirect_uri, same_origin, sanitize_headers_for_redirect, total_timeout_expired,
+    truncate_body, validate_base_url,
 };
 
 #[derive(Debug)]
@@ -207,6 +208,14 @@ pub(crate) fn status_retry_delay(
     let retry_after_cap = max_delay.max(Duration::from_millis(1));
     let fallback = fallback.min(retry_after_cap);
     parse_retry_after_capped(headers, clock.now_system(), retry_after_cap).unwrap_or(fallback)
+}
+
+pub(crate) fn server_throttle_delay(
+    clock: &dyn Clock,
+    headers: &HeaderMap,
+    fallback: Duration,
+) -> Duration {
+    parse_retry_after(headers, clock.now_system()).unwrap_or(fallback)
 }
 
 #[cfg(feature = "_async")]
@@ -532,8 +541,8 @@ mod tests {
     use http::header::{HeaderName, HeaderValue};
 
     use super::{
-        RetrySchedule, RetryScheduleInput, prepare_retry_schedule, status_retry_delay,
-        transport_retry_decision,
+        RetrySchedule, RetryScheduleInput, prepare_retry_schedule, server_throttle_delay,
+        status_retry_delay, transport_retry_decision,
     };
     use crate::error::TransportErrorKind;
     use crate::extensions::SystemClock;
@@ -604,6 +613,19 @@ mod tests {
         );
 
         assert_eq!(delay, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn server_throttle_delay_uses_retry_after_without_retry_backoff_cap() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("120"),
+        );
+
+        let delay = server_throttle_delay(&SystemClock, &headers, Duration::from_millis(50));
+
+        assert_eq!(delay, Duration::from_secs(120));
     }
 
     #[test]

@@ -611,6 +611,34 @@ mod tests {
     }
 
     #[test]
+    fn server_throttle_delay_is_capped_by_rate_limit_policy() {
+        let clock = Arc::new(TestClock::default());
+        let limiter = RateLimiter::new(
+            None,
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(100.0)
+                    .burst(10)
+                    .max_throttle_delay(Duration::from_millis(500)),
+            ),
+            clock,
+        )
+        .expect("per-host limiter should be built");
+
+        limiter.observe_server_throttle(
+            Some("api.example.com"),
+            Duration::from_secs(120),
+            ServerThrottleScope::Auto,
+            None,
+        );
+
+        assert_eq!(
+            limiter.acquire_delay(Some("api.example.com")),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
     fn unrepresentable_throttle_deadline_does_not_panic_or_clear_existing_throttle() {
         let now = Instant::now();
         let mut bucket = TokenBucket::new(

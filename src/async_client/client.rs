@@ -40,8 +40,8 @@ use crate::execution::{
     AttemptGuards, BodyReadOutcome, RedirectInput, RedirectTransitionInput, RetryScheduleInput,
     StatusRetryPlanInput, apply_redirect_transition, effective_status_policy, next_redirect_action,
     prepare_retry_schedule, response_body_read_retry_decision, select_base_url,
-    should_return_non_success_response, status_retry_delay, status_retry_error, status_retry_plan,
-    stream_timing, terminal_non_success, timeout_retry_decision,
+    server_throttle_delay, should_return_non_success_response, status_retry_error,
+    status_retry_plan, stream_timing, terminal_non_success, timeout_retry_decision,
     transport_retry_decision_from_error, transport_timeout_error,
 };
 use crate::extensions::{
@@ -2098,17 +2098,11 @@ impl Client {
         headers: &HeaderMap,
         host: Option<&str>,
         fallback_delay: Duration,
-        max_retry_delay: Duration,
     ) {
         if status != http::StatusCode::TOO_MANY_REQUESTS {
             return;
         }
-        let throttle_delay = status_retry_delay(
-            self.clock.as_ref(),
-            headers,
-            fallback_delay,
-            max_retry_delay,
-        );
+        let throttle_delay = server_throttle_delay(self.clock.as_ref(), headers, fallback_delay);
         let header_scope_hint = server_throttle_scope_from_headers(headers);
         let resolved_scope = match &self.rate_limiter {
             Some(rate_limiter) => rate_limiter.observe_server_throttle(
@@ -3040,7 +3034,6 @@ impl Client {
                     rate_limit_host.as_deref(),
                     self.backoff_source
                         .backoff_for_retry(&retry_policy, attempt),
-                    retry_policy.configured_max_backoff(),
                 );
                 observed_server_throttle = true;
 
@@ -3107,7 +3100,6 @@ impl Client {
                         rate_limit_host.as_deref(),
                         self.backoff_source
                             .backoff_for_retry(&retry_policy, attempt),
-                        retry_policy.configured_max_backoff(),
                     );
                     observed_server_throttle = true;
                 }
@@ -3189,7 +3181,6 @@ impl Client {
                         rate_limit_host.as_deref(),
                         self.backoff_source
                             .backoff_for_retry(&retry_policy, attempt),
-                        retry_policy.configured_max_backoff(),
                     );
                 }
                 if !evaluated_status_retry
