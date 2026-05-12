@@ -1,3 +1,22 @@
+## [0.1.36] - 2026-05-12
+
+### 🐛 Bug Fixes
+
+- *(upload)* Revalidate checkpoint ETags on resume
+- Correct retry, resilience, and integrity edge cases
+- *(resilience)* Release attempt resources before retry backoff
+- *(rate-limit)* Avoid panic on oversized throttle delays
+- *(rate-limit)* Honor Retry-After throttle independently of retry backoff
+- Harden request execution edge cases
+
+### 🚜 Refactor
+
+- *(execution)* Unify async and blocking request flow
+## [0.1.35] - 2026-04-23
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.35
 ## [0.1.34] - 2026-04-10
 
 ### 🐛 Bug Fixes
