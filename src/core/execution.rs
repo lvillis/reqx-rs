@@ -3,16 +3,269 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 
+use crate::core::request_builder::RequestExecutionOptions;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::extensions::{Clock, EndpointSelector};
-use crate::policy::{RedirectPolicy, StatusPolicy};
+use crate::policy::{RedirectPolicy, RequestContext, StatusPolicy};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after,
-    parse_retry_after_capped, redact_uri_for_logs, redirect_location, redirect_method,
-    resolve_redirect_uri, same_origin, sanitize_headers_for_redirect, total_timeout_expired,
-    truncate_body, validate_base_url,
+    parse_retry_after_capped, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
+    redirect_location, redirect_method, resolve_redirect_uri, same_origin,
+    sanitize_headers_for_redirect, total_timeout_expired, truncate_body, validate_base_url,
 };
+
+pub(crate) struct RetryRequestInput<Body> {
+    pub(crate) method: Method,
+    pub(crate) uri: Uri,
+    pub(crate) redacted_uri_text: String,
+    pub(crate) merged_headers: HeaderMap,
+    pub(crate) body: Body,
+    pub(crate) execution_options: RequestExecutionOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponseMode {
+    Buffered,
+    Stream,
+}
+
+impl ResponseMode {
+    pub(crate) const fn is_buffered(self) -> bool {
+        matches!(self, Self::Buffered)
+    }
+
+    pub(crate) const fn is_stream(self) -> bool {
+        matches!(self, Self::Stream)
+    }
+}
+
+pub(crate) struct RequestExecutionStateInput {
+    pub(crate) method: Method,
+    pub(crate) uri: Uri,
+    pub(crate) redacted_uri_text: String,
+    pub(crate) merged_headers: HeaderMap,
+    pub(crate) body_replayable: bool,
+    pub(crate) retry_policy: RetryPolicy,
+    pub(crate) redirect_policy: RedirectPolicy,
+    pub(crate) status_policy: StatusPolicy,
+    pub(crate) timeout_value: Duration,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) request_started_at: Instant,
+}
+
+pub(crate) struct RequestExecutionState {
+    pub(crate) retry_policy: RetryPolicy,
+    pub(crate) redirect_policy: RedirectPolicy,
+    pub(crate) status_policy: StatusPolicy,
+    pub(crate) timeout_value: Duration,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) request_started_at: Instant,
+    pub(crate) attempt: usize,
+    pub(crate) max_attempts: usize,
+    pub(crate) redirect_count: usize,
+    pub(crate) current_method: Method,
+    pub(crate) current_uri: Uri,
+    pub(crate) current_redacted_uri: String,
+    pub(crate) current_headers: HeaderMap,
+    pub(crate) body_replayable: bool,
+}
+
+impl RequestExecutionState {
+    pub(crate) fn new(
+        input: RequestExecutionStateInput,
+        retry_eligibility: &dyn RetryEligibility,
+    ) -> Self {
+        let RequestExecutionStateInput {
+            method,
+            uri,
+            redacted_uri_text,
+            merged_headers,
+            body_replayable,
+            retry_policy,
+            redirect_policy,
+            status_policy,
+            timeout_value,
+            total_timeout,
+            max_response_body_bytes,
+            request_started_at,
+        } = input;
+        let max_attempts =
+            if retry_eligibility.supports_retry(&method, &merged_headers) && body_replayable {
+                retry_policy.configured_max_attempts()
+            } else {
+                1
+            };
+
+        Self {
+            retry_policy,
+            redirect_policy,
+            status_policy,
+            timeout_value,
+            total_timeout,
+            max_response_body_bytes,
+            request_started_at,
+            attempt: 1,
+            max_attempts,
+            redirect_count: 0,
+            current_method: method,
+            current_uri: uri,
+            current_redacted_uri: redacted_uri_text,
+            current_headers: merged_headers,
+            body_replayable,
+        }
+    }
+
+    pub(crate) const fn can_attempt(&self) -> bool {
+        self.attempt <= self.max_attempts
+    }
+
+    pub(crate) fn context(&self) -> RequestContext {
+        RequestContext::new(
+            self.current_method.clone(),
+            self.current_redacted_uri.clone(),
+            self.attempt,
+            self.max_attempts,
+            self.redirect_count,
+        )
+    }
+
+    pub(crate) fn rate_limit_host(&self) -> Option<String> {
+        rate_limit_bucket_key(&self.current_uri)
+    }
+
+    pub(crate) fn phase_timeout(&self) -> Option<Duration> {
+        phase_timeout(
+            self.timeout_value,
+            self.total_timeout,
+            self.request_started_at,
+        )
+    }
+
+    pub(crate) fn deadline_error(&self) -> Error {
+        deadline_exceeded_error(
+            self.total_timeout,
+            &self.current_method,
+            &self.current_redacted_uri,
+        )
+    }
+
+    pub(crate) fn retry_backoff(
+        &self,
+        backoff_source: &dyn crate::extensions::BackoffSource,
+    ) -> Duration {
+        backoff_source.backoff_for_retry(&self.retry_policy, self.attempt)
+    }
+
+    pub(crate) fn status_retry_plan(
+        &self,
+        status: StatusCode,
+        headers: &HeaderMap,
+        clock: &dyn Clock,
+        fallback_delay: Duration,
+    ) -> StatusRetryPlan {
+        status_retry_plan(StatusRetryPlanInput {
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            method: &self.current_method,
+            redacted_uri: &self.current_redacted_uri,
+            status,
+            headers,
+            clock,
+            fallback_delay,
+            max_delay: self.retry_policy.configured_max_backoff(),
+        })
+    }
+
+    pub(crate) fn retry_attempt(&mut self) -> RetryAttemptState<'_> {
+        RetryAttemptState {
+            retry_policy: &self.retry_policy,
+            total_timeout: self.total_timeout,
+            request_started_at: self.request_started_at,
+            method: &self.current_method,
+            redacted_uri: &self.current_redacted_uri,
+            attempt: &mut self.attempt,
+            max_attempts: self.max_attempts,
+        }
+    }
+
+    pub(crate) fn next_redirect_action(
+        &self,
+        status: StatusCode,
+        response_headers: &HeaderMap,
+    ) -> Result<Option<RedirectAction>, Error> {
+        next_redirect_action(RedirectInput {
+            redirect_policy: self.redirect_policy,
+            redirect_count: self.redirect_count,
+            status,
+            current_method: &self.current_method,
+            current_uri: &self.current_uri,
+            current_redacted_uri: &self.current_redacted_uri,
+            response_headers,
+            body_replayable: self.body_replayable,
+        })
+    }
+
+    pub(crate) fn apply_redirect(
+        &mut self,
+        redirect_action: RedirectAction,
+        retry_eligibility: &dyn RetryEligibility,
+    ) -> bool {
+        let drops_body = apply_redirect_transition(
+            RedirectTransitionInput {
+                retry_eligibility,
+                retry_policy: &self.retry_policy,
+                max_attempts: &mut self.max_attempts,
+                body_replayable: self.body_replayable,
+                current_headers: &mut self.current_headers,
+                current_method: &mut self.current_method,
+                current_uri: &mut self.current_uri,
+                current_redacted_uri: &mut self.current_redacted_uri,
+                redirect_count: &mut self.redirect_count,
+            },
+            redirect_action,
+        );
+        if drops_body {
+            self.body_replayable = true;
+        }
+        drops_body
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ResponseProgress {
+    ran_response_interceptors: bool,
+    observed_server_throttle: bool,
+    evaluated_status_retry: bool,
+}
+
+impl ResponseProgress {
+    pub(crate) fn mark_response_interceptors_ran(&mut self) {
+        self.ran_response_interceptors = true;
+    }
+
+    pub(crate) fn mark_server_throttle_observed(&mut self) {
+        self.observed_server_throttle = true;
+    }
+
+    pub(crate) fn mark_status_retry_evaluated(&mut self) {
+        self.evaluated_status_retry = true;
+    }
+
+    pub(crate) const fn needs_response_interceptors(&self) -> bool {
+        !self.ran_response_interceptors
+    }
+
+    pub(crate) const fn needs_server_throttle_observation(&self) -> bool {
+        !self.observed_server_throttle
+    }
+
+    pub(crate) const fn needs_status_retry_evaluation(&self) -> bool {
+        !self.evaluated_status_retry
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RedirectAction {
@@ -44,13 +297,6 @@ pub(crate) struct RedirectTransitionInput<'a> {
     pub(crate) current_uri: &'a mut Uri,
     pub(crate) current_redacted_uri: &'a mut String,
     pub(crate) redirect_count: &'a mut usize,
-}
-
-pub(crate) fn effective_status_policy(
-    request_policy: Option<StatusPolicy>,
-    client_policy: StatusPolicy,
-) -> StatusPolicy {
-    request_policy.unwrap_or(client_policy)
 }
 
 pub(crate) fn select_base_url(
@@ -240,6 +486,63 @@ pub(crate) struct StatusRetryPlan {
 pub(crate) enum BodyReadOutcome {
     Body(Bytes),
     Retry(Duration),
+}
+
+pub(crate) struct RetryAttemptState<'a> {
+    pub(crate) retry_policy: &'a RetryPolicy,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) request_started_at: Instant,
+    pub(crate) method: &'a Method,
+    pub(crate) redacted_uri: &'a str,
+    pub(crate) attempt: &'a mut usize,
+    pub(crate) max_attempts: usize,
+}
+
+impl RetryAttemptState<'_> {
+    pub(crate) fn prepare_retry_schedule(
+        self,
+        retry_decision: &RetryDecision,
+        requested_delay: Duration,
+        consume_retry_budget: impl FnOnce(&Method, &str) -> Result<(), Error>,
+    ) -> Result<RetrySchedule, Error> {
+        let Self {
+            retry_policy,
+            total_timeout,
+            request_started_at,
+            method,
+            redacted_uri,
+            attempt,
+            max_attempts,
+        } = self;
+
+        prepare_retry_schedule(
+            RetryScheduleInput {
+                retry_policy,
+                retry_decision,
+                requested_delay,
+                attempt,
+                max_attempts,
+                total_timeout,
+                request_started_at,
+                method,
+                redacted_uri,
+            },
+            || consume_retry_budget(method, redacted_uri),
+        )
+    }
+}
+
+pub(crate) struct BodyReadRetryContext<'a> {
+    pub(crate) context: &'a RequestContext,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) read_timeout: Duration,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) request_started_at: Instant,
+    pub(crate) method: &'a Method,
+    pub(crate) redacted_uri: &'a str,
+    pub(crate) retry_policy: &'a RetryPolicy,
+    pub(crate) max_attempts: usize,
+    pub(crate) attempt: &'a mut usize,
 }
 
 pub(crate) trait AttemptOutcome {

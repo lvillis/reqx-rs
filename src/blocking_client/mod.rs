@@ -26,6 +26,7 @@ mod request;
 mod transport;
 
 use crate::blocking_client::limiters::RequestLimiters;
+use crate::core::request_builder::RequestExecutionOptions;
 
 pub use request::RequestBuilder;
 
@@ -141,16 +142,6 @@ impl Drop for AdaptiveConcurrencyPermit {
             self.completed = true;
         }
     }
-}
-
-struct RequestExecutionOptions {
-    request_timeout: Option<Duration>,
-    total_timeout: Option<Duration>,
-    retry_policy: Option<RetryPolicy>,
-    max_response_body_bytes: Option<usize>,
-    redirect_policy: Option<RedirectPolicy>,
-    status_policy: Option<StatusPolicy>,
-    auto_accept_encoding: Option<bool>,
 }
 
 enum RequestBody {

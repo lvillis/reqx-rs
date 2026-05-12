@@ -12,9 +12,9 @@ use tokio_util::io::ReaderStream;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::body::{RequestBody, stream_req_body};
-use crate::client::{Client, RequestExecutionOptions};
+use crate::client::Client;
 use crate::core::request_builder::{
-    PreparedRequest, RequestExecutionOverrides, RequestPreparation,
+    PreparedRequest, RequestExecutionOptions, RequestExecutionOverrides, RequestPreparation,
 };
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
@@ -369,19 +369,5 @@ impl<'a> RequestBuilder<'a> {
         client
             .send_request_stream(method, path, headers, body, execution_options)
             .await
-    }
-}
-
-impl From<RequestExecutionOverrides> for RequestExecutionOptions {
-    fn from(overrides: RequestExecutionOverrides) -> Self {
-        Self {
-            request_timeout: overrides.request_timeout,
-            total_timeout: overrides.total_timeout,
-            max_response_body_bytes: overrides.max_response_body_bytes,
-            retry_policy: overrides.retry_policy,
-            redirect_policy: overrides.redirect_policy,
-            status_policy: overrides.status_policy,
-            auto_accept_encoding: overrides.auto_accept_encoding,
-        }
     }
 }

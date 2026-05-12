@@ -24,6 +24,30 @@ impl RequestExecutionOverrides {
     }
 }
 
+pub(crate) struct RequestExecutionOptions {
+    pub(crate) request_timeout: Option<Duration>,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) retry_policy: Option<RetryPolicy>,
+    pub(crate) max_response_body_bytes: Option<usize>,
+    pub(crate) redirect_policy: Option<RedirectPolicy>,
+    pub(crate) status_policy: Option<StatusPolicy>,
+    pub(crate) auto_accept_encoding: Option<bool>,
+}
+
+impl From<RequestExecutionOverrides> for RequestExecutionOptions {
+    fn from(overrides: RequestExecutionOverrides) -> Self {
+        Self {
+            request_timeout: overrides.request_timeout,
+            total_timeout: overrides.total_timeout,
+            max_response_body_bytes: overrides.max_response_body_bytes,
+            retry_policy: overrides.retry_policy,
+            redirect_policy: overrides.redirect_policy,
+            status_policy: overrides.status_policy,
+            auto_accept_encoding: overrides.auto_accept_encoding,
+        }
+    }
+}
+
 pub(crate) struct PreparedRequest<'a, ClientRef, Body, ExecutionOptions> {
     pub(crate) client: &'a ClientRef,
     pub(crate) method: Method,

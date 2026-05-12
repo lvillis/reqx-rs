@@ -9,14 +9,14 @@ use serde::de::DeserializeOwned;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::core::request_builder::{
-    PreparedRequest, RequestExecutionOverrides, RequestPreparation,
+    PreparedRequest, RequestExecutionOptions, RequestExecutionOverrides, RequestPreparation,
 };
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryPolicy;
 use crate::util::{parse_header_name, parse_header_value};
 
-use super::{Client, RequestBody, RequestExecutionOptions};
+use super::{Client, RequestBody};
 
 /// Builds and executes a single request against an existing [`Client`].
 ///
@@ -313,19 +313,5 @@ impl<'a> RequestBuilder<'a> {
             execution_options,
         } = self.into_prepared_request(Some(StatusPolicy::Response));
         client.send_request_stream(method, path, headers, body, execution_options)
-    }
-}
-
-impl From<RequestExecutionOverrides> for RequestExecutionOptions {
-    fn from(overrides: RequestExecutionOverrides) -> Self {
-        Self {
-            request_timeout: overrides.request_timeout,
-            total_timeout: overrides.total_timeout,
-            retry_policy: overrides.retry_policy,
-            max_response_body_bytes: overrides.max_response_body_bytes,
-            redirect_policy: overrides.redirect_policy,
-            status_policy: overrides.status_policy,
-            auto_accept_encoding: overrides.auto_accept_encoding,
-        }
     }
 }
