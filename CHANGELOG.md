@@ -12,6 +12,10 @@
 ### 🚜 Refactor
 
 - *(execution)* Unify async and blocking request flow
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.36
 ## [0.1.35] - 2026-04-23
 
 ### ⚙️ Miscellaneous Tasks
