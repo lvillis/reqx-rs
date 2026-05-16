@@ -11,8 +11,7 @@ use crate::execution::{
     AttemptGuards, BodyReadOutcome, BodyReadRetryContext, RequestExecutionState,
     RequestExecutionStateInput, ResponseMode, ResponseProgress, RetryAttemptState,
     RetryRequestInput, response_body_read_retry_decision, select_base_url, server_throttle_delay,
-    should_return_non_success_response, stream_timing, terminal_non_success,
-    timeout_retry_decision, transport_retry_decision_from_error, transport_timeout_error,
+    timeout_retry_decision,
 };
 use crate::extensions::Clock;
 use crate::metrics::MetricsSnapshot;
@@ -22,7 +21,7 @@ use crate::response::{
     BlockingResponseStream, BlockingResponseStreamContext, Response, StreamLifecycle,
     StreamOutcomeHooks,
 };
-use crate::retry::{RetryDecision, RetryPolicy};
+use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
@@ -260,16 +259,6 @@ impl Client {
         }
     }
 
-    fn maybe_record_terminal_response_success(
-        &self,
-        status: http::StatusCode,
-        retry_policy: &RetryPolicy,
-    ) {
-        if !retry_policy.is_retryable_status(status) {
-            self.record_successful_request_for_resilience();
-        }
-    }
-
     fn stream_lifecycle(
         &self,
         record_retry_budget_success: bool,
@@ -288,20 +277,6 @@ impl Client {
                 attempts,
             },
         ))))
-    }
-
-    fn record_non_success_response_outcome(
-        &self,
-        status: http::StatusCode,
-        retry_policy: &RetryPolicy,
-        attempts: &mut AttemptGuards<crate::resilience::CircuitAttempt, AdaptiveConcurrencyPermit>,
-    ) {
-        if retry_policy.is_retryable_status(status) {
-            attempts.mark_failure();
-        } else {
-            self.record_successful_request_for_resilience();
-            attempts.mark_success();
-        }
     }
 
     fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
@@ -1030,7 +1005,7 @@ impl Client {
             self.retry_eligibility.as_ref(),
         );
 
-        let stream_timing = stream_timing(execution.total_timeout, request_started_at);
+        let stream_timing = execution.stream_timing();
         let stream_total_timeout_ms = stream_timing.total_timeout_ms;
         let stream_deadline_at = stream_timing.deadline_at;
         let mut stream_global_permit = stream_global_permit;
@@ -1041,10 +1016,10 @@ impl Client {
             let rate_limit_host = execution.rate_limit_host();
             if let Err(error) = self.acquire_rate_limit_slot(
                 rate_limit_host.as_deref(),
-                execution.total_timeout,
-                execution.request_started_at,
-                &execution.current_method,
-                &execution.current_redacted_uri,
+                execution.total_timeout(),
+                execution.request_started_at(),
+                execution.current_method(),
+                execution.current_redacted_uri(),
             ) {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
@@ -1056,10 +1031,10 @@ impl Client {
             };
             let host_permit = match self.acquire_host_request_permit(
                 rate_limit_host.as_deref(),
-                execution.total_timeout,
-                execution.request_started_at,
-                &execution.current_method,
-                &execution.current_redacted_uri,
+                execution.total_timeout(),
+                execution.request_started_at(),
+                execution.current_method(),
+                execution.current_redacted_uri(),
             ) {
                 Ok(permit) => permit,
                 Err(error) => {
@@ -1068,7 +1043,7 @@ impl Client {
                 }
             };
             let circuit_attempt = match self
-                .begin_circuit_attempt(&execution.current_method, &execution.current_redacted_uri)
+                .begin_circuit_attempt(execution.current_method(), execution.current_redacted_uri())
             {
                 Ok(attempt) => attempt,
                 Err(error) => {
@@ -1081,10 +1056,10 @@ impl Client {
                 AdaptiveConcurrencyPermit,
             > = AttemptGuards::new(circuit_attempt, None);
             let adaptive_attempt = match self.begin_adaptive_attempt(
-                execution.total_timeout,
-                execution.request_started_at,
-                &execution.current_method,
-                &execution.current_redacted_uri,
+                execution.total_timeout(),
+                execution.request_started_at(),
+                execution.current_method(),
+                execution.current_redacted_uri(),
             ) {
                 Ok(attempt) => attempt,
                 Err(error) => {
@@ -1103,15 +1078,15 @@ impl Client {
                     None => RequestBody::Buffered(Bytes::new()),
                 }
             };
-            let mut attempt_headers = execution.current_headers.clone();
+            let mut attempt_headers = execution.current_headers().clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
             // Never forward hop-by-hop proxy credentials to origin servers.
             attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
-            let current_uri_text = execution.current_uri.to_string();
+            let current_uri_text = execution.current_uri().to_string();
 
             let mut response = match self.run_once(
-                execution.current_method.clone(),
-                &execution.current_uri,
+                execution.current_method().clone(),
+                execution.current_uri(),
                 &current_uri_text,
                 &attempt_headers,
                 request_body,
@@ -1126,23 +1101,13 @@ impl Client {
                             ..
                         }
                     ) {
-                        transport_timeout_error(
-                            execution.total_timeout,
-                            execution.request_started_at,
-                            transport_timeout.as_millis(),
-                            &execution.current_method,
-                            &execution.current_redacted_uri,
-                        )
+                        execution.transport_timeout_error(transport_timeout.as_millis())
                     } else {
                         error
                     };
-                    let Some(retry_decision) = transport_retry_decision_from_error(
-                        execution.attempt,
-                        execution.max_attempts,
-                        &execution.current_method,
-                        &execution.current_redacted_uri,
-                        &error,
-                    ) else {
+                    let Some(retry_decision) =
+                        execution.transport_retry_decision_from_error(&error)
+                    else {
                         attempts.cancel();
                         self.run_error_interceptors(&context, &error);
                         return Err(error);
@@ -1191,8 +1156,9 @@ impl Client {
             let mut response_progress = ResponseProgress::default();
 
             if response_mode.is_stream() {
-                self.run_response_interceptors(&context, status, &response_headers);
-                response_progress.mark_response_interceptors_ran();
+                response_progress.run_response_interceptors_if_needed(|| {
+                    self.run_response_interceptors(&context, status, &response_headers);
+                });
 
                 if status.is_success() {
                     let stream_lifecycle = self.stream_lifecycle(true, true, attempts.take());
@@ -1200,56 +1166,9 @@ impl Client {
                         status,
                         response_headers,
                         response_body: response.into_body(),
-                        method: execution.current_method.clone(),
-                        uri: execution.current_uri.clone(),
-                        redacted_uri: execution.current_redacted_uri.clone(),
-                        transport_timeout,
-                        stream_total_timeout_ms,
-                        stream_deadline_at,
-                        stream_deadline_slack: self.stream_deadline_slack,
-                        clock: Arc::clone(&self.clock),
-                        stream_lifecycle,
-                        stream_global_permit: stream_global_permit.take(),
-                        host_permit,
-                    }));
-                }
-
-                self.observe_server_throttle(
-                    &context,
-                    status,
-                    &response_headers,
-                    rate_limit_host.as_deref(),
-                    self.backoff_source
-                        .backoff_for_retry(&execution.retry_policy, execution.attempt),
-                );
-                response_progress.mark_server_throttle_observed();
-                response_progress.mark_status_retry_evaluated();
-                if let Some(retry_delay) =
-                    self.prepare_status_retry(&mut execution, &context, status, &response_headers)?
-                {
-                    attempts.mark_failure();
-                    drop(response);
-                    drop(host_permit);
-                    if !retry_delay.is_zero() {
-                        sleep(retry_delay);
-                    }
-                    continue;
-                }
-                if should_return_non_success_response(execution.status_policy) {
-                    let retryable_status = execution.retry_policy.is_retryable_status(status);
-                    if retryable_status {
-                        attempts.mark_failure();
-                    }
-                    let record_success = !retryable_status;
-                    let stream_lifecycle =
-                        self.stream_lifecycle(record_success, record_success, attempts.take());
-                    return Ok(stream_retry_response(StreamResponseInput {
-                        status,
-                        response_headers,
-                        response_body: response.into_body(),
-                        method: execution.current_method.clone(),
-                        uri: execution.current_uri.clone(),
-                        redacted_uri: execution.current_redacted_uri.clone(),
+                        method: execution.current_method().clone(),
+                        uri: execution.current_uri().clone(),
+                        redacted_uri: execution.current_redacted_uri().to_owned(),
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
@@ -1262,26 +1181,29 @@ impl Client {
                 }
             }
 
-            if response_mode.is_buffered() && !status.is_success() {
-                if response_progress.needs_response_interceptors() {
-                    self.run_response_interceptors(&context, status, &response_headers);
-                    response_progress.mark_response_interceptors_ran();
-                }
-                if response_progress.needs_server_throttle_observation() {
-                    self.observe_server_throttle(
-                        &context,
-                        status,
-                        &response_headers,
-                        rate_limit_host.as_deref(),
-                        self.backoff_source
-                            .backoff_for_retry(&execution.retry_policy, execution.attempt),
-                    );
-                    response_progress.mark_server_throttle_observed();
-                }
-                response_progress.mark_status_retry_evaluated();
-                if let Some(retry_delay) =
-                    self.prepare_status_retry(&mut execution, &context, status, &response_headers)?
-                {
+            if !status.is_success() {
+                let server_throttle_fallback_delay =
+                    execution.retry_backoff(self.backoff_source.as_ref());
+                if let Some(retry_delay) = response_progress.prepare_non_success_before_body(
+                    || self.run_response_interceptors(&context, status, &response_headers),
+                    || {
+                        self.observe_server_throttle(
+                            &context,
+                            status,
+                            &response_headers,
+                            rate_limit_host.as_deref(),
+                            server_throttle_fallback_delay,
+                        );
+                    },
+                    || {
+                        self.prepare_status_retry(
+                            &mut execution,
+                            &context,
+                            status,
+                            &response_headers,
+                        )
+                    },
+                )? {
                     attempts.mark_failure();
                     drop(response);
                     drop(host_permit);
@@ -1289,6 +1211,30 @@ impl Client {
                         sleep(retry_delay);
                     }
                     continue;
+                }
+                if response_mode.is_stream() && execution.should_return_non_success_response() {
+                    let stream_resilience = execution
+                        .non_success_resilience_outcome(status)
+                        .prepare_stream_response_attempt(&mut attempts);
+                    let record_success = stream_resilience.record_success_on_complete();
+                    let stream_lifecycle =
+                        self.stream_lifecycle(record_success, record_success, attempts.take());
+                    return Ok(stream_retry_response(StreamResponseInput {
+                        status,
+                        response_headers,
+                        response_body: response.into_body(),
+                        method: execution.current_method().clone(),
+                        uri: execution.current_uri().clone(),
+                        redacted_uri: execution.current_redacted_uri().to_owned(),
+                        transport_timeout,
+                        stream_total_timeout_ms,
+                        stream_deadline_at,
+                        stream_deadline_slack: self.stream_deadline_slack,
+                        clock: Arc::clone(&self.clock),
+                        stream_lifecycle,
+                        stream_global_permit: stream_global_permit.take(),
+                        host_permit,
+                    }));
                 }
             }
 
@@ -1296,18 +1242,7 @@ impl Client {
                 &mut response,
                 &mut response_headers,
                 status,
-                BodyReadRetryContext {
-                    context: &context,
-                    max_response_body_bytes: execution.max_response_body_bytes,
-                    read_timeout: transport_timeout,
-                    retry_policy: &execution.retry_policy,
-                    total_timeout: execution.total_timeout,
-                    request_started_at: execution.request_started_at,
-                    method: &execution.current_method,
-                    redacted_uri: &execution.current_redacted_uri,
-                    attempt: &mut execution.attempt,
-                    max_attempts: execution.max_attempts,
-                },
+                execution.body_read_retry_context(&context, transport_timeout),
             )? {
                 BodyReadOutcome::Body(body) => body,
                 BodyReadOutcome::Retry(retry_delay) => {
@@ -1321,46 +1256,17 @@ impl Client {
                 }
             };
 
-            if response_progress.needs_response_interceptors() {
+            response_progress.run_response_interceptors_if_needed(|| {
                 self.run_response_interceptors(&context, status, &response_headers);
-            }
+            });
 
             if !status.is_success() {
-                if response_progress.needs_server_throttle_observation() {
-                    self.observe_server_throttle(
-                        &context,
-                        status,
-                        &response_headers,
-                        rate_limit_host.as_deref(),
-                        self.backoff_source
-                            .backoff_for_retry(&execution.retry_policy, execution.attempt),
-                    );
-                }
-                if response_progress.needs_status_retry_evaluation()
-                    && let Some(retry_delay) = self.prepare_status_retry(
-                        &mut execution,
-                        &context,
-                        status,
-                        &response_headers,
-                    )?
-                {
-                    attempts.mark_failure();
-                    drop(response);
-                    drop(response_body);
-                    drop(host_permit);
-                    if !retry_delay.is_zero() {
-                        sleep(retry_delay);
+                if execution.should_return_non_success_response() && response_mode.is_buffered() {
+                    let resilience = execution.non_success_resilience_outcome(status);
+                    resilience.record_buffered_response_attempt(&mut attempts);
+                    if resilience.record_success() {
+                        self.record_successful_request_for_resilience();
                     }
-                    continue;
-                }
-                if should_return_non_success_response(execution.status_policy)
-                    && response_mode.is_buffered()
-                {
-                    self.record_non_success_response_outcome(
-                        status,
-                        &execution.retry_policy,
-                        &mut attempts,
-                    );
                     return Ok(RetryResponse::Buffered(Response::new(
                         status,
                         response_headers,
@@ -1368,17 +1274,11 @@ impl Client {
                     )));
                 }
 
-                let terminal = terminal_non_success(
-                    status,
-                    &execution.current_method,
-                    &execution.current_redacted_uri,
-                    &response_headers,
-                    &response_body,
-                    &execution.retry_policy,
-                );
-                if terminal.should_mark_success {
-                    attempts.mark_success();
-                    self.maybe_record_terminal_response_success(status, &execution.retry_policy);
+                let terminal =
+                    execution.terminal_non_success(status, &response_headers, &response_body);
+                terminal.resilience.record_terminal_attempt(&mut attempts);
+                if terminal.resilience.record_success() {
+                    self.record_successful_request_for_resilience();
                 }
                 self.run_error_interceptors(&context, &terminal.error);
                 return Err(terminal.error);

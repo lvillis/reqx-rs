@@ -56,21 +56,21 @@ pub(crate) struct RequestExecutionStateInput {
 }
 
 pub(crate) struct RequestExecutionState {
-    pub(crate) retry_policy: RetryPolicy,
-    pub(crate) redirect_policy: RedirectPolicy,
-    pub(crate) status_policy: StatusPolicy,
-    pub(crate) timeout_value: Duration,
-    pub(crate) total_timeout: Option<Duration>,
-    pub(crate) max_response_body_bytes: usize,
-    pub(crate) request_started_at: Instant,
-    pub(crate) attempt: usize,
-    pub(crate) max_attempts: usize,
-    pub(crate) redirect_count: usize,
-    pub(crate) current_method: Method,
-    pub(crate) current_uri: Uri,
-    pub(crate) current_redacted_uri: String,
-    pub(crate) current_headers: HeaderMap,
-    pub(crate) body_replayable: bool,
+    retry_policy: RetryPolicy,
+    redirect_policy: RedirectPolicy,
+    status_policy: StatusPolicy,
+    timeout_value: Duration,
+    total_timeout: Option<Duration>,
+    max_response_body_bytes: usize,
+    request_started_at: Instant,
+    attempt: usize,
+    max_attempts: usize,
+    redirect_count: usize,
+    current_method: Method,
+    current_uri: Uri,
+    current_redacted_uri: String,
+    current_headers: HeaderMap,
+    body_replayable: bool,
 }
 
 impl RequestExecutionState {
@@ -122,6 +122,40 @@ impl RequestExecutionState {
         self.attempt <= self.max_attempts
     }
 
+    #[cfg(any(feature = "_async", test))]
+    pub(crate) const fn attempt(&self) -> usize {
+        self.attempt
+    }
+
+    #[cfg(any(feature = "_async", test))]
+    pub(crate) const fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    pub(crate) const fn total_timeout(&self) -> Option<Duration> {
+        self.total_timeout
+    }
+
+    pub(crate) fn request_started_at(&self) -> Instant {
+        self.request_started_at
+    }
+
+    pub(crate) fn current_method(&self) -> &Method {
+        &self.current_method
+    }
+
+    pub(crate) fn current_uri(&self) -> &Uri {
+        &self.current_uri
+    }
+
+    pub(crate) fn current_redacted_uri(&self) -> &str {
+        &self.current_redacted_uri
+    }
+
+    pub(crate) fn current_headers(&self) -> &HeaderMap {
+        &self.current_headers
+    }
+
     pub(crate) fn context(&self) -> RequestContext {
         RequestContext::new(
             self.current_method.clone(),
@@ -130,6 +164,10 @@ impl RequestExecutionState {
             self.max_attempts,
             self.redirect_count,
         )
+    }
+
+    pub(crate) fn stream_timing(&self) -> StreamTiming {
+        stream_timing(self.total_timeout, self.request_started_at)
     }
 
     pub(crate) fn rate_limit_host(&self) -> Option<String> {
@@ -147,6 +185,16 @@ impl RequestExecutionState {
     pub(crate) fn deadline_error(&self) -> Error {
         deadline_exceeded_error(
             self.total_timeout,
+            &self.current_method,
+            &self.current_redacted_uri,
+        )
+    }
+
+    pub(crate) fn transport_timeout_error(&self, timeout_ms: u128) -> Error {
+        transport_timeout_error(
+            self.total_timeout,
+            self.request_started_at,
+            timeout_ms,
             &self.current_method,
             &self.current_redacted_uri,
         )
@@ -177,6 +225,75 @@ impl RequestExecutionState {
             fallback_delay,
             max_delay: self.retry_policy.configured_max_backoff(),
         })
+    }
+
+    #[cfg(feature = "_async")]
+    pub(crate) fn status_retry_error(&self, status: StatusCode, headers: &HeaderMap) -> Error {
+        status_retry_error(
+            status,
+            &self.current_method,
+            &self.current_redacted_uri,
+            headers,
+        )
+    }
+
+    pub(crate) fn transport_retry_decision_from_error(
+        &self,
+        error: &Error,
+    ) -> Option<RetryDecision> {
+        transport_retry_decision_from_error(
+            self.attempt,
+            self.max_attempts,
+            &self.current_method,
+            &self.current_redacted_uri,
+            error,
+        )
+    }
+
+    pub(crate) fn body_read_retry_context<'a>(
+        &'a mut self,
+        context: &'a RequestContext,
+        read_timeout: Duration,
+    ) -> BodyReadRetryContext<'a> {
+        BodyReadRetryContext {
+            context,
+            max_response_body_bytes: self.max_response_body_bytes,
+            read_timeout,
+            total_timeout: self.total_timeout,
+            request_started_at: self.request_started_at,
+            method: &self.current_method,
+            redacted_uri: &self.current_redacted_uri,
+            retry_policy: &self.retry_policy,
+            max_attempts: self.max_attempts,
+            attempt: &mut self.attempt,
+        }
+    }
+
+    pub(crate) fn non_success_resilience_outcome(
+        &self,
+        status: StatusCode,
+    ) -> ResponseResilienceOutcome {
+        ResponseResilienceOutcome::from_status(&self.retry_policy, status)
+    }
+
+    pub(crate) const fn should_return_non_success_response(&self) -> bool {
+        should_return_non_success_response(self.status_policy)
+    }
+
+    pub(crate) fn terminal_non_success(
+        &self,
+        status: StatusCode,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> TerminalNonSuccess {
+        terminal_non_success(
+            status,
+            &self.current_method,
+            &self.current_redacted_uri,
+            headers,
+            body,
+            &self.retry_policy,
+        )
     }
 
     pub(crate) fn retry_attempt(&mut self) -> RetryAttemptState<'_> {
@@ -242,28 +359,64 @@ pub(crate) struct ResponseProgress {
 }
 
 impl ResponseProgress {
-    pub(crate) fn mark_response_interceptors_ran(&mut self) {
+    fn mark_response_interceptors_ran(&mut self) {
         self.ran_response_interceptors = true;
     }
 
-    pub(crate) fn mark_server_throttle_observed(&mut self) {
+    fn mark_server_throttle_observed(&mut self) {
         self.observed_server_throttle = true;
     }
 
-    pub(crate) fn mark_status_retry_evaluated(&mut self) {
+    fn mark_status_retry_evaluated(&mut self) {
         self.evaluated_status_retry = true;
     }
 
-    pub(crate) const fn needs_response_interceptors(&self) -> bool {
+    const fn needs_response_interceptors(&self) -> bool {
         !self.ran_response_interceptors
     }
 
-    pub(crate) const fn needs_server_throttle_observation(&self) -> bool {
+    const fn needs_server_throttle_observation(&self) -> bool {
         !self.observed_server_throttle
     }
 
-    pub(crate) const fn needs_status_retry_evaluation(&self) -> bool {
+    const fn needs_status_retry_evaluation(&self) -> bool {
         !self.evaluated_status_retry
+    }
+
+    pub(crate) fn run_response_interceptors_if_needed(&mut self, run: impl FnOnce()) {
+        if self.needs_response_interceptors() {
+            run();
+            self.mark_response_interceptors_ran();
+        }
+    }
+
+    fn observe_server_throttle_if_needed(&mut self, observe: impl FnOnce()) {
+        if self.needs_server_throttle_observation() {
+            observe();
+            self.mark_server_throttle_observed();
+        }
+    }
+
+    fn try_status_retry_if_needed(
+        &mut self,
+        retry: impl FnOnce() -> Result<Option<Duration>, Error>,
+    ) -> Result<Option<Duration>, Error> {
+        if self.needs_status_retry_evaluation() {
+            self.mark_status_retry_evaluated();
+            return retry();
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn prepare_non_success_before_body(
+        &mut self,
+        run_response_interceptors: impl FnOnce(),
+        observe_server_throttle: impl FnOnce(),
+        try_status_retry: impl FnOnce() -> Result<Option<Duration>, Error>,
+    ) -> Result<Option<Duration>, Error> {
+        self.run_response_interceptors_if_needed(run_response_interceptors);
+        self.observe_server_throttle_if_needed(observe_server_throttle);
+        self.try_status_retry_if_needed(try_status_retry)
     }
 }
 
@@ -425,9 +578,69 @@ pub(crate) fn should_mark_non_success_for_resilience(
     !retry_policy.is_retryable_status(status)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResponseResilienceOutcome {
+    record_success: bool,
+}
+
+impl ResponseResilienceOutcome {
+    pub(crate) fn from_status(retry_policy: &RetryPolicy, status: StatusCode) -> Self {
+        Self {
+            record_success: should_mark_non_success_for_resilience(retry_policy, status),
+        }
+    }
+
+    pub(crate) const fn record_success(self) -> bool {
+        self.record_success
+    }
+
+    pub(crate) fn record_buffered_response_attempt<C, A>(self, attempts: &mut AttemptGuards<C, A>)
+    where
+        C: AttemptOutcome,
+        A: AttemptOutcome,
+    {
+        attempts.record(self.record_success);
+    }
+
+    pub(crate) fn record_terminal_attempt<C, A>(self, attempts: &mut AttemptGuards<C, A>)
+    where
+        C: AttemptOutcome,
+        A: AttemptOutcome,
+    {
+        attempts.record(self.record_success);
+    }
+
+    pub(crate) fn prepare_stream_response_attempt<C, A>(
+        self,
+        attempts: &mut AttemptGuards<C, A>,
+    ) -> StreamResponseResilience
+    where
+        C: AttemptOutcome,
+        A: AttemptOutcome,
+    {
+        if !self.record_success {
+            attempts.mark_failure();
+        }
+        StreamResponseResilience {
+            record_success_on_complete: self.record_success,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamResponseResilience {
+    record_success_on_complete: bool,
+}
+
+impl StreamResponseResilience {
+    pub(crate) const fn record_success_on_complete(self) -> bool {
+        self.record_success_on_complete
+    }
+}
+
 pub(crate) struct TerminalNonSuccess {
     pub(crate) error: Error,
-    pub(crate) should_mark_success: bool,
+    pub(crate) resilience: ResponseResilienceOutcome,
 }
 
 pub(crate) fn terminal_non_success(
@@ -440,7 +653,7 @@ pub(crate) fn terminal_non_success(
 ) -> TerminalNonSuccess {
     TerminalNonSuccess {
         error: http_status_error(status, method, redacted_uri, headers, truncate_body(body)),
-        should_mark_success: should_mark_non_success_for_resilience(retry_policy, status),
+        resilience: ResponseResilienceOutcome::from_status(retry_policy, status),
     }
 }
 
@@ -844,15 +1057,16 @@ mod tests {
     use http::header::{HeaderName, HeaderValue};
 
     use super::{
-        RedirectInput, RetrySchedule, RetryScheduleInput, next_redirect_action,
+        RedirectAction, RedirectInput, RequestExecutionState, RequestExecutionStateInput,
+        ResponseProgress, RetrySchedule, RetryScheduleInput, next_redirect_action,
         prepare_retry_schedule, server_throttle_delay, status_retry_delay,
         transport_retry_decision,
     };
     use crate::error::Error;
     use crate::error::TransportErrorKind;
     use crate::extensions::SystemClock;
-    use crate::policy::RedirectPolicy;
-    use crate::retry::RetryPolicy;
+    use crate::policy::{RedirectPolicy, StatusPolicy};
+    use crate::retry::{PermissiveRetryEligibility, RetryPolicy};
 
     struct TestAttempt {
         name: &'static str,
@@ -889,6 +1103,33 @@ mod tests {
                 .expect("lock events")
                 .push(format!("{}:cancel", self.name));
         }
+    }
+
+    fn test_execution_state(
+        method: http::Method,
+        body_replayable: bool,
+        retry_policy: RetryPolicy,
+    ) -> RequestExecutionState {
+        let uri = "http://example.com/old"
+            .parse()
+            .expect("request URI should parse");
+        RequestExecutionState::new(
+            RequestExecutionStateInput {
+                method,
+                uri,
+                redacted_uri_text: "http://example.com/old".to_owned(),
+                merged_headers: HeaderMap::new(),
+                body_replayable,
+                retry_policy,
+                redirect_policy: RedirectPolicy::limited(3),
+                status_policy: StatusPolicy::error(),
+                timeout_value: Duration::from_millis(250),
+                total_timeout: Some(Duration::from_secs(5)),
+                max_response_body_bytes: 1024,
+                request_started_at: Instant::now(),
+            },
+            &PermissiveRetryEligibility,
+        )
     }
 
     #[test]
@@ -1023,6 +1264,186 @@ mod tests {
 
         assert_eq!(action.next_method, http::Method::HEAD);
         assert!(action.drops_body);
+    }
+
+    #[test]
+    fn request_execution_state_reenables_retries_when_redirect_drops_body() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let mut state = test_execution_state(http::Method::POST, false, retry_policy);
+        let next_uri = "http://example.com/next"
+            .parse()
+            .expect("redirect URI should parse");
+
+        assert_eq!(state.max_attempts(), 1);
+
+        let drops_body = state.apply_redirect(
+            RedirectAction {
+                next_method: http::Method::GET,
+                next_uri,
+                next_redacted_uri: "http://example.com/next".to_owned(),
+                drops_body: true,
+                same_origin_redirect: true,
+            },
+            &PermissiveRetryEligibility,
+        );
+
+        assert!(drops_body);
+        assert_eq!(state.max_attempts(), 3);
+        assert_eq!(state.current_method(), &http::Method::GET);
+        assert_eq!(state.current_redacted_uri(), "http://example.com/next");
+    }
+
+    #[test]
+    fn body_read_retry_context_borrows_execution_attempt() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let mut state = test_execution_state(http::Method::GET, true, retry_policy);
+        let context = state.context();
+
+        {
+            let retry_context = state.body_read_retry_context(&context, Duration::from_millis(75));
+            assert_eq!(retry_context.context.attempt(), 1);
+            assert_eq!(retry_context.max_response_body_bytes, 1024);
+            assert_eq!(retry_context.read_timeout, Duration::from_millis(75));
+            assert_eq!(retry_context.method, &http::Method::GET);
+            assert_eq!(retry_context.redacted_uri, "http://example.com/old");
+            assert_eq!(retry_context.max_attempts, 3);
+
+            *retry_context.attempt = 2;
+        }
+
+        assert_eq!(state.attempt(), 2);
+    }
+
+    #[test]
+    fn response_progress_helpers_run_each_stage_once() {
+        let mut progress = ResponseProgress::default();
+        let mut response_interceptors = 0;
+        let mut throttle_observations = 0;
+        let mut status_retries = 0;
+
+        progress.run_response_interceptors_if_needed(|| response_interceptors += 1);
+        progress.run_response_interceptors_if_needed(|| response_interceptors += 1);
+        progress.observe_server_throttle_if_needed(|| throttle_observations += 1);
+        progress.observe_server_throttle_if_needed(|| throttle_observations += 1);
+
+        let first_retry = progress
+            .try_status_retry_if_needed(|| {
+                status_retries += 1;
+                Ok(Some(Duration::from_millis(10)))
+            })
+            .expect("status retry check should succeed");
+        let second_retry = progress
+            .try_status_retry_if_needed(|| {
+                status_retries += 1;
+                Ok(Some(Duration::from_millis(20)))
+            })
+            .expect("status retry check should stay idempotent");
+
+        assert_eq!(response_interceptors, 1);
+        assert_eq!(throttle_observations, 1);
+        assert_eq!(status_retries, 1);
+        assert_eq!(first_retry, Some(Duration::from_millis(10)));
+        assert_eq!(second_retry, None);
+    }
+
+    #[test]
+    fn response_progress_pre_body_helper_runs_each_stage_once() {
+        let mut progress = ResponseProgress::default();
+        let mut response_interceptors = 0;
+        let mut throttle_observations = 0;
+        let mut status_retries = 0;
+
+        let first_retry = progress
+            .prepare_non_success_before_body(
+                || response_interceptors += 1,
+                || throttle_observations += 1,
+                || {
+                    status_retries += 1;
+                    Ok(Some(Duration::from_millis(10)))
+                },
+            )
+            .expect("pre-body status handling should succeed");
+        let second_retry = progress
+            .prepare_non_success_before_body(
+                || response_interceptors += 1,
+                || throttle_observations += 1,
+                || {
+                    status_retries += 1;
+                    Ok(Some(Duration::from_millis(20)))
+                },
+            )
+            .expect("pre-body status handling should remain idempotent");
+
+        assert_eq!(response_interceptors, 1);
+        assert_eq!(throttle_observations, 1);
+        assert_eq!(status_retries, 1);
+        assert_eq!(first_retry, Some(Duration::from_millis(10)));
+        assert_eq!(second_retry, None);
+    }
+
+    #[test]
+    fn response_resilience_outcome_records_buffered_non_retryable_status_as_success() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+        let outcome = super::ResponseResilienceOutcome::from_status(
+            &RetryPolicy::standard(),
+            http::StatusCode::NOT_FOUND,
+        );
+
+        outcome.record_buffered_response_attempt(&mut attempts);
+
+        assert!(outcome.record_success());
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:success".to_owned(), "adaptive:success".to_owned()]
+        );
+    }
+
+    #[test]
+    fn response_resilience_outcome_records_stream_retryable_status_before_return() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+        let outcome = super::ResponseResilienceOutcome::from_status(
+            &RetryPolicy::standard(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        let stream_resilience = outcome.prepare_stream_response_attempt(&mut attempts);
+
+        assert!(!outcome.record_success());
+        assert!(!stream_resilience.record_success_on_complete());
+        assert!(attempts.is_empty());
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
+    }
+
+    #[test]
+    fn response_resilience_outcome_records_terminal_retryable_status_as_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+        let outcome = super::ResponseResilienceOutcome::from_status(
+            &RetryPolicy::standard(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        outcome.record_terminal_attempt(&mut attempts);
+
+        assert!(!outcome.record_success());
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
     }
 
     #[test]
