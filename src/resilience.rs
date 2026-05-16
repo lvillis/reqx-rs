@@ -414,6 +414,12 @@ pub(crate) struct AdaptiveConcurrencyState {
     ewma_latency_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdaptiveConcurrencyOutcome {
+    Success,
+    Failure,
+}
+
 impl AdaptiveConcurrencyPolicy {
     /// Returns the default adaptive concurrency settings.
     pub const fn standard() -> Self {
@@ -556,7 +562,7 @@ impl AdaptiveConcurrencyState {
     pub(crate) fn release_and_record(
         &mut self,
         policy: AdaptiveConcurrencyPolicy,
-        success: bool,
+        outcome: AdaptiveConcurrencyOutcome,
         latency: Duration,
     ) {
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -569,7 +575,8 @@ impl AdaptiveConcurrencyState {
         }
 
         let threshold_ms = policy.configured_high_latency_threshold().as_secs_f64() * 1000.0;
-        let should_decrease = !success || self.ewma_latency_ms > threshold_ms;
+        let should_decrease = matches!(outcome, AdaptiveConcurrencyOutcome::Failure)
+            || self.ewma_latency_ms > threshold_ms;
         if should_decrease {
             let decreased =
                 (self.current_limit as f64 * policy.configured_decrease_ratio()).floor() as usize;

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+#[cfg(feature = "_async")]
+use std::future::Future;
+use std::io::{self, Read};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -492,8 +494,6 @@ pub trait BlockingResumableUploadBackend {
     }
 }
 
-#[cfg(feature = "_async")]
-#[allow(async_fn_in_trait)]
 /// Backend contract for async resumable uploads.
 #[cfg_attr(
     docsrs,
@@ -508,26 +508,29 @@ pub trait AsyncResumableUploadBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Starts a new remote upload session and returns its upload id.
-    async fn create_upload(&self) -> Result<String, Self::Error>;
+    fn create_upload(&self) -> impl Future<Output = Result<String, Self::Error>> + Send;
 
     /// Uploads one part and returns normalized metadata for the completed part.
-    async fn upload_part(
+    fn upload_part(
         &self,
         upload_id: &str,
         part_number: u32,
         chunk: &[u8],
-    ) -> Result<UploadedPart, Self::Error>;
+    ) -> impl Future<Output = Result<UploadedPart, Self::Error>> + Send;
 
     /// Finalizes the remote upload using the ordered completed parts.
-    async fn complete_upload(
+    fn complete_upload(
         &self,
         upload_id: &str,
         parts: &[UploadedPart],
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Aborts a remote upload session after a terminal error.
-    async fn abort_upload(&self, _upload_id: &str) -> Result<(), Self::Error> {
-        Ok(())
+    fn abort_upload(
+        &self,
+        _upload_id: &str,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -647,7 +650,7 @@ fn checkpoint_has_remaining_parts(
         .map(|(&part_number, _)| part_number)
 }
 
-fn read_chunk<R>(reader: &mut R, part_size: usize) -> std::io::Result<Vec<u8>>
+fn read_chunk<R>(reader: &mut R, part_size: usize) -> io::Result<Vec<u8>>
 where
     R: Read,
 {
@@ -664,6 +667,210 @@ where
 
     buffer.truncate(read_len);
     Ok(buffer)
+}
+
+#[cfg(feature = "_async")]
+async fn read_chunk_async<R>(reader: &mut R, part_size: usize) -> io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = vec![0_u8; part_size];
+    let mut read_len = 0_usize;
+
+    while read_len < part_size {
+        let read = reader.read(&mut buffer[read_len..]).await?;
+        if read == 0 {
+            break;
+        }
+        read_len = read_len.saturating_add(read);
+    }
+
+    buffer.truncate(read_len);
+    Ok(buffer)
+}
+
+struct UploadPartPlan {
+    part_number: u32,
+    chunk: Vec<u8>,
+    expected_checksum: Option<String>,
+}
+
+enum UploadChunkAction {
+    Finish,
+    Skip,
+    Upload(UploadPartPlan),
+}
+
+struct ResumableUploadSession<'a> {
+    options: &'a ResumableUploadOptions,
+    checkpoint: ResumableUploadCheckpoint,
+    resumed: bool,
+    total_bytes: u64,
+    part_number: u32,
+}
+
+impl<'a> ResumableUploadSession<'a> {
+    fn new<E>(
+        options: &'a ResumableUploadOptions,
+        mut checkpoint: ResumableUploadCheckpoint,
+        resumed: bool,
+    ) -> Result<Self, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        validate_and_upgrade_checkpoint::<E>(options, &mut checkpoint)?;
+        Ok(Self {
+            options,
+            checkpoint,
+            resumed,
+            total_bytes: 0,
+            part_number: 1,
+        })
+    }
+
+    fn upload_id(&self) -> &str {
+        &self.checkpoint.upload_id
+    }
+
+    fn next_chunk<E>(
+        &mut self,
+        chunk: Vec<u8>,
+    ) -> Result<UploadChunkAction, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if chunk.is_empty() {
+            if let Some(expected_part_number) =
+                checkpoint_has_remaining_parts(&self.checkpoint, self.part_number)
+            {
+                return Err(ResumableUploadError::SourceRead {
+                    source: io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("source ended before checkpointed part {expected_part_number}"),
+                    ),
+                    checkpoint: self.checkpoint.clone(),
+                });
+            }
+            return Ok(UploadChunkAction::Finish);
+        }
+
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        let expected_checksum = self.options.expected_checksum(&chunk);
+        if let Some(existing) = self.checkpoint.completed_parts.get(&self.part_number)
+            && checkpoint_part_matches(
+                existing,
+                chunk.len(),
+                expected_checksum.as_deref(),
+                self.options.verify_remote_etag(),
+            )
+        {
+            self.part_number = self.part_number.saturating_add(1);
+            return Ok(UploadChunkAction::Skip);
+        }
+
+        Ok(UploadChunkAction::Upload(UploadPartPlan {
+            part_number: self.part_number,
+            chunk,
+            expected_checksum,
+        }))
+    }
+
+    fn accept_uploaded_part<E>(
+        &mut self,
+        plan: &UploadPartPlan,
+        uploaded: UploadedPart,
+    ) -> Result<(), ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut normalized = normalize_part(uploaded, plan.part_number, plan.chunk.len());
+        self.options.validate_uploaded_part::<E>(
+            &self.checkpoint,
+            plan.part_number,
+            &normalized,
+            plan.expected_checksum.as_deref(),
+        )?;
+        if normalized.checksum.is_none() {
+            normalized.checksum = plan.expected_checksum.clone();
+        }
+        self.checkpoint
+            .completed_parts
+            .insert(plan.part_number, normalized);
+        self.part_number = self.part_number.saturating_add(1);
+        Ok(())
+    }
+
+    fn source_read_error<E>(&self, source: io::Error) -> ResumableUploadError<E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        ResumableUploadError::SourceRead {
+            source,
+            checkpoint: self.checkpoint.clone(),
+        }
+    }
+
+    fn part_upload_failed<E>(
+        &self,
+        plan: &UploadPartPlan,
+        attempts: usize,
+        source: E,
+    ) -> ResumableUploadError<E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        ResumableUploadError::PartUploadFailed {
+            part_number: plan.part_number,
+            attempts,
+            checkpoint: self.checkpoint.clone(),
+            source,
+        }
+    }
+
+    fn complete_upload_failed<E>(&self, source: E) -> ResumableUploadError<E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        ResumableUploadError::CompleteFailed {
+            checkpoint: self.checkpoint.clone(),
+            source,
+        }
+    }
+
+    fn ordered_parts<E>(&self) -> Result<Vec<UploadedPart>, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let total_parts = self.total_parts();
+        let mut ordered_parts = Vec::with_capacity(total_parts as usize);
+        for current in 1..=total_parts {
+            let Some(part) = self.checkpoint.completed_parts.get(&current) else {
+                return Err(ResumableUploadError::MissingCompletedPart {
+                    part_number: current,
+                    checkpoint: self.checkpoint.clone(),
+                });
+            };
+            ordered_parts.push(part.clone());
+        }
+        Ok(ordered_parts)
+    }
+
+    fn total_parts(&self) -> u32 {
+        self.part_number.saturating_sub(1)
+    }
+
+    fn finish(self, completed_parts: Vec<UploadedPart>) -> ResumableUploadResult {
+        let total_parts = self.total_parts();
+        ResumableUploadResult {
+            upload_id: self.checkpoint.upload_id,
+            total_bytes: self.total_bytes,
+            total_parts,
+            resumed: self.resumed,
+            completed_parts,
+        }
+    }
 }
 
 /// Blocking helper that drives a multipart upload with checkpoints and retries.
@@ -727,133 +934,93 @@ impl BlockingResumableUploader {
         &self,
         backend: &B,
         reader: &mut R,
-        mut checkpoint: ResumableUploadCheckpoint,
+        checkpoint: ResumableUploadCheckpoint,
         resumed: bool,
     ) -> Result<ResumableUploadResult, ResumableUploadError<B::Error>>
     where
         B: BlockingResumableUploadBackend,
         R: Read,
     {
-        validate_and_upgrade_checkpoint::<B::Error>(&self.options, &mut checkpoint)?;
-
-        let mut total_bytes = 0_u64;
-        let mut part_number = 1_u32;
+        let mut session =
+            ResumableUploadSession::new::<B::Error>(&self.options, checkpoint, resumed)?;
 
         loop {
             let chunk = match read_chunk(reader, self.options.part_size) {
                 Ok(chunk) => chunk,
                 Err(source) => {
-                    self.abort_if_configured(backend, &checkpoint.upload_id);
-                    return Err(ResumableUploadError::SourceRead {
-                        source,
-                        checkpoint: checkpoint.clone(),
-                    });
-                }
-            };
-            if chunk.is_empty() {
-                if let Some(expected_part_number) =
-                    checkpoint_has_remaining_parts(&checkpoint, part_number)
-                {
-                    self.abort_if_configured(backend, &checkpoint.upload_id);
-                    return Err(ResumableUploadError::SourceRead {
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("source ended before checkpointed part {expected_part_number}"),
-                        ),
-                        checkpoint: checkpoint.clone(),
-                    });
-                }
-                break;
-            }
-            total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-
-            let expected_checksum = self.options.expected_checksum(&chunk);
-            if let Some(existing) = checkpoint.completed_parts.get(&part_number)
-                && checkpoint_part_matches(
-                    existing,
-                    chunk.len(),
-                    expected_checksum.as_deref(),
-                    self.options.verify_remote_etag(),
-                )
-            {
-                part_number = part_number.saturating_add(1);
-                continue;
-            }
-
-            let mut attempt = 1_usize;
-            let uploaded = loop {
-                match backend.upload_part(&checkpoint.upload_id, part_number, &chunk) {
-                    Ok(part) => {
-                        let mut normalized = normalize_part(part, part_number, chunk.len());
-                        if let Err(error) = self.options.validate_uploaded_part::<B::Error>(
-                            &checkpoint,
-                            part_number,
-                            &normalized,
-                            expected_checksum.as_deref(),
-                        ) {
-                            self.abort_if_configured(backend, &checkpoint.upload_id);
-                            return Err(error);
-                        }
-                        if normalized.checksum.is_none() {
-                            normalized.checksum = expected_checksum.clone();
-                        }
-                        break normalized;
-                    }
-                    Err(source) => {
-                        if attempt >= self.options.max_attempts {
-                            self.abort_if_configured(backend, &checkpoint.upload_id);
-                            return Err(ResumableUploadError::PartUploadFailed {
-                                part_number,
-                                attempts: attempt,
-                                checkpoint,
-                                source,
-                            });
-                        }
-                        let delay = self.options.backoff_for_retry(attempt);
-                        if !delay.is_zero() {
-                            sleep(delay);
-                        }
-                        attempt = attempt.saturating_add(1);
-                    }
+                    self.abort_if_configured(backend, session.upload_id());
+                    return Err(session.source_read_error(source));
                 }
             };
 
-            checkpoint.completed_parts.insert(part_number, uploaded);
-            part_number = part_number.saturating_add(1);
+            let action = match session.next_chunk::<B::Error>(chunk) {
+                Ok(action) => action,
+                Err(error) => {
+                    self.abort_if_configured(backend, session.upload_id());
+                    return Err(error);
+                }
+            };
+
+            match action {
+                UploadChunkAction::Finish => break,
+                UploadChunkAction::Skip => continue,
+                UploadChunkAction::Upload(plan) => {
+                    let uploaded = self.upload_part_with_retries(backend, &session, &plan)?;
+                    if let Err(error) = session.accept_uploaded_part::<B::Error>(&plan, uploaded) {
+                        self.abort_if_configured(backend, session.upload_id());
+                        return Err(error);
+                    }
+                }
+            }
         }
 
-        let total_parts = part_number.saturating_sub(1);
-        if total_parts == 0 {
-            self.abort_if_configured(backend, &checkpoint.upload_id);
+        if session.total_parts() == 0 {
+            self.abort_if_configured(backend, session.upload_id());
             return Err(ResumableUploadError::EmptyUploadBody);
         }
 
-        let mut ordered_parts = Vec::with_capacity(total_parts as usize);
-        for current in 1..=total_parts {
-            let Some(part) = checkpoint.completed_parts.get(&current) else {
-                self.abort_if_configured(backend, &checkpoint.upload_id);
-                return Err(ResumableUploadError::MissingCompletedPart {
-                    part_number: current,
-                    checkpoint,
-                });
-            };
-            ordered_parts.push(part.clone());
+        let ordered_parts = match session.ordered_parts::<B::Error>() {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.abort_if_configured(backend, session.upload_id());
+                return Err(error);
+            }
+        };
+
+        if let Err(source) = backend.complete_upload(session.upload_id(), &ordered_parts) {
+            self.abort_if_configured(backend, session.upload_id());
+            return Err(session.complete_upload_failed(source));
         }
 
-        if let Err(source) = backend.complete_upload(&checkpoint.upload_id, &ordered_parts) {
-            self.abort_if_configured(backend, &checkpoint.upload_id);
-            return Err(ResumableUploadError::CompleteFailed { checkpoint, source });
+        Ok(session.finish(ordered_parts))
+    }
+
+    fn upload_part_with_retries<B>(
+        &self,
+        backend: &B,
+        session: &ResumableUploadSession<'_>,
+        plan: &UploadPartPlan,
+    ) -> Result<UploadedPart, ResumableUploadError<B::Error>>
+    where
+        B: BlockingResumableUploadBackend,
+    {
+        let mut attempt = 1_usize;
+        loop {
+            match backend.upload_part(session.upload_id(), plan.part_number, &plan.chunk) {
+                Ok(part) => return Ok(part),
+                Err(source) => {
+                    if attempt >= self.options.max_attempts {
+                        self.abort_if_configured(backend, session.upload_id());
+                        return Err(session.part_upload_failed(plan, attempt, source));
+                    }
+                    let delay = self.options.backoff_for_retry(attempt);
+                    if !delay.is_zero() {
+                        sleep(delay);
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
         }
-
-        let upload_id = checkpoint.upload_id.clone();
-
-        Ok(ResumableUploadResult {
-            upload_id,
-            total_bytes,
-            total_parts,
-            resumed,
-            completed_parts: ordered_parts,
-        })
     }
 }
 
@@ -937,158 +1104,101 @@ impl AsyncResumableUploader {
         &self,
         backend: &B,
         reader: &mut R,
-        mut checkpoint: ResumableUploadCheckpoint,
+        checkpoint: ResumableUploadCheckpoint,
         resumed: bool,
     ) -> Result<ResumableUploadResult, ResumableUploadError<B::Error>>
     where
         B: AsyncResumableUploadBackend,
         R: tokio::io::AsyncRead + Unpin,
     {
-        use tokio::io::AsyncReadExt;
-
-        validate_and_upgrade_checkpoint::<B::Error>(&self.options, &mut checkpoint)?;
-
-        let mut total_bytes = 0_u64;
-        let mut part_number = 1_u32;
+        let mut session =
+            ResumableUploadSession::new::<B::Error>(&self.options, checkpoint, resumed)?;
 
         loop {
-            let mut chunk = vec![0_u8; self.options.part_size];
-            let mut read_len = 0_usize;
-            while read_len < self.options.part_size {
-                let read = match reader.read(&mut chunk[read_len..]).await {
-                    Ok(read) => read,
-                    Err(source) => {
-                        self.abort_if_configured(backend, &checkpoint.upload_id)
-                            .await;
-                        return Err(ResumableUploadError::SourceRead {
-                            source,
-                            checkpoint: checkpoint.clone(),
-                        });
-                    }
-                };
-                if read == 0 {
-                    break;
-                }
-                read_len = read_len.saturating_add(read);
-            }
-            chunk.truncate(read_len);
-
-            if chunk.is_empty() {
-                if let Some(expected_part_number) =
-                    checkpoint_has_remaining_parts(&checkpoint, part_number)
-                {
-                    self.abort_if_configured(backend, &checkpoint.upload_id)
-                        .await;
-                    return Err(ResumableUploadError::SourceRead {
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("source ended before checkpointed part {expected_part_number}"),
-                        ),
-                        checkpoint: checkpoint.clone(),
-                    });
-                }
-                break;
-            }
-            total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-
-            let expected_checksum = self.options.expected_checksum(&chunk);
-            if let Some(existing) = checkpoint.completed_parts.get(&part_number)
-                && checkpoint_part_matches(
-                    existing,
-                    chunk.len(),
-                    expected_checksum.as_deref(),
-                    self.options.verify_remote_etag(),
-                )
-            {
-                part_number = part_number.saturating_add(1);
-                continue;
-            }
-
-            let mut attempt = 1_usize;
-            let uploaded = loop {
-                match backend
-                    .upload_part(&checkpoint.upload_id, part_number, &chunk)
-                    .await
-                {
-                    Ok(part) => {
-                        let mut normalized = normalize_part(part, part_number, chunk.len());
-                        if let Err(error) = self.options.validate_uploaded_part::<B::Error>(
-                            &checkpoint,
-                            part_number,
-                            &normalized,
-                            expected_checksum.as_deref(),
-                        ) {
-                            self.abort_if_configured(backend, &checkpoint.upload_id)
-                                .await;
-                            return Err(error);
-                        }
-                        if normalized.checksum.is_none() {
-                            normalized.checksum = expected_checksum.clone();
-                        }
-                        break normalized;
-                    }
-                    Err(source) => {
-                        if attempt >= self.options.max_attempts {
-                            self.abort_if_configured(backend, &checkpoint.upload_id)
-                                .await;
-                            return Err(ResumableUploadError::PartUploadFailed {
-                                part_number,
-                                attempts: attempt,
-                                checkpoint,
-                                source,
-                            });
-                        }
-                        let delay = self.options.backoff_for_retry(attempt);
-                        if !delay.is_zero() {
-                            tokio::time::sleep(delay).await;
-                        }
-                        attempt = attempt.saturating_add(1);
-                    }
+            let chunk = match read_chunk_async(reader, self.options.part_size).await {
+                Ok(chunk) => chunk,
+                Err(source) => {
+                    self.abort_if_configured(backend, session.upload_id()).await;
+                    return Err(session.source_read_error(source));
                 }
             };
 
-            checkpoint.completed_parts.insert(part_number, uploaded);
-            part_number = part_number.saturating_add(1);
+            let action = match session.next_chunk::<B::Error>(chunk) {
+                Ok(action) => action,
+                Err(error) => {
+                    self.abort_if_configured(backend, session.upload_id()).await;
+                    return Err(error);
+                }
+            };
+
+            match action {
+                UploadChunkAction::Finish => break,
+                UploadChunkAction::Skip => continue,
+                UploadChunkAction::Upload(plan) => {
+                    let uploaded = self
+                        .upload_part_with_retries(backend, &session, &plan)
+                        .await?;
+                    if let Err(error) = session.accept_uploaded_part::<B::Error>(&plan, uploaded) {
+                        self.abort_if_configured(backend, session.upload_id()).await;
+                        return Err(error);
+                    }
+                }
+            }
         }
 
-        let total_parts = part_number.saturating_sub(1);
-        if total_parts == 0 {
-            self.abort_if_configured(backend, &checkpoint.upload_id)
-                .await;
+        if session.total_parts() == 0 {
+            self.abort_if_configured(backend, session.upload_id()).await;
             return Err(ResumableUploadError::EmptyUploadBody);
         }
 
-        let mut ordered_parts = Vec::with_capacity(total_parts as usize);
-        for current in 1..=total_parts {
-            let Some(part) = checkpoint.completed_parts.get(&current) else {
-                self.abort_if_configured(backend, &checkpoint.upload_id)
-                    .await;
-                return Err(ResumableUploadError::MissingCompletedPart {
-                    part_number: current,
-                    checkpoint,
-                });
-            };
-            ordered_parts.push(part.clone());
-        }
+        let ordered_parts = match session.ordered_parts::<B::Error>() {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.abort_if_configured(backend, session.upload_id()).await;
+                return Err(error);
+            }
+        };
 
         if let Err(source) = backend
-            .complete_upload(&checkpoint.upload_id, &ordered_parts)
+            .complete_upload(session.upload_id(), &ordered_parts)
             .await
         {
-            self.abort_if_configured(backend, &checkpoint.upload_id)
-                .await;
-            return Err(ResumableUploadError::CompleteFailed { checkpoint, source });
+            self.abort_if_configured(backend, session.upload_id()).await;
+            return Err(session.complete_upload_failed(source));
         }
 
-        let upload_id = checkpoint.upload_id.clone();
+        Ok(session.finish(ordered_parts))
+    }
 
-        Ok(ResumableUploadResult {
-            upload_id,
-            total_bytes,
-            total_parts,
-            resumed,
-            completed_parts: ordered_parts,
-        })
+    async fn upload_part_with_retries<B>(
+        &self,
+        backend: &B,
+        session: &ResumableUploadSession<'_>,
+        plan: &UploadPartPlan,
+    ) -> Result<UploadedPart, ResumableUploadError<B::Error>>
+    where
+        B: AsyncResumableUploadBackend,
+    {
+        let mut attempt = 1_usize;
+        loop {
+            match backend
+                .upload_part(session.upload_id(), plan.part_number, &plan.chunk)
+                .await
+            {
+                Ok(part) => return Ok(part),
+                Err(source) => {
+                    if attempt >= self.options.max_attempts {
+                        self.abort_if_configured(backend, session.upload_id()).await;
+                        return Err(session.part_upload_failed(plan, attempt, source));
+                    }
+                    let delay = self.options.backoff_for_retry(attempt);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
     }
 }
 

@@ -12,8 +12,8 @@ use crate::policy::{Interceptor, RedirectPolicy, StatusPolicy};
 use crate::proxy::{NoProxyRule, ProxyConfig};
 use crate::rate_limit::{RateLimitPolicy, RateLimiter, ServerThrottleScope};
 use crate::resilience::{
-    AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState, CircuitBreaker, CircuitBreakerPolicy,
-    RetryBudget, RetryBudgetPolicy,
+    AdaptiveConcurrencyOutcome, AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState,
+    CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
 };
 use crate::retry::{RetryEligibility, RetryPolicy};
 use crate::tls::{TlsBackend, TlsOptions};
@@ -92,9 +92,9 @@ impl AdaptiveConcurrencyController {
         })
     }
 
-    fn release_and_record(&self, success: bool, latency: Duration) {
+    fn release_and_record(&self, outcome: AdaptiveConcurrencyOutcome, latency: Duration) {
         let mut state = lock_unpoisoned(&self.state);
-        state.release_and_record(self.policy, success, latency);
+        state.release_and_record(self.policy, outcome, latency);
         self.condvar.notify_all();
     }
 
@@ -120,12 +120,14 @@ impl AdaptiveConcurrencyPermit {
     }
 
     fn mark_success(mut self) {
-        self.controller.release_and_record(true, self.latency());
+        self.controller
+            .release_and_record(AdaptiveConcurrencyOutcome::Success, self.latency());
         self.completed = true;
     }
 
     fn mark_failure(mut self) {
-        self.controller.release_and_record(false, self.latency());
+        self.controller
+            .release_and_record(AdaptiveConcurrencyOutcome::Failure, self.latency());
         self.completed = true;
     }
 
@@ -138,7 +140,8 @@ impl AdaptiveConcurrencyPermit {
 impl Drop for AdaptiveConcurrencyPermit {
     fn drop(&mut self) {
         if !self.completed {
-            self.controller.release_and_record(false, self.latency());
+            self.controller
+                .release_and_record(AdaptiveConcurrencyOutcome::Failure, self.latency());
             self.completed = true;
         }
     }

@@ -8,10 +8,10 @@ use http::{HeaderMap, Method, Uri};
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::{
-    AttemptGuards, BodyReadOutcome, BodyReadRetryContext, RequestExecutionState,
-    RequestExecutionStateInput, ResponseMode, ResponseProgress, RetryAttemptState,
-    RetryRequestInput, response_body_read_retry_decision, select_base_url, server_throttle_delay,
-    timeout_retry_decision,
+    AttemptGuards, BodyReadFailure, BodyReadOutcome, BodyReadRetryContext, RequestCompletion,
+    RequestExecutionState, RequestExecutionStateInput, ResponseMode, ResponseProgress,
+    RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan, select_base_url,
+    server_throttle_delay,
 };
 use crate::extensions::Clock;
 use crate::metrics::MetricsSnapshot;
@@ -19,14 +19,12 @@ use crate::policy::{RequestContext, StatusPolicy};
 use crate::rate_limit::{resolve_server_throttle_scope, server_throttle_scope_from_headers};
 use crate::response::{
     BlockingResponseStream, BlockingResponseStreamContext, Response, StreamLifecycle,
-    StreamOutcomeHooks,
 };
 use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
     is_timeout_io_error, merge_headers, redact_uri_for_logs, resolve_uri, total_timeout_deadline,
-    total_timeout_expired,
 };
 
 use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
@@ -86,32 +84,17 @@ struct StreamResponseInput {
     host_permit: HostRequestPermit,
 }
 
-struct StreamResilienceHooks {
-    retry_budget: Option<std::sync::Arc<crate::resilience::RetryBudget>>,
-    record_retry_budget_success: bool,
-    record_attempt_success: bool,
-    attempts: AttemptGuards<crate::resilience::CircuitAttempt, AdaptiveConcurrencyPermit>,
-}
-
-impl StreamOutcomeHooks for StreamResilienceHooks {
-    fn complete_success(&mut self) {
-        if self.record_retry_budget_success
-            && let Some(retry_budget) = self.retry_budget.take()
-        {
-            retry_budget.record_success();
-        }
-        self.attempts.record(self.record_attempt_success);
-    }
-
-    fn complete_error(&mut self, _error: &Error) {
-        self.retry_budget = None;
-        self.attempts.mark_failure();
-    }
-
-    fn complete_canceled(&mut self) {
-        self.retry_budget = None;
-        self.attempts.cancel();
-    }
+struct StreamResponseBuildInput<'a> {
+    status: http::StatusCode,
+    response_headers: HeaderMap,
+    response_body: ureq::Body,
+    execution: &'a RequestExecutionState,
+    transport_timeout: Duration,
+    stream_total_timeout_ms: Option<u128>,
+    stream_deadline_at: Option<Instant>,
+    stream_lifecycle: Option<StreamLifecycle>,
+    stream_global_permit: &'a mut Option<GlobalRequestPermit>,
+    host_permit: HostRequestPermit,
 }
 
 fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
@@ -253,30 +236,35 @@ impl Client {
         }
     }
 
-    fn record_successful_request_for_resilience(&self) {
-        if let Some(retry_budget) = &self.retry_budget {
-            retry_budget.record_success();
-        }
-    }
-
-    fn stream_lifecycle(
-        &self,
-        record_retry_budget_success: bool,
-        record_attempt_success: bool,
-        attempts: AttemptGuards<crate::resilience::CircuitAttempt, AdaptiveConcurrencyPermit>,
-    ) -> Option<StreamLifecycle> {
-        if self.retry_budget.is_none() && attempts.is_empty() {
-            return None;
-        }
-
-        Some(StreamLifecycle::new(Some(Box::new(
-            StreamResilienceHooks {
-                retry_budget: self.retry_budget.clone(),
-                record_retry_budget_success,
-                record_attempt_success,
-                attempts,
-            },
-        ))))
+    fn stream_response(&self, input: StreamResponseBuildInput<'_>) -> RetryResponse {
+        let StreamResponseBuildInput {
+            status,
+            response_headers,
+            response_body,
+            execution,
+            transport_timeout,
+            stream_total_timeout_ms,
+            stream_deadline_at,
+            stream_lifecycle,
+            stream_global_permit,
+            host_permit,
+        } = input;
+        stream_retry_response(StreamResponseInput {
+            status,
+            response_headers,
+            response_body,
+            method: execution.current_method().clone(),
+            uri: execution.current_uri().clone(),
+            redacted_uri: execution.current_redacted_uri().to_owned(),
+            transport_timeout,
+            stream_total_timeout_ms,
+            stream_deadline_at,
+            stream_deadline_slack: self.stream_deadline_slack,
+            clock: Arc::clone(&self.clock),
+            stream_lifecycle,
+            stream_global_permit: stream_global_permit.take(),
+            host_permit,
+        })
     }
 
     fn try_consume_retry_budget(&self, method: &Method, uri: &str) -> Result<(), Error> {
@@ -427,7 +415,7 @@ impl Client {
         context: &RequestContext,
         retry_decision: &RetryDecision,
         requested_delay: Duration,
-    ) -> Result<Option<Duration>, Error> {
+    ) -> Result<RetrySchedule, Error> {
         let retry_schedule = match retry_attempt.prepare_retry_schedule(
             retry_decision,
             requested_delay,
@@ -439,13 +427,13 @@ impl Client {
                 return Err(error);
             }
         };
-        let Some(retry_delay) = retry_schedule.delay() else {
-            return Ok(None);
+        let RetrySchedule::Scheduled { delay: retry_delay } = retry_schedule else {
+            return Ok(RetrySchedule::NotScheduled);
         };
 
         self.metrics.record_retry();
         self.run_retry_observers(context, retry_decision, retry_delay);
-        Ok(Some(retry_delay))
+        Ok(RetrySchedule::Scheduled { delay: retry_delay })
     }
 
     fn prepare_status_retry(
@@ -454,13 +442,12 @@ impl Client {
         context: &RequestContext,
         status: http::StatusCode,
         response_headers: &HeaderMap,
-    ) -> Result<Option<Duration>, Error> {
-        let fallback_delay = state.retry_backoff(self.backoff_source.as_ref());
+    ) -> Result<RetrySchedule, Error> {
         let retry_plan = state.status_retry_plan(
             status,
             response_headers,
             self.clock.as_ref(),
-            fallback_delay,
+            self.backoff_source.as_ref(),
         );
         self.prepare_retry(
             state.retry_attempt(),
@@ -494,109 +481,55 @@ impl Client {
             .inspect_err(|error| self.run_error_interceptors(context, error))
     }
 
+    fn handle_body_read_failure(
+        &self,
+        retry_context: &mut BodyReadRetryContext<'_>,
+        failure: BodyReadFailure,
+    ) -> Result<BodyReadOutcome, Error> {
+        let (error, retry_plan) = match failure {
+            BodyReadFailure::Terminal { error } => {
+                self.run_error_interceptors(retry_context.context(), &error);
+                return Err(error);
+            }
+            BodyReadFailure::Retryable { error, retry_plan } => (error, retry_plan),
+        };
+
+        let context = retry_context.context();
+        match self.prepare_retry(
+            retry_context.retry_attempt(),
+            context,
+            &retry_plan.decision,
+            retry_plan.delay,
+        )? {
+            RetrySchedule::Scheduled { delay } => return Ok(BodyReadOutcome::Retry(delay)),
+            RetrySchedule::NotScheduled => {}
+        }
+        self.run_error_interceptors(context, &error);
+        Err(error)
+    }
+
     fn read_response_body_with_retry(
         &self,
         response: &mut ureq::http::Response<ureq::Body>,
-        retry_context: BodyReadRetryContext<'_>,
+        mut retry_context: BodyReadRetryContext<'_>,
     ) -> Result<BodyReadOutcome, Error> {
-        let BodyReadRetryContext {
-            context,
-            max_response_body_bytes,
-            read_timeout,
-            retry_policy,
-            total_timeout,
-            request_started_at,
-            method,
-            redacted_uri,
-            attempt,
-            max_attempts,
-        } = retry_context;
-
-        match read_all_body_limited(response, max_response_body_bytes) {
+        match read_all_body_limited(response, retry_context.max_response_body_bytes()) {
             Ok(body) => Ok(BodyReadOutcome::Body(body)),
             Err(ReadBodyError::TooLarge { actual_bytes }) => {
-                let error = Error::ResponseBodyTooLarge {
-                    limit_bytes: max_response_body_bytes,
-                    actual_bytes,
-                    method: method.clone(),
-                    uri: redacted_uri.to_owned(),
-                };
-                self.run_error_interceptors(context, &error);
+                let error = retry_context.response_body_too_large_error(actual_bytes);
+                self.run_error_interceptors(retry_context.context(), &error);
                 Err(error)
             }
             Err(ReadBodyError::Read(source)) => {
                 if is_timeout_io_error(&source) {
-                    let timeout_phase = TimeoutPhase::ResponseBody;
-                    let error = if total_timeout_expired(total_timeout, request_started_at) {
-                        deadline_exceeded_error(total_timeout, method, redacted_uri)
-                    } else {
-                        Error::Timeout {
-                            phase: timeout_phase,
-                            timeout_ms: read_timeout.as_millis(),
-                            method: method.clone(),
-                            uri: redacted_uri.to_owned(),
-                        }
-                    };
-                    if matches!(error, Error::DeadlineExceeded { .. }) {
-                        self.run_error_interceptors(context, &error);
-                        return Err(error);
-                    }
-                    let retry_decision = timeout_retry_decision(
-                        *attempt,
-                        max_attempts,
-                        method,
-                        redacted_uri,
-                        timeout_phase,
-                    );
-                    let retry_delay = self
-                        .backoff_source
-                        .backoff_for_retry(retry_policy, *attempt);
-                    if let Some(retry_delay) = self.prepare_retry(
-                        RetryAttemptState {
-                            retry_policy,
-                            total_timeout,
-                            request_started_at,
-                            method,
-                            redacted_uri,
-                            attempt,
-                            max_attempts,
-                        },
-                        context,
-                        &retry_decision,
-                        retry_delay,
-                    )? {
-                        return Ok(BodyReadOutcome::Retry(retry_delay));
-                    }
-                    self.run_error_interceptors(context, &error);
-                    return Err(error);
+                    let failure =
+                        retry_context.response_body_timeout_failure(self.backoff_source.as_ref());
+                    return self.handle_body_read_failure(&mut retry_context, failure);
                 }
 
-                let error = Error::ReadBody {
-                    source: Box::new(source),
-                };
-                let retry_decision =
-                    response_body_read_retry_decision(*attempt, max_attempts, method, redacted_uri);
-                let retry_delay = self
-                    .backoff_source
-                    .backoff_for_retry(retry_policy, *attempt);
-                if let Some(retry_delay) = self.prepare_retry(
-                    RetryAttemptState {
-                        retry_policy,
-                        total_timeout,
-                        request_started_at,
-                        method,
-                        redacted_uri,
-                        attempt,
-                        max_attempts,
-                    },
-                    context,
-                    &retry_decision,
-                    retry_delay,
-                )? {
-                    return Ok(BodyReadOutcome::Retry(retry_delay));
-                }
-                self.run_error_interceptors(context, &error);
-                Err(error)
+                let failure =
+                    retry_context.response_body_read_failure(source, self.backoff_source.as_ref());
+                self.handle_body_read_failure(&mut retry_context, failure)
             }
         }
     }
@@ -608,8 +541,8 @@ impl Client {
         status: http::StatusCode,
         retry_context: BodyReadRetryContext<'_>,
     ) -> Result<BodyReadOutcome, Error> {
-        let max_response_body_bytes = retry_context.max_response_body_bytes;
-        let context = retry_context.context;
+        let max_response_body_bytes = retry_context.max_response_body_bytes();
+        let context = retry_context.context();
         let response_body = match self.read_response_body_with_retry(response, retry_context)? {
             BodyReadOutcome::Body(body) => body,
             BodyReadOutcome::Retry(delay) => return Ok(BodyReadOutcome::Retry(delay)),
@@ -1105,27 +1038,31 @@ impl Client {
                     } else {
                         error
                     };
-                    let Some(retry_decision) =
-                        execution.transport_retry_decision_from_error(&error)
-                    else {
-                        attempts.cancel();
-                        self.run_error_interceptors(&context, &error);
-                        return Err(error);
-                    };
-
-                    let retry_delay = execution.retry_backoff(self.backoff_source.as_ref());
-                    if let Some(retry_delay) = self.prepare_retry(
-                        execution.retry_attempt(),
-                        &context,
-                        &retry_decision,
-                        retry_delay,
-                    )? {
-                        attempts.mark_failure();
-                        drop(host_permit);
-                        if !retry_delay.is_zero() {
-                            sleep(retry_delay);
+                    match execution.transport_failure_plan(&error, self.backoff_source.as_ref()) {
+                        TransportFailurePlan::Retry(retry_plan) => {
+                            match attempts.record_failure_for_retry_schedule(self.prepare_retry(
+                                execution.retry_attempt(),
+                                &context,
+                                &retry_plan.decision,
+                                retry_plan.delay,
+                            ))? {
+                                RetrySchedule::Scheduled { delay: retry_delay } => {
+                                    drop(host_permit);
+                                    if !retry_delay.is_zero() {
+                                        sleep(retry_delay);
+                                    }
+                                    continue;
+                                }
+                                RetrySchedule::NotScheduled => {
+                                    attempts.mark_failure();
+                                }
+                            }
                         }
-                        continue;
+                        TransportFailurePlan::Terminal {
+                            attempt_disposition,
+                        } => {
+                            attempt_disposition.apply(&mut attempts);
+                        }
                     }
                     self.run_error_interceptors(&context, &error);
                     return Err(error);
@@ -1137,6 +1074,7 @@ impl Client {
             let redirect_action = match execution.next_redirect_action(status, &response_headers) {
                 Ok(action) => action,
                 Err(error) => {
+                    attempts.mark_failure();
                     self.run_error_interceptors(&context, &error);
                     return Err(error);
                 }
@@ -1161,21 +1099,18 @@ impl Client {
                 });
 
                 if status.is_success() {
-                    let stream_lifecycle = self.stream_lifecycle(true, true, attempts.take());
-                    return Ok(stream_retry_response(StreamResponseInput {
+                    let stream_lifecycle = RequestCompletion::success()
+                        .into_stream_lifecycle(&mut attempts, self.retry_budget.clone());
+                    return Ok(self.stream_response(StreamResponseBuildInput {
                         status,
                         response_headers,
                         response_body: response.into_body(),
-                        method: execution.current_method().clone(),
-                        uri: execution.current_uri().clone(),
-                        redacted_uri: execution.current_redacted_uri().to_owned(),
+                        execution: &execution,
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
-                        stream_deadline_slack: self.stream_deadline_slack,
-                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
-                        stream_global_permit: stream_global_permit.take(),
+                        stream_global_permit: &mut stream_global_permit,
                         host_permit,
                     }));
                 }
@@ -1184,65 +1119,67 @@ impl Client {
             if !status.is_success() {
                 let server_throttle_fallback_delay =
                     execution.retry_backoff(self.backoff_source.as_ref());
-                if let Some(retry_delay) = response_progress.prepare_non_success_before_body(
-                    || self.run_response_interceptors(&context, status, &response_headers),
-                    || {
-                        self.observe_server_throttle(
-                            &context,
-                            status,
-                            &response_headers,
-                            rate_limit_host.as_deref(),
-                            server_throttle_fallback_delay,
-                        );
-                    },
-                    || {
-                        self.prepare_status_retry(
-                            &mut execution,
-                            &context,
-                            status,
-                            &response_headers,
-                        )
-                    },
+                match attempts.record_failure_for_retry_schedule(
+                    response_progress.prepare_non_success_before_body(
+                        || self.run_response_interceptors(&context, status, &response_headers),
+                        || {
+                            self.observe_server_throttle(
+                                &context,
+                                status,
+                                &response_headers,
+                                rate_limit_host.as_deref(),
+                                server_throttle_fallback_delay,
+                            );
+                        },
+                        || {
+                            self.prepare_status_retry(
+                                &mut execution,
+                                &context,
+                                status,
+                                &response_headers,
+                            )
+                        },
+                    ),
                 )? {
-                    attempts.mark_failure();
-                    drop(response);
-                    drop(host_permit);
-                    if !retry_delay.is_zero() {
-                        sleep(retry_delay);
+                    RetrySchedule::Scheduled { delay: retry_delay } => {
+                        drop(response);
+                        drop(host_permit);
+                        if !retry_delay.is_zero() {
+                            sleep(retry_delay);
+                        }
+                        continue;
                     }
-                    continue;
+                    RetrySchedule::NotScheduled => {
+                        // Keep the attempt open so terminal non-success handling can record the
+                        // correct success/failure disposition.
+                    }
                 }
                 if response_mode.is_stream() && execution.should_return_non_success_response() {
-                    let stream_resilience = execution
-                        .non_success_resilience_outcome(status)
-                        .prepare_stream_response_attempt(&mut attempts);
-                    let record_success = stream_resilience.record_success_on_complete();
-                    let stream_lifecycle =
-                        self.stream_lifecycle(record_success, record_success, attempts.take());
-                    return Ok(stream_retry_response(StreamResponseInput {
+                    let stream_lifecycle = execution
+                        .non_success_completion(status)
+                        .into_stream_lifecycle(&mut attempts, self.retry_budget.clone());
+                    return Ok(self.stream_response(StreamResponseBuildInput {
                         status,
                         response_headers,
                         response_body: response.into_body(),
-                        method: execution.current_method().clone(),
-                        uri: execution.current_uri().clone(),
-                        redacted_uri: execution.current_redacted_uri().to_owned(),
+                        execution: &execution,
                         transport_timeout,
                         stream_total_timeout_ms,
                         stream_deadline_at,
-                        stream_deadline_slack: self.stream_deadline_slack,
-                        clock: Arc::clone(&self.clock),
                         stream_lifecycle,
-                        stream_global_permit: stream_global_permit.take(),
+                        stream_global_permit: &mut stream_global_permit,
                         host_permit,
                     }));
                 }
             }
 
-            let response_body = match self.read_decoded_response_body_with_retry(
-                &mut response,
-                &mut response_headers,
-                status,
-                execution.body_read_retry_context(&context, transport_timeout),
+            let response_body = match attempts.record_failure_on_error(
+                self.read_decoded_response_body_with_retry(
+                    &mut response,
+                    &mut response_headers,
+                    status,
+                    execution.body_read_retry_context(&context, transport_timeout),
+                ),
             )? {
                 BodyReadOutcome::Body(body) => body,
                 BodyReadOutcome::Retry(retry_delay) => {
@@ -1262,11 +1199,8 @@ impl Client {
 
             if !status.is_success() {
                 if execution.should_return_non_success_response() && response_mode.is_buffered() {
-                    let resilience = execution.non_success_resilience_outcome(status);
-                    resilience.record_buffered_response_attempt(&mut attempts);
-                    if resilience.record_success() {
-                        self.record_successful_request_for_resilience();
-                    }
+                    let completion = execution.non_success_completion(status);
+                    completion.record_completed(&mut attempts, self.retry_budget.as_ref());
                     return Ok(RetryResponse::Buffered(Response::new(
                         status,
                         response_headers,
@@ -1276,16 +1210,15 @@ impl Client {
 
                 let terminal =
                     execution.terminal_non_success(status, &response_headers, &response_body);
-                terminal.resilience.record_terminal_attempt(&mut attempts);
-                if terminal.resilience.record_success() {
-                    self.record_successful_request_for_resilience();
-                }
+                terminal
+                    .completion
+                    .record_completed(&mut attempts, self.retry_budget.as_ref());
                 self.run_error_interceptors(&context, &terminal.error);
                 return Err(terminal.error);
             }
 
-            attempts.mark_success();
-            self.record_successful_request_for_resilience();
+            RequestCompletion::success()
+                .record_completed(&mut attempts, self.retry_budget.as_ref());
             return Ok(RetryResponse::Buffered(Response::new(
                 status,
                 response_headers,

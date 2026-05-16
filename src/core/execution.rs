@@ -1,3 +1,5 @@
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -5,8 +7,12 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::core::request_builder::RequestExecutionOptions;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
-use crate::extensions::{Clock, EndpointSelector};
+use crate::extensions::{BackoffSource, Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, RequestContext, StatusPolicy};
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+use crate::resilience::RetryBudget;
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+use crate::response::{StreamLifecycle, StreamOutcomeHooks};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after,
@@ -200,10 +206,7 @@ impl RequestExecutionState {
         )
     }
 
-    pub(crate) fn retry_backoff(
-        &self,
-        backoff_source: &dyn crate::extensions::BackoffSource,
-    ) -> Duration {
+    pub(crate) fn retry_backoff(&self, backoff_source: &dyn BackoffSource) -> Duration {
         backoff_source.backoff_for_retry(&self.retry_policy, self.attempt)
     }
 
@@ -212,8 +215,9 @@ impl RequestExecutionState {
         status: StatusCode,
         headers: &HeaderMap,
         clock: &dyn Clock,
-        fallback_delay: Duration,
-    ) -> StatusRetryPlan {
+        backoff_source: &dyn BackoffSource,
+    ) -> RetryPlan {
+        let fallback_delay = self.retry_backoff(backoff_source);
         status_retry_plan(StatusRetryPlanInput {
             attempt: self.attempt,
             max_attempts: self.max_attempts,
@@ -237,10 +241,7 @@ impl RequestExecutionState {
         )
     }
 
-    pub(crate) fn transport_retry_decision_from_error(
-        &self,
-        error: &Error,
-    ) -> Option<RetryDecision> {
+    fn transport_retry_decision_from_error(&self, error: &Error) -> Option<RetryDecision> {
         transport_retry_decision_from_error(
             self.attempt,
             self.max_attempts,
@@ -248,6 +249,29 @@ impl RequestExecutionState {
             &self.current_redacted_uri,
             error,
         )
+    }
+
+    pub(crate) fn transport_failure_plan(
+        &self,
+        error: &Error,
+        backoff_source: &dyn BackoffSource,
+    ) -> TransportFailurePlan {
+        if let Some(decision) = self.transport_retry_decision_from_error(error) {
+            return TransportFailurePlan::Retry(RetryPlan {
+                decision,
+                delay: self.retry_backoff(backoff_source),
+            });
+        }
+
+        let attempt_disposition = if matches!(error, Error::DeadlineExceeded { .. }) {
+            AttemptDisposition::Failure
+        } else {
+            AttemptDisposition::Cancel
+        };
+
+        TransportFailurePlan::Terminal {
+            attempt_disposition,
+        }
     }
 
     pub(crate) fn body_read_retry_context<'a>(
@@ -269,11 +293,8 @@ impl RequestExecutionState {
         }
     }
 
-    pub(crate) fn non_success_resilience_outcome(
-        &self,
-        status: StatusCode,
-    ) -> ResponseResilienceOutcome {
-        ResponseResilienceOutcome::from_status(&self.retry_policy, status)
+    pub(crate) fn non_success_completion(&self, status: StatusCode) -> RequestCompletion {
+        RequestCompletion::from_response_status(&self.retry_policy, status)
     }
 
     pub(crate) const fn should_return_non_success_response(&self) -> bool {
@@ -399,21 +420,21 @@ impl ResponseProgress {
 
     fn try_status_retry_if_needed(
         &mut self,
-        retry: impl FnOnce() -> Result<Option<Duration>, Error>,
-    ) -> Result<Option<Duration>, Error> {
+        retry: impl FnOnce() -> Result<RetrySchedule, Error>,
+    ) -> Result<RetrySchedule, Error> {
         if self.needs_status_retry_evaluation() {
             self.mark_status_retry_evaluated();
             return retry();
         }
-        Ok(None)
+        Ok(RetrySchedule::NotScheduled)
     }
 
     pub(crate) fn prepare_non_success_before_body(
         &mut self,
         run_response_interceptors: impl FnOnce(),
         observe_server_throttle: impl FnOnce(),
-        try_status_retry: impl FnOnce() -> Result<Option<Duration>, Error>,
-    ) -> Result<Option<Duration>, Error> {
+        try_status_retry: impl FnOnce() -> Result<RetrySchedule, Error>,
+    ) -> Result<RetrySchedule, Error> {
         self.run_response_interceptors_if_needed(run_response_interceptors);
         self.observe_server_throttle_if_needed(observe_server_throttle);
         self.try_status_retry_if_needed(try_status_retry)
@@ -526,7 +547,7 @@ pub(crate) fn response_body_read_retry_decision(
     )
 }
 
-pub(crate) fn transport_retry_decision_from_error(
+fn transport_retry_decision_from_error(
     attempt: usize,
     max_attempts: usize,
     method: &Method,
@@ -571,76 +592,161 @@ pub(crate) fn transport_timeout_error(
     }
 }
 
-pub(crate) fn should_mark_non_success_for_resilience(
-    retry_policy: &RetryPolicy,
-    status: StatusCode,
-) -> bool {
-    !retry_policy.is_retryable_status(status)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ResponseResilienceOutcome {
-    record_success: bool,
+pub(crate) struct RequestCompletion {
+    attempt_disposition: AttemptDisposition,
+    retry_budget_disposition: RetryBudgetDisposition,
 }
 
-impl ResponseResilienceOutcome {
-    pub(crate) fn from_status(retry_policy: &RetryPolicy, status: StatusCode) -> Self {
+impl RequestCompletion {
+    pub(crate) const fn success() -> Self {
         Self {
-            record_success: should_mark_non_success_for_resilience(retry_policy, status),
+            attempt_disposition: AttemptDisposition::Success,
+            retry_budget_disposition: RetryBudgetDisposition::RecordSuccess,
         }
     }
 
-    pub(crate) const fn record_success(self) -> bool {
-        self.record_success
+    pub(crate) fn from_response_status(retry_policy: &RetryPolicy, status: StatusCode) -> Self {
+        if retry_policy.is_retryable_status(status) {
+            return Self {
+                attempt_disposition: AttemptDisposition::Failure,
+                retry_budget_disposition: RetryBudgetDisposition::Skip,
+            };
+        }
+
+        Self::success()
     }
 
-    pub(crate) fn record_buffered_response_attempt<C, A>(self, attempts: &mut AttemptGuards<C, A>)
+    #[cfg(test)]
+    const fn retry_budget_disposition(self) -> RetryBudgetDisposition {
+        self.retry_budget_disposition
+    }
+
+    pub(crate) fn record_attempt<C, A>(self, attempts: &mut AttemptGuards<C, A>)
     where
         C: AttemptOutcome,
         A: AttemptOutcome,
     {
-        attempts.record(self.record_success);
+        self.attempt_disposition.apply(attempts);
     }
 
-    pub(crate) fn record_terminal_attempt<C, A>(self, attempts: &mut AttemptGuards<C, A>)
-    where
-        C: AttemptOutcome,
-        A: AttemptOutcome,
-    {
-        attempts.record(self.record_success);
-    }
-
-    pub(crate) fn prepare_stream_response_attempt<C, A>(
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
+    pub(crate) fn record_completed<C, A>(
         self,
         attempts: &mut AttemptGuards<C, A>,
-    ) -> StreamResponseResilience
-    where
+        retry_budget: Option<&Arc<RetryBudget>>,
+    ) where
         C: AttemptOutcome,
         A: AttemptOutcome,
     {
-        if !self.record_success {
-            attempts.mark_failure();
+        self.record_attempt(attempts);
+        self.retry_budget_disposition.apply_to_budget(retry_budget);
+    }
+
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
+    pub(crate) fn into_stream_lifecycle<C, A>(
+        self,
+        attempts: &mut AttemptGuards<C, A>,
+        retry_budget: Option<Arc<RetryBudget>>,
+    ) -> Option<StreamLifecycle>
+    where
+        C: AttemptOutcome + Send + 'static,
+        A: AttemptOutcome + Send + 'static,
+    {
+        if matches!(self.attempt_disposition, AttemptDisposition::Failure) {
+            self.attempt_disposition.apply(attempts);
         }
-        StreamResponseResilience {
-            record_success_on_complete: self.record_success,
+        stream_lifecycle_from_parts(
+            retry_budget,
+            self.retry_budget_disposition,
+            self.attempt_disposition,
+            attempts.take(),
+        )
+    }
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+pub(crate) struct StreamResilienceHooks<C, A> {
+    retry_budget: Option<Arc<RetryBudget>>,
+    retry_budget_disposition: RetryBudgetDisposition,
+    attempt_on_success: AttemptDisposition,
+    attempts: AttemptGuards<C, A>,
+}
+
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+impl<C, A> StreamResilienceHooks<C, A> {
+    pub(crate) const fn new(
+        retry_budget: Option<Arc<RetryBudget>>,
+        retry_budget_disposition: RetryBudgetDisposition,
+        attempt_on_success: AttemptDisposition,
+        attempts: AttemptGuards<C, A>,
+    ) -> Self {
+        Self {
+            retry_budget,
+            retry_budget_disposition,
+            attempt_on_success,
+            attempts,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StreamResponseResilience {
-    record_success_on_complete: bool,
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+impl<C, A> StreamOutcomeHooks for StreamResilienceHooks<C, A>
+where
+    C: AttemptOutcome,
+    A: AttemptOutcome,
+{
+    fn complete_success(&mut self) {
+        self.retry_budget_disposition
+            .apply_to_budget(self.retry_budget.as_ref());
+        self.retry_budget = None;
+        self.attempt_on_success.apply(&mut self.attempts);
+    }
+
+    fn complete_error(&mut self, _error: &Error) {
+        self.retry_budget = None;
+        self.attempts.mark_failure();
+    }
+
+    fn complete_canceled(&mut self) {
+        self.retry_budget = None;
+        self.attempts.cancel();
+    }
 }
 
-impl StreamResponseResilience {
-    pub(crate) const fn record_success_on_complete(self) -> bool {
-        self.record_success_on_complete
+#[cfg(any(feature = "_async", feature = "_blocking"))]
+fn stream_lifecycle_from_parts<C, A>(
+    retry_budget: Option<Arc<RetryBudget>>,
+    retry_budget_disposition: RetryBudgetDisposition,
+    attempt_on_success: AttemptDisposition,
+    attempts: AttemptGuards<C, A>,
+) -> Option<StreamLifecycle>
+where
+    C: AttemptOutcome + Send + 'static,
+    A: AttemptOutcome + Send + 'static,
+{
+    let has_retry_budget_hook = retry_budget.is_some()
+        && matches!(
+            retry_budget_disposition,
+            RetryBudgetDisposition::RecordSuccess
+        );
+    if !has_retry_budget_hook && attempts.is_empty() {
+        return None;
     }
+
+    Some(StreamLifecycle::new(Some(Box::new(
+        StreamResilienceHooks::new(
+            retry_budget,
+            retry_budget_disposition,
+            attempt_on_success,
+            attempts,
+        ),
+    ))))
 }
 
 pub(crate) struct TerminalNonSuccess {
     pub(crate) error: Error,
-    pub(crate) resilience: ResponseResilienceOutcome,
+    pub(crate) completion: RequestCompletion,
 }
 
 pub(crate) fn terminal_non_success(
@@ -653,7 +759,7 @@ pub(crate) fn terminal_non_success(
 ) -> TerminalNonSuccess {
     TerminalNonSuccess {
         error: http_status_error(status, method, redacted_uri, headers, truncate_body(body)),
-        resilience: ResponseResilienceOutcome::from_status(retry_policy, status),
+        completion: RequestCompletion::from_response_status(retry_policy, status),
     }
 }
 
@@ -691,9 +797,54 @@ pub(crate) const fn should_return_non_success_response(status_policy: StatusPoli
     matches!(status_policy, StatusPolicy::Response)
 }
 
-pub(crate) struct StatusRetryPlan {
+pub(crate) struct RetryPlan {
     pub(crate) decision: RetryDecision,
     pub(crate) delay: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptDisposition {
+    Success,
+    Failure,
+    Cancel,
+}
+
+impl AttemptDisposition {
+    pub(crate) fn apply<C, A>(self, attempts: &mut AttemptGuards<C, A>)
+    where
+        C: AttemptOutcome,
+        A: AttemptOutcome,
+    {
+        match self {
+            Self::Success => attempts.mark_success(),
+            Self::Failure => attempts.mark_failure(),
+            Self::Cancel => attempts.cancel(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryBudgetDisposition {
+    RecordSuccess,
+    Skip,
+}
+
+impl RetryBudgetDisposition {
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
+    pub(crate) fn apply_to_budget(self, retry_budget: Option<&Arc<RetryBudget>>) {
+        if matches!(self, Self::RecordSuccess)
+            && let Some(retry_budget) = retry_budget
+        {
+            retry_budget.record_success();
+        }
+    }
+}
+
+pub(crate) enum TransportFailurePlan {
+    Retry(RetryPlan),
+    Terminal {
+        attempt_disposition: AttemptDisposition,
+    },
 }
 
 pub(crate) enum BodyReadOutcome {
@@ -702,13 +853,13 @@ pub(crate) enum BodyReadOutcome {
 }
 
 pub(crate) struct RetryAttemptState<'a> {
-    pub(crate) retry_policy: &'a RetryPolicy,
-    pub(crate) total_timeout: Option<Duration>,
-    pub(crate) request_started_at: Instant,
-    pub(crate) method: &'a Method,
-    pub(crate) redacted_uri: &'a str,
-    pub(crate) attempt: &'a mut usize,
-    pub(crate) max_attempts: usize,
+    retry_policy: &'a RetryPolicy,
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    method: &'a Method,
+    redacted_uri: &'a str,
+    attempt: &'a mut usize,
+    max_attempts: usize,
 }
 
 impl RetryAttemptState<'_> {
@@ -746,16 +897,121 @@ impl RetryAttemptState<'_> {
 }
 
 pub(crate) struct BodyReadRetryContext<'a> {
-    pub(crate) context: &'a RequestContext,
-    pub(crate) max_response_body_bytes: usize,
-    pub(crate) read_timeout: Duration,
-    pub(crate) total_timeout: Option<Duration>,
-    pub(crate) request_started_at: Instant,
-    pub(crate) method: &'a Method,
-    pub(crate) redacted_uri: &'a str,
-    pub(crate) retry_policy: &'a RetryPolicy,
-    pub(crate) max_attempts: usize,
-    pub(crate) attempt: &'a mut usize,
+    context: &'a RequestContext,
+    max_response_body_bytes: usize,
+    read_timeout: Duration,
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    method: &'a Method,
+    redacted_uri: &'a str,
+    retry_policy: &'a RetryPolicy,
+    max_attempts: usize,
+    attempt: &'a mut usize,
+}
+
+impl<'a> BodyReadRetryContext<'a> {
+    pub(crate) fn context(&self) -> &'a RequestContext {
+        self.context
+    }
+
+    pub(crate) const fn max_response_body_bytes(&self) -> usize {
+        self.max_response_body_bytes
+    }
+
+    #[cfg(feature = "_async")]
+    pub(crate) const fn read_timeout(&self) -> Duration {
+        self.read_timeout
+    }
+
+    pub(crate) fn response_body_too_large_error(&self, actual_bytes: usize) -> Error {
+        Error::ResponseBodyTooLarge {
+            limit_bytes: self.max_response_body_bytes,
+            actual_bytes,
+            method: self.method.clone(),
+            uri: self.redacted_uri.to_owned(),
+        }
+    }
+
+    pub(crate) fn response_body_read_failure(
+        &self,
+        source: impl std::error::Error + Send + Sync + 'static,
+        backoff_source: &dyn BackoffSource,
+    ) -> BodyReadFailure {
+        BodyReadFailure::Retryable {
+            error: Error::ReadBody {
+                source: Box::new(source),
+            },
+            retry_plan: self.response_body_read_retry_plan(backoff_source),
+        }
+    }
+
+    pub(crate) fn response_body_timeout_failure(
+        &self,
+        backoff_source: &dyn BackoffSource,
+    ) -> BodyReadFailure {
+        let error = if total_timeout_expired(self.total_timeout, self.request_started_at) {
+            deadline_exceeded_error(self.total_timeout, self.method, self.redacted_uri)
+        } else {
+            Error::Timeout {
+                phase: TimeoutPhase::ResponseBody,
+                timeout_ms: self.read_timeout.as_millis(),
+                method: self.method.clone(),
+                uri: self.redacted_uri.to_owned(),
+            }
+        };
+        if matches!(error, Error::DeadlineExceeded { .. }) {
+            BodyReadFailure::Terminal { error }
+        } else {
+            BodyReadFailure::Retryable {
+                error,
+                retry_plan: self.response_body_timeout_retry_plan(backoff_source),
+            }
+        }
+    }
+
+    pub(crate) fn retry_attempt(&mut self) -> RetryAttemptState<'_> {
+        RetryAttemptState {
+            retry_policy: self.retry_policy,
+            total_timeout: self.total_timeout,
+            request_started_at: self.request_started_at,
+            method: self.method,
+            redacted_uri: self.redacted_uri,
+            attempt: &mut *self.attempt,
+            max_attempts: self.max_attempts,
+        }
+    }
+
+    fn response_body_read_retry_plan(&self, backoff_source: &dyn BackoffSource) -> RetryPlan {
+        let attempt = *self.attempt;
+        RetryPlan {
+            decision: response_body_read_retry_decision(
+                attempt,
+                self.max_attempts,
+                self.method,
+                self.redacted_uri,
+            ),
+            delay: backoff_source.backoff_for_retry(self.retry_policy, attempt),
+        }
+    }
+
+    fn response_body_timeout_retry_plan(&self, backoff_source: &dyn BackoffSource) -> RetryPlan {
+        let attempt = *self.attempt;
+        RetryPlan {
+            decision: timeout_retry_decision(
+                attempt,
+                self.max_attempts,
+                self.method,
+                self.redacted_uri,
+                TimeoutPhase::ResponseBody,
+            ),
+            delay: backoff_source.backoff_for_retry(self.retry_policy, attempt),
+        }
+    }
+}
+
+pub(crate) enum BodyReadFailure {
+    Terminal { error: Error },
+    Retryable { error: Error, retry_plan: RetryPlan },
 }
 
 pub(crate) trait AttemptOutcome {
@@ -813,6 +1069,36 @@ where
         }
     }
 
+    pub(crate) fn record_failure_for_retry_schedule(
+        &mut self,
+        retry_schedule: Result<RetrySchedule, Error>,
+    ) -> Result<RetrySchedule, Error> {
+        match retry_schedule {
+            Ok(RetrySchedule::Scheduled { delay }) => {
+                self.mark_failure();
+                Ok(RetrySchedule::Scheduled { delay })
+            }
+            Ok(RetrySchedule::NotScheduled) => Ok(RetrySchedule::NotScheduled),
+            Err(error) => {
+                self.mark_failure();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn record_failure_on_error<T>(
+        &mut self,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.mark_failure();
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn cancel(&mut self) {
         if let Some(circuit) = self.circuit.take() {
             circuit.cancel();
@@ -821,28 +1107,12 @@ where
             adaptive.cancel();
         }
     }
-
-    pub(crate) fn record(&mut self, success: bool) {
-        if success {
-            self.mark_success();
-        } else {
-            self.mark_failure();
-        }
-    }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetrySchedule {
     NotScheduled,
     Scheduled { delay: Duration },
-}
-
-impl RetrySchedule {
-    pub(crate) const fn delay(self) -> Option<Duration> {
-        match self {
-            Self::NotScheduled => None,
-            Self::Scheduled { delay } => Some(delay),
-        }
-    }
 }
 
 pub(crate) struct RetryScheduleInput<'a> {
@@ -904,7 +1174,7 @@ pub(crate) struct StatusRetryPlanInput<'a> {
     pub(crate) max_delay: Duration,
 }
 
-pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryPlan {
+pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> RetryPlan {
     let StatusRetryPlanInput {
         attempt,
         max_attempts,
@@ -916,7 +1186,7 @@ pub(crate) fn status_retry_plan(input: StatusRetryPlanInput<'_>) -> StatusRetryP
         fallback_delay,
         max_delay,
     } = input;
-    StatusRetryPlan {
+    RetryPlan {
         decision: status_retry_decision(attempt, max_attempts, method, redacted_uri, status),
         delay: status_retry_delay(clock, headers, fallback_delay, max_delay),
     }
@@ -1057,16 +1327,15 @@ mod tests {
     use http::header::{HeaderName, HeaderValue};
 
     use super::{
-        RedirectAction, RedirectInput, RequestExecutionState, RequestExecutionStateInput,
-        ResponseProgress, RetrySchedule, RetryScheduleInput, next_redirect_action,
-        prepare_retry_schedule, server_throttle_delay, status_retry_delay,
-        transport_retry_decision,
+        AttemptDisposition, BodyReadFailure, RedirectAction, RedirectInput, RequestExecutionState,
+        RequestExecutionStateInput, ResponseProgress, RetryBudgetDisposition, RetrySchedule,
+        RetryScheduleInput, TransportFailurePlan, next_redirect_action, prepare_retry_schedule,
+        server_throttle_delay, status_retry_delay, transport_retry_decision,
     };
-    use crate::error::Error;
-    use crate::error::TransportErrorKind;
-    use crate::extensions::SystemClock;
+    use crate::error::{Error, TransportErrorKind, transport_error};
+    use crate::extensions::{BackoffSource, SystemClock};
     use crate::policy::{RedirectPolicy, StatusPolicy};
-    use crate::retry::{PermissiveRetryEligibility, RetryPolicy};
+    use crate::retry::{PermissiveRetryEligibility, RetryPolicy, RetryReason};
 
     struct TestAttempt {
         name: &'static str,
@@ -1102,6 +1371,14 @@ mod tests {
                 .lock()
                 .expect("lock events")
                 .push(format!("{}:cancel", self.name));
+        }
+    }
+
+    struct FixedBackoffSource(Duration);
+
+    impl BackoffSource for FixedBackoffSource {
+        fn backoff_for_retry(&self, _retry_policy: &RetryPolicy, _attempt: usize) -> Duration {
+            self.0
         }
     }
 
@@ -1315,6 +1592,109 @@ mod tests {
     }
 
     #[test]
+    fn body_read_retry_context_builds_read_failure_retry_plan() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let mut state = test_execution_state(http::Method::GET, true, retry_policy);
+        let context = state.context();
+        let retry_context = state.body_read_retry_context(&context, Duration::from_millis(75));
+
+        let failure = retry_context.response_body_read_failure(
+            std::io::Error::other("read failed"),
+            &FixedBackoffSource(Duration::from_millis(17)),
+        );
+        let BodyReadFailure::Retryable { error, retry_plan } = failure else {
+            panic!("read body failures should produce a retry plan");
+        };
+
+        assert!(matches!(error, Error::ReadBody { .. }));
+        assert_eq!(retry_plan.decision.reason(), RetryReason::ResponseBodyRead);
+        assert_eq!(retry_plan.decision.attempt(), 1);
+        assert_eq!(retry_plan.decision.max_attempts(), 3);
+        assert_eq!(retry_plan.delay, Duration::from_millis(17));
+    }
+
+    #[test]
+    fn body_read_retry_context_treats_expired_body_timeout_as_terminal_deadline() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let mut state = test_execution_state(http::Method::GET, true, retry_policy);
+        state.request_started_at = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("test start time should be representable");
+        let context = state.context();
+        let retry_context = state.body_read_retry_context(&context, Duration::from_millis(75));
+
+        let failure = retry_context
+            .response_body_timeout_failure(&FixedBackoffSource(Duration::from_millis(17)));
+        let BodyReadFailure::Terminal { error } = failure else {
+            panic!("expired total deadlines must not schedule another body timeout retry");
+        };
+
+        assert!(matches!(error, Error::DeadlineExceeded { .. }));
+    }
+
+    #[test]
+    fn transport_failure_plan_retries_transport_errors_with_execution_identity_and_backoff() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let state = test_execution_state(http::Method::GET, true, retry_policy);
+        let error = transport_error(
+            TransportErrorKind::Connect,
+            http::Method::GET,
+            "http://example.com/old".to_owned(),
+            std::io::Error::other("connect failed"),
+        );
+
+        let TransportFailurePlan::Retry(retry_plan) =
+            state.transport_failure_plan(&error, &FixedBackoffSource(Duration::from_millis(42)))
+        else {
+            panic!("transport errors should produce a retry plan");
+        };
+
+        assert_eq!(retry_plan.decision.attempt(), 1);
+        assert_eq!(retry_plan.decision.max_attempts(), 3);
+        assert_eq!(retry_plan.decision.method(), &http::Method::GET);
+        assert_eq!(retry_plan.decision.uri(), "http://example.com/old");
+        assert_eq!(
+            retry_plan.decision.transport_error_kind(),
+            Some(TransportErrorKind::Connect)
+        );
+        assert_eq!(retry_plan.delay, Duration::from_millis(42));
+    }
+
+    #[test]
+    fn transport_failure_plan_records_deadline_as_failed_attempt() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let state = test_execution_state(http::Method::GET, true, retry_policy);
+        let error = state.deadline_error();
+
+        let TransportFailurePlan::Terminal {
+            attempt_disposition,
+        } = state.transport_failure_plan(&error, &FixedBackoffSource(Duration::from_millis(42)))
+        else {
+            panic!("deadline errors should not produce transport retry plans");
+        };
+
+        assert_eq!(attempt_disposition, AttemptDisposition::Failure);
+    }
+
+    #[test]
+    fn transport_failure_plan_cancels_local_non_transport_errors() {
+        let retry_policy = RetryPolicy::standard().max_attempts(3);
+        let state = test_execution_state(http::Method::GET, true, retry_policy);
+        let error = Error::InvalidUri {
+            uri: "http://example.com bad".to_owned(),
+        };
+
+        let TransportFailurePlan::Terminal {
+            attempt_disposition,
+        } = state.transport_failure_plan(&error, &FixedBackoffSource(Duration::from_millis(42)))
+        else {
+            panic!("local non-transport errors should not produce transport retry plans");
+        };
+
+        assert_eq!(attempt_disposition, AttemptDisposition::Cancel);
+    }
+
+    #[test]
     fn response_progress_helpers_run_each_stage_once() {
         let mut progress = ResponseProgress::default();
         let mut response_interceptors = 0;
@@ -1329,21 +1709,30 @@ mod tests {
         let first_retry = progress
             .try_status_retry_if_needed(|| {
                 status_retries += 1;
-                Ok(Some(Duration::from_millis(10)))
+                Ok(RetrySchedule::Scheduled {
+                    delay: Duration::from_millis(10),
+                })
             })
             .expect("status retry check should succeed");
         let second_retry = progress
             .try_status_retry_if_needed(|| {
                 status_retries += 1;
-                Ok(Some(Duration::from_millis(20)))
+                Ok(RetrySchedule::Scheduled {
+                    delay: Duration::from_millis(20),
+                })
             })
             .expect("status retry check should stay idempotent");
 
         assert_eq!(response_interceptors, 1);
         assert_eq!(throttle_observations, 1);
         assert_eq!(status_retries, 1);
-        assert_eq!(first_retry, Some(Duration::from_millis(10)));
-        assert_eq!(second_retry, None);
+        assert_eq!(
+            first_retry,
+            RetrySchedule::Scheduled {
+                delay: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(second_retry, RetrySchedule::NotScheduled);
     }
 
     #[test]
@@ -1359,7 +1748,9 @@ mod tests {
                 || throttle_observations += 1,
                 || {
                     status_retries += 1;
-                    Ok(Some(Duration::from_millis(10)))
+                    Ok(RetrySchedule::Scheduled {
+                        delay: Duration::from_millis(10),
+                    })
                 },
             )
             .expect("pre-body status handling should succeed");
@@ -1369,7 +1760,9 @@ mod tests {
                 || throttle_observations += 1,
                 || {
                     status_retries += 1;
-                    Ok(Some(Duration::from_millis(20)))
+                    Ok(RetrySchedule::Scheduled {
+                        delay: Duration::from_millis(20),
+                    })
                 },
             )
             .expect("pre-body status handling should remain idempotent");
@@ -1377,47 +1770,59 @@ mod tests {
         assert_eq!(response_interceptors, 1);
         assert_eq!(throttle_observations, 1);
         assert_eq!(status_retries, 1);
-        assert_eq!(first_retry, Some(Duration::from_millis(10)));
-        assert_eq!(second_retry, None);
+        assert_eq!(
+            first_retry,
+            RetrySchedule::Scheduled {
+                delay: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(second_retry, RetrySchedule::NotScheduled);
     }
 
     #[test]
-    fn response_resilience_outcome_records_buffered_non_retryable_status_as_success() {
+    fn request_completion_records_completed_non_retryable_status_as_success() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut attempts = super::AttemptGuards::new(
             Some(TestAttempt::new("circuit", &events)),
             Some(TestAttempt::new("adaptive", &events)),
         );
-        let outcome = super::ResponseResilienceOutcome::from_status(
+        let completion = super::RequestCompletion::from_response_status(
             &RetryPolicy::standard(),
             http::StatusCode::NOT_FOUND,
         );
 
-        outcome.record_buffered_response_attempt(&mut attempts);
+        completion.record_attempt(&mut attempts);
 
-        assert!(outcome.record_success());
+        assert_eq!(
+            completion.retry_budget_disposition(),
+            RetryBudgetDisposition::RecordSuccess
+        );
         assert_eq!(
             *events.lock().expect("lock events"),
             vec!["circuit:success".to_owned(), "adaptive:success".to_owned()]
         );
     }
 
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
     #[test]
-    fn response_resilience_outcome_records_stream_retryable_status_before_return() {
+    fn request_completion_records_stream_retryable_status_before_return() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut attempts = super::AttemptGuards::new(
             Some(TestAttempt::new("circuit", &events)),
             Some(TestAttempt::new("adaptive", &events)),
         );
-        let outcome = super::ResponseResilienceOutcome::from_status(
+        let completion = super::RequestCompletion::from_response_status(
             &RetryPolicy::standard(),
             http::StatusCode::SERVICE_UNAVAILABLE,
         );
 
-        let stream_resilience = outcome.prepare_stream_response_attempt(&mut attempts);
+        let lifecycle = completion.into_stream_lifecycle(&mut attempts, None);
 
-        assert!(!outcome.record_success());
-        assert!(!stream_resilience.record_success_on_complete());
+        assert_eq!(
+            completion.retry_budget_disposition(),
+            RetryBudgetDisposition::Skip
+        );
+        assert!(lifecycle.is_none());
         assert!(attempts.is_empty());
         assert_eq!(
             *events.lock().expect("lock events"),
@@ -1425,21 +1830,42 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "_async", feature = "_blocking"))]
     #[test]
-    fn response_resilience_outcome_records_terminal_retryable_status_as_failure() {
+    fn stream_lifecycle_skips_inert_resilience_hooks() {
+        let retry_budget = Arc::new(crate::resilience::RetryBudget::new(
+            crate::resilience::RetryBudgetPolicy::standard(),
+            Arc::new(SystemClock),
+        ));
+        let mut attempts: super::AttemptGuards<TestAttempt, TestAttempt> =
+            super::AttemptGuards::new(None, None);
+        let completion = super::RequestCompletion::from_response_status(
+            &RetryPolicy::standard(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        );
+        let lifecycle = completion.into_stream_lifecycle(&mut attempts, Some(retry_budget));
+
+        assert!(lifecycle.is_none());
+    }
+
+    #[test]
+    fn request_completion_records_completed_retryable_status_as_failure() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut attempts = super::AttemptGuards::new(
             Some(TestAttempt::new("circuit", &events)),
             Some(TestAttempt::new("adaptive", &events)),
         );
-        let outcome = super::ResponseResilienceOutcome::from_status(
+        let completion = super::RequestCompletion::from_response_status(
             &RetryPolicy::standard(),
             http::StatusCode::SERVICE_UNAVAILABLE,
         );
 
-        outcome.record_terminal_attempt(&mut attempts);
+        completion.record_attempt(&mut attempts);
 
-        assert!(!outcome.record_success());
+        assert_eq!(
+            completion.retry_budget_disposition(),
+            RetryBudgetDisposition::Skip
+        );
         assert_eq!(
             *events.lock().expect("lock events"),
             vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
@@ -1584,6 +2010,116 @@ mod tests {
         attempts.mark_failure();
         attempts.mark_success();
 
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attempt_disposition_applies_explicit_outcome() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut canceled_attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+        AttemptDisposition::Cancel.apply(&mut canceled_attempts);
+
+        let mut failed_attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+        AttemptDisposition::Failure.apply(&mut failed_attempts);
+
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec![
+                "circuit:cancel".to_owned(),
+                "adaptive:cancel".to_owned(),
+                "circuit:failure".to_owned(),
+                "adaptive:failure".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attempt_guards_record_retry_schedule_failures_explicitly() {
+        let retry_events = Arc::new(Mutex::new(Vec::new()));
+        let mut retry_attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &retry_events)),
+            Some(TestAttempt::new("adaptive", &retry_events)),
+        );
+        let retry =
+            retry_attempts.record_failure_for_retry_schedule(Ok(RetrySchedule::Scheduled {
+                delay: Duration::from_millis(5),
+            }));
+
+        assert_eq!(
+            retry.expect("retry result should stay successful"),
+            RetrySchedule::Scheduled {
+                delay: Duration::from_millis(5)
+            }
+        );
+        assert_eq!(
+            *retry_events.lock().expect("lock retry events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
+
+        let error_events = Arc::new(Mutex::new(Vec::new()));
+        let mut error_attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &error_events)),
+            Some(TestAttempt::new("adaptive", &error_events)),
+        );
+        let error = error_attempts
+            .record_failure_for_retry_schedule(Err(Error::InvalidUri {
+                uri: "http://example.com bad".to_owned(),
+            }))
+            .expect_err("retry planning errors should propagate");
+
+        assert!(matches!(error, Error::InvalidUri { .. }));
+        assert_eq!(
+            *error_events.lock().expect("lock error events"),
+            vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attempt_guards_leave_unscheduled_retry_for_terminal_completion() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+
+        let retry = attempts.record_failure_for_retry_schedule(Ok(RetrySchedule::NotScheduled));
+
+        assert_eq!(
+            retry.expect("retry result should stay successful"),
+            RetrySchedule::NotScheduled
+        );
+        assert_eq!(*events.lock().expect("lock events"), Vec::<String>::new());
+        attempts.mark_success();
+        assert_eq!(
+            *events.lock().expect("lock events"),
+            vec!["circuit:success".to_owned(), "adaptive:success".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attempt_guards_record_regular_errors_explicitly() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut attempts = super::AttemptGuards::new(
+            Some(TestAttempt::new("circuit", &events)),
+            Some(TestAttempt::new("adaptive", &events)),
+        );
+
+        let error = attempts
+            .record_failure_on_error::<()>(Err(Error::InvalidUri {
+                uri: "http://example.com bad".to_owned(),
+            }))
+            .expect_err("regular errors should propagate");
+
+        assert!(matches!(error, Error::InvalidUri { .. }));
         assert_eq!(
             *events.lock().expect("lock events"),
             vec!["circuit:failure".to_owned(), "adaptive:failure".to_owned()]
