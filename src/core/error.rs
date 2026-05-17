@@ -95,8 +95,16 @@ pub enum ErrorCode {
     InvalidNoProxyRule,
     /// Proxy configuration was internally inconsistent.
     InvalidProxyConfig,
+    /// Timeout settings were invalid.
+    InvalidTimeoutConfig,
+    /// Retry settings were invalid.
+    InvalidRetryPolicy,
     /// Adaptive concurrency settings were invalid.
     InvalidAdaptiveConcurrencyPolicy,
+    /// Circuit breaker settings were invalid.
+    InvalidCircuitBreakerPolicy,
+    /// Rate limit settings were invalid.
+    InvalidRateLimitPolicy,
     /// Serializing a JSON request body failed.
     SerializeJson,
     /// Serializing query parameters failed.
@@ -156,7 +164,11 @@ impl ErrorCode {
         Self::InvalidUri,
         Self::InvalidNoProxyRule,
         Self::InvalidProxyConfig,
+        Self::InvalidTimeoutConfig,
+        Self::InvalidRetryPolicy,
         Self::InvalidAdaptiveConcurrencyPolicy,
+        Self::InvalidCircuitBreakerPolicy,
+        Self::InvalidRateLimitPolicy,
         Self::SerializeJson,
         Self::SerializeQuery,
         Self::SerializeForm,
@@ -196,7 +208,11 @@ impl ErrorCode {
             Self::InvalidUri => "invalid_uri",
             Self::InvalidNoProxyRule => "invalid_no_proxy_rule",
             Self::InvalidProxyConfig => "invalid_proxy_config",
+            Self::InvalidTimeoutConfig => "invalid_timeout_config",
+            Self::InvalidRetryPolicy => "invalid_retry_policy",
             Self::InvalidAdaptiveConcurrencyPolicy => "invalid_adaptive_concurrency_policy",
+            Self::InvalidCircuitBreakerPolicy => "invalid_circuit_breaker_policy",
+            Self::InvalidRateLimitPolicy => "invalid_rate_limit_policy",
             Self::SerializeJson => "serialize_json",
             Self::SerializeQuery => "serialize_query",
             Self::SerializeForm => "serialize_form",
@@ -254,6 +270,36 @@ pub enum Error {
     /// `proxy_authorization(...)` was used without configuring `http_proxy(...)`.
     #[error("proxy_authorization requires http_proxy to be configured")]
     ProxyAuthorizationRequiresHttpProxy,
+    /// Timeout settings were invalid.
+    #[error(
+        "invalid timeout configuration (request_timeout_ms={request_timeout_ms}, total_timeout_ms={total_timeout_ms:?}, connect_timeout_ms={connect_timeout_ms:?}): {message}"
+    )]
+    InvalidTimeoutConfig {
+        /// Configured per-attempt timeout in milliseconds.
+        request_timeout_ms: u128,
+        /// Configured total request deadline in milliseconds.
+        total_timeout_ms: Option<u128>,
+        /// Configured connection timeout in milliseconds.
+        connect_timeout_ms: Option<u128>,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
+    /// Retry settings were invalid.
+    #[error(
+        "invalid retry policy (max_attempts={max_attempts}, base_backoff_ms={base_backoff_ms}, max_backoff_ms={max_backoff_ms}, jitter_ratio={jitter_ratio}): {message}"
+    )]
+    InvalidRetryPolicy {
+        /// Configured maximum attempts.
+        max_attempts: usize,
+        /// Configured base backoff in milliseconds.
+        base_backoff_ms: u128,
+        /// Configured maximum backoff in milliseconds.
+        max_backoff_ms: u128,
+        /// Configured jitter ratio.
+        jitter_ratio: f64,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
     /// Adaptive concurrency settings were invalid.
     #[error(
         "invalid adaptive concurrency policy (min={min_limit}, initial={initial_limit}, max={max_limit}): {message}"
@@ -265,6 +311,34 @@ pub enum Error {
         initial_limit: usize,
         /// Configured maximum limit.
         max_limit: usize,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
+    /// Circuit breaker settings were invalid.
+    #[error(
+        "invalid circuit breaker policy (failure_threshold={failure_threshold}, open_timeout_ms={open_timeout_ms}, half_open_max_requests={half_open_max_requests}, half_open_success_threshold={half_open_success_threshold}): {message}"
+    )]
+    InvalidCircuitBreakerPolicy {
+        /// Consecutive failures required to open the circuit.
+        failure_threshold: usize,
+        /// Open-state duration in milliseconds.
+        open_timeout_ms: u128,
+        /// Maximum concurrent half-open probes.
+        half_open_max_requests: usize,
+        /// Successful half-open probes required to close the circuit.
+        half_open_success_threshold: usize,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
+    /// Rate limit settings were invalid.
+    #[error(
+        "invalid rate limit policy (requests_per_second={requests_per_second}, burst={burst}): {message}"
+    )]
+    InvalidRateLimitPolicy {
+        /// Configured sustained request rate.
+        requests_per_second: f64,
+        /// Configured token bucket burst size.
+        burst: usize,
         /// Validation failure explanation.
         message: &'static str,
     },
@@ -529,9 +603,13 @@ impl Error {
             Self::InvalidProxyConfig { .. } | Self::ProxyAuthorizationRequiresHttpProxy => {
                 ErrorCode::InvalidProxyConfig
             }
+            Self::InvalidTimeoutConfig { .. } => ErrorCode::InvalidTimeoutConfig,
+            Self::InvalidRetryPolicy { .. } => ErrorCode::InvalidRetryPolicy,
             Self::InvalidAdaptiveConcurrencyPolicy { .. } => {
                 ErrorCode::InvalidAdaptiveConcurrencyPolicy
             }
+            Self::InvalidCircuitBreakerPolicy { .. } => ErrorCode::InvalidCircuitBreakerPolicy,
+            Self::InvalidRateLimitPolicy { .. } => ErrorCode::InvalidRateLimitPolicy,
             Self::SerializeJson { .. } => ErrorCode::SerializeJson,
             Self::SerializeQuery { .. } => ErrorCode::SerializeQuery,
             Self::SerializeForm { .. } => ErrorCode::SerializeForm,

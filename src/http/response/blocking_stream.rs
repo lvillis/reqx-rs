@@ -323,7 +323,6 @@ impl BlockingResponseStream {
     where
         W: Write + ?Sized,
     {
-        let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];
         let mut copied = 0_u64;
         loop {
@@ -346,7 +345,6 @@ impl BlockingResponseStream {
 
     /// Buffers the stream into memory, enforcing `max_bytes`.
     pub fn into_bytes_limited(mut self, max_bytes: usize) -> crate::Result<Bytes> {
-        let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];
         let mut collected = Vec::new();
         let mut total_len = 0_usize;
@@ -372,7 +370,6 @@ impl BlockingResponseStream {
     ///
     /// See also `examples/blocking_streaming.rs`.
     pub fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
-        let max_bytes = max_bytes.max(1);
         let mut chunk = [0_u8; 8192];
         let mut collected = Vec::new();
         let mut total_len = 0_usize;

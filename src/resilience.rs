@@ -192,10 +192,50 @@ impl CircuitBreakerPolicy {
         self
     }
 
+    pub(crate) fn validate(self) -> crate::Result<()> {
+        if self.failure_threshold == 0 {
+            return Err(Error::InvalidCircuitBreakerPolicy {
+                failure_threshold: self.failure_threshold,
+                open_timeout_ms: self.open_timeout.as_millis(),
+                half_open_max_requests: self.half_open_max_requests,
+                half_open_success_threshold: self.half_open_success_threshold,
+                message: "failure_threshold must be >= 1",
+            });
+        }
+        if self.open_timeout.is_zero() {
+            return Err(Error::InvalidCircuitBreakerPolicy {
+                failure_threshold: self.failure_threshold,
+                open_timeout_ms: self.open_timeout.as_millis(),
+                half_open_max_requests: self.half_open_max_requests,
+                half_open_success_threshold: self.half_open_success_threshold,
+                message: "open_timeout must be >= 1ms",
+            });
+        }
+        if self.half_open_max_requests == 0 {
+            return Err(Error::InvalidCircuitBreakerPolicy {
+                failure_threshold: self.failure_threshold,
+                open_timeout_ms: self.open_timeout.as_millis(),
+                half_open_max_requests: self.half_open_max_requests,
+                half_open_success_threshold: self.half_open_success_threshold,
+                message: "half_open_max_requests must be >= 1",
+            });
+        }
+        if self.half_open_success_threshold == 0 {
+            return Err(Error::InvalidCircuitBreakerPolicy {
+                failure_threshold: self.failure_threshold,
+                open_timeout_ms: self.open_timeout.as_millis(),
+                half_open_max_requests: self.half_open_max_requests,
+                half_open_success_threshold: self.half_open_success_threshold,
+                message: "half_open_success_threshold must be >= 1",
+            });
+        }
+        Ok(())
+    }
+
     fn normalize_for_runtime(self) -> Self {
         Self {
             failure_threshold: normalize_usize_at_least_one(self.failure_threshold),
-            open_timeout: self.open_timeout,
+            open_timeout: self.open_timeout.max(Duration::from_millis(1)),
             half_open_max_requests: normalize_usize_at_least_one(self.half_open_max_requests),
             half_open_success_threshold: normalize_usize_at_least_one(
                 self.half_open_success_threshold,
@@ -530,6 +570,22 @@ impl AdaptiveConcurrencyPolicy {
                 message: "initial_limit must be >= 1",
             });
         }
+        if self.increase_step == 0 {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "increase_step must be >= 1",
+            });
+        }
+        if self.high_latency_threshold.is_zero() {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "high_latency_threshold must be >= 1ms",
+            });
+        }
         if self.min_limit > self.max_limit {
             return Err(Error::InvalidAdaptiveConcurrencyPolicy {
                 min_limit: self.min_limit,
@@ -591,14 +647,14 @@ impl AdaptiveConcurrencyPolicy {
             min_limit,
             initial_limit,
             max_limit,
-            increase_step: self.increase_step,
+            increase_step: normalize_usize_at_least_one(self.increase_step),
             decrease_ratio: clamp_f64_or_fallback(
                 self.decrease_ratio,
                 0.1,
                 0.99,
                 Self::standard().decrease_ratio,
             ),
-            high_latency_threshold: self.high_latency_threshold,
+            high_latency_threshold: self.high_latency_threshold.max(Duration::from_millis(1)),
         }
     }
 }
@@ -851,6 +907,34 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_validate_rejects_zero_failure_threshold() {
+        let policy = CircuitBreakerPolicy::standard().failure_threshold(0);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_validate_rejects_zero_open_timeout() {
+        let policy = CircuitBreakerPolicy::standard().open_timeout(Duration::ZERO);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_validate_rejects_zero_half_open_max_requests() {
+        let policy = CircuitBreakerPolicy::standard().half_open_max_requests(0);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_validate_rejects_zero_half_open_success_threshold() {
+        let policy = CircuitBreakerPolicy::standard().half_open_success_threshold(0);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
     fn circuit_breaker_limits_half_open_concurrency() {
         let clock = Arc::new(TestClock::default());
         let breaker = Arc::new(CircuitBreaker::new(
@@ -1012,6 +1096,20 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_concurrency_validate_rejects_zero_increase_step() {
+        let policy = AdaptiveConcurrencyPolicy::standard().increase_step(0);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn adaptive_concurrency_validate_rejects_zero_high_latency_threshold() {
+        let policy = AdaptiveConcurrencyPolicy::standard().high_latency_threshold(Duration::ZERO);
+
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
     fn adaptive_concurrency_release_uses_normalized_policy() {
         let policy = AdaptiveConcurrencyPolicy::standard()
             .min_limit(0)
@@ -1028,6 +1126,48 @@ mod tests {
         assert!(
             state.try_acquire(),
             "release path should not collapse the normalized limit back to zero"
+        );
+    }
+
+    #[test]
+    fn adaptive_concurrency_release_normalizes_zero_increase_step() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(1)
+            .initial_limit(1)
+            .max_limit(3)
+            .increase_step(0);
+        let mut state = AdaptiveConcurrencyState::new(policy);
+
+        assert!(state.try_acquire());
+        state.release_and_record(policy, AdaptiveConcurrencyOutcome::Success, Duration::ZERO);
+
+        assert!(state.try_acquire());
+        assert!(
+            state.try_acquire(),
+            "runtime normalization should let successful samples grow the limit"
+        );
+    }
+
+    #[test]
+    fn adaptive_concurrency_release_normalizes_zero_high_latency_threshold() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(1)
+            .initial_limit(1)
+            .max_limit(3)
+            .high_latency_threshold(Duration::ZERO);
+        let mut state = AdaptiveConcurrencyState::new(policy);
+
+        assert!(state.try_acquire());
+        state.release_and_record(
+            policy,
+            AdaptiveConcurrencyOutcome::Success,
+            Duration::from_millis(1),
+        );
+
+        assert!(state.try_acquire());
+        assert!(
+            state.try_acquire(),
+            "runtime normalization should not classify the minimum threshold sample as high latency"
         );
     }
 }

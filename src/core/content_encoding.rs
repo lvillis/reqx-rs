@@ -82,7 +82,6 @@ pub(crate) fn decode_content_encoded_body_limited(
     headers: &HeaderMap,
     max_bytes: usize,
 ) -> Result<Bytes, DecodeContentEncodingError> {
-    let max_bytes = max_bytes.max(1);
     let mut encodings = Vec::new();
     for content_encoding in headers.get_all(CONTENT_ENCODING) {
         let content_encoding =

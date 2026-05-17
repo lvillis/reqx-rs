@@ -306,7 +306,11 @@ impl ClientMetrics {
             | Error::InvalidNoProxyRule { .. }
             | Error::InvalidProxyConfig { .. }
             | Error::ProxyAuthorizationRequiresHttpProxy
+            | Error::InvalidTimeoutConfig { .. }
+            | Error::InvalidRetryPolicy { .. }
             | Error::InvalidAdaptiveConcurrencyPolicy { .. }
+            | Error::InvalidCircuitBreakerPolicy { .. }
+            | Error::InvalidRateLimitPolicy { .. }
             | Error::SerializeJson { .. }
             | Error::SerializeQuery { .. }
             | Error::SerializeForm { .. }

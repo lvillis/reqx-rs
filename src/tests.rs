@@ -16,7 +16,9 @@ use http::header::{
 };
 use http::{HeaderMap, StatusCode, header::HeaderName};
 
-use crate::advanced::{AdaptiveConcurrencyPolicy, ClientProfile, StatusPolicy};
+use crate::advanced::{
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, ClientProfile, RateLimitPolicy, StatusPolicy,
+};
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::content_encoding::{DecodeContentEncodingError, decode_content_encoded_body_limited};
@@ -34,7 +36,8 @@ use crate::util::is_timeout_io_error;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
     join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
-    resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect,
+    redact_uri_without_url_normalization, resolve_redirect_uri, resolve_uri, same_origin,
+    sanitize_headers_for_redirect,
 };
 #[cfg(feature = "_async")]
 use crate::util::{
@@ -536,6 +539,18 @@ fn redact_uri_for_logs_fallback_masks_userinfo_query_and_fragment() {
     let redacted =
         redact_uri_for_logs("https://user:pass@proxy.example.com:badport/path?token=secret#frag");
     assert_eq!(redacted, "https://proxy.example.com:badport/path");
+}
+
+#[test]
+fn redact_uri_for_logs_fallback_masks_userinfo_without_host() {
+    let redacted = redact_uri_for_logs("https://user:pass@?token=secret#frag");
+    assert_eq!(redacted, "https://<redacted>@");
+}
+
+#[test]
+fn redact_uri_for_logs_fallback_masks_network_path_userinfo_without_host() {
+    let redacted = redact_uri_without_url_normalization("//user:pass@/path?token=secret#frag");
+    assert_eq!(redacted, "//<redacted>@/path");
 }
 
 #[test]
@@ -1232,7 +1247,7 @@ fn blocking_timeout_io_error_helper_detects_plain_and_wrapped_timeouts() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 30);
+    assert_eq!(codes.len(), 34);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -1241,7 +1256,11 @@ fn error_code_contract_table_is_stable() {
             "invalid_uri",
             "invalid_no_proxy_rule",
             "invalid_proxy_config",
+            "invalid_timeout_config",
+            "invalid_retry_policy",
             "invalid_adaptive_concurrency_policy",
+            "invalid_circuit_breaker_policy",
+            "invalid_rate_limit_policy",
             "serialize_json",
             "serialize_query",
             "serialize_form",
@@ -1303,6 +1322,31 @@ fn error_code_maps_proxy_authorization_requires_http_proxy_variant() {
 }
 
 #[test]
+fn error_code_maps_invalid_timeout_config_variant() {
+    let error = Error::InvalidTimeoutConfig {
+        request_timeout_ms: 0,
+        total_timeout_ms: Some(10),
+        connect_timeout_ms: Some(5),
+        message: "request_timeout must be greater than zero",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidTimeoutConfig);
+    assert_eq!(error.code().as_str(), "invalid_timeout_config");
+}
+
+#[test]
+fn error_code_maps_invalid_retry_policy_variant() {
+    let error = Error::InvalidRetryPolicy {
+        max_attempts: 0,
+        base_backoff_ms: 1,
+        max_backoff_ms: 100,
+        jitter_ratio: 0.0,
+        message: "max_attempts must be greater than zero",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidRetryPolicy);
+    assert_eq!(error.code().as_str(), "invalid_retry_policy");
+}
+
+#[test]
 fn error_code_maps_invalid_adaptive_concurrency_policy_variant() {
     let error = Error::InvalidAdaptiveConcurrencyPolicy {
         min_limit: 10,
@@ -1312,6 +1356,30 @@ fn error_code_maps_invalid_adaptive_concurrency_policy_variant() {
     };
     assert_eq!(error.code(), ErrorCode::InvalidAdaptiveConcurrencyPolicy);
     assert_eq!(error.code().as_str(), "invalid_adaptive_concurrency_policy");
+}
+
+#[test]
+fn error_code_maps_invalid_circuit_breaker_policy_variant() {
+    let error = Error::InvalidCircuitBreakerPolicy {
+        failure_threshold: 0,
+        open_timeout_ms: 0,
+        half_open_max_requests: 1,
+        half_open_success_threshold: 1,
+        message: "failure_threshold must be >= 1",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidCircuitBreakerPolicy);
+    assert_eq!(error.code().as_str(), "invalid_circuit_breaker_policy");
+}
+
+#[test]
+fn error_code_maps_invalid_rate_limit_policy_variant() {
+    let error = Error::InvalidRateLimitPolicy {
+        requests_per_second: 0.0,
+        burst: 1,
+        message: "requests_per_second must be finite and > 0",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidRateLimitPolicy);
+    assert_eq!(error.code().as_str(), "invalid_rate_limit_policy");
 }
 
 #[test]
@@ -1649,6 +1717,79 @@ fn build_rejects_invalid_adaptive_concurrency_policy() {
             assert_eq!(min_limit, 10);
             assert_eq!(initial_limit, 8);
             assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_invalid_circuit_breaker_policy() {
+    let policy = CircuitBreakerPolicy::standard().open_timeout(Duration::ZERO);
+    let result = Client::builder("https://api.example.com")
+        .circuit_breaker_policy(policy)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid circuit breaker policy should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidCircuitBreakerPolicy {
+            failure_threshold,
+            open_timeout_ms,
+            half_open_max_requests,
+            half_open_success_threshold,
+            ..
+        } => {
+            assert_eq!(failure_threshold, 5);
+            assert_eq!(open_timeout_ms, 0);
+            assert_eq!(half_open_max_requests, 2);
+            assert_eq!(half_open_success_threshold, 2);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_invalid_global_rate_limit_policy() {
+    let policy = RateLimitPolicy::standard().requests_per_second(0.0);
+    let result = Client::builder("https://api.example.com")
+        .global_rate_limit_policy(policy)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid global rate limit policy should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidRateLimitPolicy {
+            requests_per_second,
+            burst,
+            ..
+        } => {
+            assert_eq!(requests_per_second, 0.0);
+            assert_eq!(burst, 50);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_invalid_per_host_rate_limit_policy() {
+    let policy = RateLimitPolicy::standard().burst(0);
+    let result = Client::builder("https://api.example.com")
+        .per_host_rate_limit_policy(policy)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid per-host rate limit policy should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidRateLimitPolicy {
+            requests_per_second,
+            burst,
+            ..
+        } => {
+            assert_eq!(requests_per_second, 50.0);
+            assert_eq!(burst, 0);
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -2376,6 +2517,28 @@ fn decode_content_encoded_body_limited_rejects_expanded_payload() {
     match error {
         DecodeContentEncodingError::TooLarge { actual_bytes } => {
             assert!(actual_bytes > 512);
+        }
+        other => panic!("unexpected decode error: {other:?}"),
+    }
+}
+
+#[test]
+fn decode_content_encoded_body_limited_honors_zero_limit() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("identity"),
+    );
+
+    let empty = decode_content_encoded_body_limited(Bytes::new(), &headers, 0)
+        .expect("empty body should fit zero byte limit");
+    assert!(empty.is_empty());
+
+    let error = decode_content_encoded_body_limited(Bytes::from_static(b"x"), &headers, 0)
+        .expect_err("non-empty body should exceed zero byte limit");
+    match error {
+        DecodeContentEncodingError::TooLarge { actual_bytes } => {
+            assert_eq!(actual_bytes, 1);
         }
         other => panic!("unexpected decode error: {other:?}"),
     }

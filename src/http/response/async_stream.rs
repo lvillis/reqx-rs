@@ -260,7 +260,6 @@ impl StreamBody {
     }
 
     async fn read_raw_bytes_limited(&mut self, max_bytes: usize) -> crate::Result<Bytes> {
-        let max_bytes = max_bytes.max(1);
         let mut collected = Vec::new();
         let mut total_len = 0_usize;
 
@@ -341,7 +340,6 @@ impl StreamBody {
     where
         W: AsyncWrite + Unpin + Send + ?Sized,
     {
-        let max_bytes = max_bytes.max(1);
         let mut copied = 0_u64;
 
         let pending_chunk = self.take_pending_chunk_or_complete()?;
@@ -493,7 +491,6 @@ impl ResponseStream {
     ///
     /// See also `examples/streaming.rs`.
     pub async fn into_bytes_limited(self, max_bytes: usize) -> crate::Result<Bytes> {
-        let max_bytes = max_bytes.max(1);
         let mut this = self;
         match this.body.read_raw_bytes_limited(max_bytes).await {
             Ok(body) => {
@@ -533,7 +530,6 @@ impl ResponseStream {
     ///
     /// See also `examples/streaming.rs`.
     pub async fn into_response_limited(mut self, max_bytes: usize) -> crate::Result<Response> {
-        let max_bytes = max_bytes.max(1);
         let method = self.body.method().clone();
         let uri_redacted = self.body.uri_redacted().to_owned();
         let body = match self.body.read_raw_bytes_limited(max_bytes).await {

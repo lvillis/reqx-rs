@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use thiserror::Error;
 
-use crate::util::{clamp_f64_or_fallback, exponential_backoff_with_jitter};
+use crate::util::exponential_backoff_with_jitter;
 
 /// Current resumable upload checkpoint schema version.
 pub const RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 2;
@@ -106,7 +106,7 @@ impl ResumableUploadCheckpoint {
         Self {
             version: RESUMABLE_UPLOAD_CHECKPOINT_VERSION,
             upload_id: upload_id.into(),
-            part_size: part_size.max(1),
+            part_size,
             checksum_algorithm: None,
             completed_parts: BTreeMap::new(),
         }
@@ -149,34 +149,31 @@ impl ResumableUploadOptions {
 
     /// Sets the size of each uploaded part in bytes.
     pub fn with_part_size(mut self, part_size: usize) -> Self {
-        self.part_size = part_size.max(1);
+        self.part_size = part_size;
         self
     }
 
     /// Sets how many attempts are allowed for each part upload.
     pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
-        self.max_attempts = max_attempts.max(1);
+        self.max_attempts = max_attempts;
         self
     }
 
     /// Sets the base retry backoff used between part upload attempts.
     pub fn with_base_backoff(mut self, base_backoff: Duration) -> Self {
-        self.base_backoff = base_backoff.max(Duration::from_millis(1));
-        if self.max_backoff < self.base_backoff {
-            self.max_backoff = self.base_backoff;
-        }
+        self.base_backoff = base_backoff;
         self
     }
 
     /// Sets the maximum retry backoff used between part upload attempts.
     pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
-        self.max_backoff = max_backoff.max(self.base_backoff);
+        self.max_backoff = max_backoff;
         self
     }
 
     /// Sets the backoff jitter ratio applied to retry delays.
     pub fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
-        self.jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
+        self.jitter_ratio = jitter_ratio;
         self
     }
 
@@ -234,6 +231,47 @@ impl ResumableUploadOptions {
             self.max_backoff,
             self.jitter_ratio,
         )
+    }
+
+    fn validate<E>(&self) -> Result<(), ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if self.part_size == 0 {
+            return Err(self.invalid_options("part_size must be greater than zero"));
+        }
+        if self.max_attempts == 0 {
+            return Err(self.invalid_options("max_attempts must be greater than zero"));
+        }
+        if self.base_backoff.is_zero() {
+            return Err(self.invalid_options("base_backoff must be greater than zero"));
+        }
+        if self.max_backoff.is_zero() {
+            return Err(self.invalid_options("max_backoff must be greater than zero"));
+        }
+        if self.max_backoff < self.base_backoff {
+            return Err(
+                self.invalid_options("max_backoff must be greater than or equal to base_backoff")
+            );
+        }
+        if !self.jitter_ratio.is_finite() || !(0.0..=1.0).contains(&self.jitter_ratio) {
+            return Err(self.invalid_options("jitter_ratio must be finite and between 0.0 and 1.0"));
+        }
+        Ok(())
+    }
+
+    fn invalid_options<E>(&self, message: &'static str) -> ResumableUploadError<E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        ResumableUploadError::InvalidOptions {
+            part_size: self.part_size,
+            max_attempts: self.max_attempts,
+            base_backoff_ms: self.base_backoff.as_millis(),
+            max_backoff_ms: self.max_backoff.as_millis(),
+            jitter_ratio: self.jitter_ratio,
+            message,
+        }
     }
 
     fn expected_checksum(&self, chunk: &[u8]) -> Option<String> {
@@ -306,6 +344,24 @@ pub enum ResumableUploadError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    /// Resumable upload options were invalid.
+    #[error(
+        "invalid resumable upload options (part_size={part_size}, max_attempts={max_attempts}, base_backoff_ms={base_backoff_ms}, max_backoff_ms={max_backoff_ms}, jitter_ratio={jitter_ratio}): {message}"
+    )]
+    InvalidOptions {
+        /// Configured part size.
+        part_size: usize,
+        /// Configured attempts per part.
+        max_attempts: usize,
+        /// Configured base backoff in milliseconds.
+        base_backoff_ms: u128,
+        /// Configured maximum backoff in milliseconds.
+        max_backoff_ms: u128,
+        /// Configured jitter ratio.
+        jitter_ratio: f64,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
     /// Creating the remote upload session failed.
     #[error("failed to create resumable upload: {source}")]
     CreateFailed {
@@ -747,6 +803,7 @@ impl<'a> ResumableUploadSession<'a> {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
+        options.validate::<E>()?;
         validate_and_upgrade_checkpoint::<E>(options, &mut checkpoint)?;
         Ok(Self {
             options,
@@ -954,6 +1011,7 @@ impl BlockingResumableUploader {
         B: BlockingResumableUploadBackend,
         R: Read,
     {
+        self.options.validate::<B::Error>()?;
         let upload_id = backend
             .create_upload()
             .map_err(|source| ResumableUploadError::CreateFailed { source })?;
@@ -1116,6 +1174,7 @@ impl AsyncResumableUploader {
         B: AsyncResumableUploadBackend,
         R: tokio::io::AsyncRead + Unpin,
     {
+        self.options.validate::<B::Error>()?;
         let upload_id = backend
             .create_upload()
             .await
@@ -1752,6 +1811,58 @@ mod tests {
     }
 
     #[test]
+    fn blocking_upload_rejects_invalid_options_before_create_upload() {
+        let backend = BlockingMockBackend::default();
+        let uploader =
+            BlockingResumableUploader::new(ResumableUploadOptions::new().with_part_size(0));
+
+        let mut reader = std::io::Cursor::new(b"abcd".to_vec());
+        let error = uploader
+            .upload(&backend, &mut reader)
+            .expect_err("invalid options should fail before creating an upload");
+
+        match error {
+            ResumableUploadError::InvalidOptions {
+                part_size, message, ..
+            } => {
+                assert_eq!(part_size, 0);
+                assert_eq!(message, "part_size must be greater than zero");
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.aborts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resumable_upload_options_reject_incoherent_backoff_window() {
+        let options = ResumableUploadOptions::new()
+            .with_base_backoff(Duration::from_millis(80))
+            .with_max_backoff(Duration::from_millis(50));
+
+        let error = options
+            .validate::<MockError>()
+            .expect_err("max backoff below base backoff should be invalid");
+
+        match error {
+            ResumableUploadError::InvalidOptions {
+                base_backoff_ms,
+                max_backoff_ms,
+                message,
+                ..
+            } => {
+                assert_eq!(base_backoff_ms, 80);
+                assert_eq!(max_backoff_ms, 50);
+                assert_eq!(
+                    message,
+                    "max_backoff must be greater than or equal to base_backoff"
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
     fn blocking_abort_on_error_aborts_after_source_read_failure() {
         let backend = BlockingMockBackend::default();
         let uploader = BlockingResumableUploader::new(
@@ -1958,13 +2069,30 @@ mod tests {
     }
 
     #[test]
-    fn resumable_upload_nan_jitter_ratio_is_normalized_to_zero() {
+    fn resumable_upload_options_reject_nan_jitter_ratio() {
         let options = ResumableUploadOptions::new()
             .with_base_backoff(Duration::from_millis(50))
             .with_max_backoff(Duration::from_millis(80))
             .with_jitter_ratio(f64::NAN);
 
-        assert_eq!(options.backoff_for_retry(1), Duration::from_millis(50));
+        let error = options
+            .validate::<MockError>()
+            .expect_err("nan jitter ratio should be invalid");
+
+        match error {
+            ResumableUploadError::InvalidOptions {
+                jitter_ratio,
+                message,
+                ..
+            } => {
+                assert!(jitter_ratio.is_nan());
+                assert_eq!(
+                    message,
+                    "jitter_ratio must be finite and between 0.0 and 1.0"
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[cfg(feature = "_async")]
@@ -2097,6 +2225,34 @@ mod tests {
         assert!(resumed.resumed);
         assert_eq!(resumed.total_parts, 2);
         assert_eq!(backend.completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "_async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_upload_rejects_invalid_options_before_create_upload() {
+        let backend = AsyncMockBackend::default();
+        let uploader =
+            AsyncResumableUploader::new(ResumableUploadOptions::new().with_max_attempts(0));
+
+        let mut reader = std::io::Cursor::new(b"abcd".to_vec());
+        let error = uploader
+            .upload(&backend, &mut reader)
+            .await
+            .expect_err("invalid options should fail before creating an upload");
+
+        match error {
+            ResumableUploadError::InvalidOptions {
+                max_attempts,
+                message,
+                ..
+            } => {
+                assert_eq!(max_attempts, 0);
+                assert_eq!(message, "max_attempts must be greater than zero");
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+        assert_eq!(backend.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.aborts.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "_async")]

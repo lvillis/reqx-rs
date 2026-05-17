@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 
+use crate::config::RequestTimeoutConfig;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::{
@@ -904,13 +905,16 @@ impl Client {
         } = input;
         let timeout_value = execution_options
             .request_timeout
-            .unwrap_or(self.request_timeout)
-            .max(Duration::from_millis(1));
+            .unwrap_or(self.request_timeout);
         let total_timeout = execution_options.total_timeout.or(self.total_timeout);
+        RequestTimeoutConfig {
+            request_timeout: timeout_value,
+            total_timeout,
+        }
+        .validate()?;
         let max_response_body_bytes = execution_options
             .max_response_body_bytes
-            .unwrap_or(self.max_response_body_bytes)
-            .max(1);
+            .unwrap_or(self.max_response_body_bytes);
 
         let (mut buffered_body, mut reader_body) = match body {
             RequestBody::Buffered(body) => (Some(body), None),
@@ -921,6 +925,7 @@ impl Client {
         let retry_policy = execution_options
             .retry_policy
             .unwrap_or_else(|| self.retry_policy.clone());
+        retry_policy.validate()?;
         let redirect_policy = execution_options
             .redirect_policy
             .unwrap_or(self.redirect_policy);

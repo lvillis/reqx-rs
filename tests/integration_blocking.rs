@@ -840,6 +840,56 @@ fn blocking_head_stream_into_response_with_content_encoding_empty_body_succeeds(
 }
 
 #[test]
+fn blocking_zero_response_body_limit_rejects_first_buffered_or_streamed_byte() {
+    let server = MockServer::start(vec![
+        MockResponse::new(200, vec![("Content-Type", "text/plain")], b"x".to_vec()),
+        MockResponse::new(200, vec![("Content-Type", "text/plain")], b"y".to_vec()),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .max_response_body_bytes(0)
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let buffered_error = client
+        .get("/zero-buffered")
+        .send()
+        .expect_err("non-empty buffered body should exceed zero byte limit");
+    match buffered_error {
+        Error::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 0);
+            assert_eq!(actual_bytes, 1);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let streamed = client
+        .get("/zero-stream")
+        .send_stream()
+        .expect("stream request should succeed");
+    let stream_error = streamed
+        .into_bytes_limited(0)
+        .expect_err("non-empty stream body should exceed zero byte limit");
+    match stream_error {
+        Error::ResponseBodyTooLarge {
+            limit_bytes,
+            actual_bytes,
+            ..
+        } => {
+            assert_eq!(limit_bytes, 0);
+            assert_eq!(actual_bytes, 1);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_body_reader_accepts_send_non_sync_reader() {
     #[derive(Default)]
     struct NonSyncReader {
@@ -1709,7 +1759,7 @@ fn blocking_buffered_status_retry_happens_before_body_limit() {
         .retry_policy(
             RetryPolicy::standard()
                 .max_attempts(2)
-                .base_backoff(Duration::ZERO)
+                .base_backoff(Duration::from_millis(1))
                 .max_backoff(Duration::from_millis(1))
                 .jitter_ratio(0.0),
         )
@@ -1751,6 +1801,178 @@ fn blocking_build_rejects_invalid_adaptive_concurrency_policy() {
             assert_eq!(min_limit, 10);
             assert_eq!(initial_limit, 8);
             assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_retry_policy() {
+    let result = Client::builder("https://api.example.com")
+        .retry_policy(RetryPolicy::standard().max_attempts(0))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid retry policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRetryPolicy {
+            max_attempts,
+            message,
+            ..
+        } => {
+            assert_eq!(max_attempts, 0);
+            assert_eq!(message, "max_attempts must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_timeout_config() {
+    let result = Client::builder("https://api.example.com")
+        .connect_timeout(Duration::ZERO)
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid timeout configuration should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidTimeoutConfig {
+            request_timeout_ms,
+            total_timeout_ms,
+            connect_timeout_ms,
+            message,
+        } => {
+            assert_eq!(request_timeout_ms, 10_000);
+            assert_eq!(total_timeout_ms, None);
+            assert_eq!(connect_timeout_ms, Some(0));
+            assert_eq!(message, "connect_timeout must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_accepts_zero_idle_pool_limits() {
+    Client::builder("https://api.example.com")
+        .pool_idle_timeout(Duration::ZERO)
+        .pool_max_idle_per_host(0)
+        .pool_max_idle_connections(0)
+        .build()
+        .expect("zero idle pool limits should disable idle retention");
+}
+
+#[test]
+fn blocking_request_rejects_invalid_retry_policy_override() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain")],
+        b"unused".to_vec(),
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/invalid-retry-policy")
+        .retry_policy(RetryPolicy::standard().jitter_ratio(f64::NAN))
+        .send()
+        .expect_err("invalid request retry override should fail");
+
+    match error {
+        Error::InvalidRetryPolicy { jitter_ratio, .. } => assert!(jitter_ratio.is_nan()),
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(server.served_count(), 0);
+}
+
+#[test]
+fn blocking_request_rejects_invalid_timeout_override() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain")],
+        b"unused".to_vec(),
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/invalid-timeout")
+        .timeout(Duration::ZERO)
+        .send()
+        .expect_err("invalid request timeout override should fail");
+
+    match error {
+        Error::InvalidTimeoutConfig {
+            request_timeout_ms,
+            total_timeout_ms,
+            connect_timeout_ms,
+            message,
+        } => {
+            assert_eq!(request_timeout_ms, 0);
+            assert_eq!(total_timeout_ms, None);
+            assert_eq!(connect_timeout_ms, None);
+            assert_eq!(message, "request_timeout must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(server.served_count(), 0);
+}
+
+#[test]
+fn blocking_build_rejects_invalid_circuit_breaker_policy() {
+    let result = Client::builder("https://api.example.com")
+        .circuit_breaker_policy(CircuitBreakerPolicy::standard().open_timeout(Duration::ZERO))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid circuit breaker policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidCircuitBreakerPolicy {
+            failure_threshold,
+            open_timeout_ms,
+            half_open_max_requests,
+            half_open_success_threshold,
+            ..
+        } => {
+            assert_eq!(failure_threshold, 5);
+            assert_eq!(open_timeout_ms, 0);
+            assert_eq!(half_open_max_requests, 2);
+            assert_eq!(half_open_success_threshold, 2);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_rate_limit_policy() {
+    let result = Client::builder("https://api.example.com")
+        .per_host_rate_limit_policy(RateLimitPolicy::standard().burst(0))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid rate limit policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRateLimitPolicy {
+            requests_per_second,
+            burst,
+            ..
+        } => {
+            assert_eq!(requests_per_second, 50.0);
+            assert_eq!(burst, 0);
         }
         other => panic!("unexpected error: {other}"),
     }

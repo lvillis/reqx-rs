@@ -4,7 +4,7 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
-use crate::config::ClientProfile;
+use crate::config::{ClientControlPolicies, ClientProfile, ClientTimeoutConfig};
 use crate::core::limiters::normalize_concurrency_limit;
 use crate::error::Error;
 use crate::extensions::{
@@ -88,14 +88,18 @@ impl ClientBuilder {
     }
 
     /// Sets the per-attempt request timeout.
+    ///
+    /// A zero duration is rejected by [`Self::build`].
     pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
-        self.request_timeout = request_timeout.max(Duration::from_millis(1));
+        self.request_timeout = request_timeout;
         self
     }
 
     /// Sets the overall request deadline, including retries and redirects.
+    ///
+    /// A zero duration is rejected by [`Self::build`].
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
-        self.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self.total_timeout = Some(total_timeout);
         self
     }
 
@@ -113,31 +117,39 @@ impl ClientBuilder {
 
     /// Sets the default buffered response body size limit in bytes.
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
-        self.max_response_body_bytes = max_response_body_bytes.max(1);
+        self.max_response_body_bytes = max_response_body_bytes;
         self
     }
 
     /// Sets the connect timeout used before a socket is established.
+    ///
+    /// A zero duration is rejected by [`Self::build`].
     pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        self.connect_timeout = connect_timeout.max(Duration::from_millis(1));
+        self.connect_timeout = connect_timeout;
         self
     }
 
     /// Sets how long idle pooled connections may be kept alive.
+    ///
+    /// A zero duration disables idle connection retention.
     pub fn pool_idle_timeout(mut self, pool_idle_timeout: Duration) -> Self {
-        self.pool_idle_timeout = pool_idle_timeout.max(Duration::from_millis(1));
+        self.pool_idle_timeout = pool_idle_timeout;
         self
     }
 
     /// Sets the maximum number of idle pooled connections kept per host.
+    ///
+    /// Zero disables per-host idle connection retention.
     pub fn pool_max_idle_per_host(mut self, pool_max_idle_per_host: usize) -> Self {
-        self.pool_max_idle_per_host = pool_max_idle_per_host.max(1);
+        self.pool_max_idle_per_host = pool_max_idle_per_host;
         self
     }
 
     /// Sets the maximum number of idle pooled connections kept in total.
+    ///
+    /// Zero disables global idle connection retention.
     pub fn pool_max_idle_connections(mut self, pool_max_idle_connections: usize) -> Self {
-        self.pool_max_idle_connections = pool_max_idle_connections.max(1);
+        self.pool_max_idle_connections = pool_max_idle_connections;
         self
     }
 
@@ -571,9 +583,20 @@ impl ClientBuilder {
         if let Some(rule) = self.invalid_no_proxy_rules.first() {
             return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
         }
-        if let Some(policy) = self.adaptive_concurrency_policy {
-            policy.validate()?;
+        ClientTimeoutConfig {
+            request_timeout: self.request_timeout,
+            total_timeout: self.total_timeout,
+            connect_timeout: self.connect_timeout,
         }
+        .validate()?;
+        self.retry_policy.validate()?;
+        ClientControlPolicies {
+            circuit_breaker: self.circuit_breaker_policy,
+            adaptive_concurrency: self.adaptive_concurrency_policy,
+            global_rate_limit: self.global_rate_limit_policy,
+            per_host_rate_limit: self.per_host_rate_limit_policy,
+        }
+        .validate()?;
 
         if !backend_is_available(self.tls_backend) {
             return Err(Error::TlsBackendUnavailable {

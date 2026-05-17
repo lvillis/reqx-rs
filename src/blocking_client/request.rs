@@ -172,20 +172,24 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Overrides the per-attempt request timeout for this request.
+    ///
+    /// A zero duration is rejected by `send` or `send_stream`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.execution_overrides.request_timeout = Some(timeout.max(Duration::from_millis(1)));
+        self.execution_overrides.request_timeout = Some(timeout);
         self
     }
 
     /// Overrides the overall deadline for this request.
+    ///
+    /// A zero duration is rejected by `send` or `send_stream`.
     pub fn total_timeout(mut self, total_timeout: Duration) -> Self {
-        self.execution_overrides.total_timeout = Some(total_timeout.max(Duration::from_millis(1)));
+        self.execution_overrides.total_timeout = Some(total_timeout);
         self
     }
 
     /// Overrides the buffered response body size limit for this request.
     pub fn max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
-        self.execution_overrides.max_response_body_bytes = Some(max_response_body_bytes.max(1));
+        self.execution_overrides.max_response_body_bytes = Some(max_response_body_bytes);
         self
     }
 

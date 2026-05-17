@@ -5,8 +5,8 @@ use std::time::Duration;
 use http::{HeaderMap, Method, StatusCode};
 
 use crate::IDEMPOTENCY_KEY_HEADER;
-use crate::error::{TimeoutPhase, TransportErrorKind};
-use crate::util::{clamp_f64_or_fallback, exponential_backoff_with_jitter};
+use crate::error::{Error, TimeoutPhase, TransportErrorKind};
+use crate::util::exponential_backoff_with_jitter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Reason a retry was considered.
@@ -245,28 +245,25 @@ impl RetryPolicy {
 
     /// Sets the maximum number of attempts, including the first try.
     pub fn max_attempts(mut self, max_attempts: usize) -> Self {
-        self.max_attempts = max_attempts.max(1);
+        self.max_attempts = max_attempts;
         self
     }
 
     /// Sets the base exponential backoff delay.
     pub fn base_backoff(mut self, base_backoff: Duration) -> Self {
-        self.base_backoff = base_backoff.max(Duration::from_millis(1));
-        if self.max_backoff < self.base_backoff {
-            self.max_backoff = self.base_backoff;
-        }
+        self.base_backoff = base_backoff;
         self
     }
 
     /// Sets the maximum backoff delay.
     pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
-        self.max_backoff = max_backoff.max(self.base_backoff);
+        self.max_backoff = max_backoff;
         self
     }
 
     /// Sets the random jitter ratio applied to computed backoffs.
     pub fn jitter_ratio(mut self, jitter_ratio: f64) -> Self {
-        self.jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
+        self.jitter_ratio = jitter_ratio;
         self
     }
 
@@ -302,28 +299,25 @@ impl RetryPolicy {
 
     /// Sets a per-status retry window measured in maximum attempts.
     pub fn status_retry_window(mut self, status: u16, max_attempts: usize) -> Self {
-        self.status_retry_windows
-            .insert(status, max_attempts.max(1));
+        self.status_retry_windows.insert(status, max_attempts);
         self
     }
 
     /// Sets a per-transport-kind retry window measured in maximum attempts.
     pub fn transport_retry_window(mut self, kind: TransportErrorKind, max_attempts: usize) -> Self {
-        self.transport_retry_windows
-            .insert(kind, max_attempts.max(1));
+        self.transport_retry_windows.insert(kind, max_attempts);
         self
     }
 
     /// Sets a per-timeout-phase retry window measured in maximum attempts.
     pub fn timeout_retry_window(mut self, phase: TimeoutPhase, max_attempts: usize) -> Self {
-        self.timeout_retry_windows
-            .insert(phase, max_attempts.max(1));
+        self.timeout_retry_windows.insert(phase, max_attempts);
         self
     }
 
     /// Sets the retry window for response body read failures.
     pub fn response_body_read_retry_window(mut self, max_attempts: usize) -> Self {
-        self.response_body_read_retry_window = Some(max_attempts.max(1));
+        self.response_body_read_retry_window = Some(max_attempts);
         self
     }
 
@@ -341,6 +335,55 @@ impl RetryPolicy {
         self.max_backoff
     }
 
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        if self.max_attempts == 0 {
+            return Err(self.invalid_policy("max_attempts must be greater than zero"));
+        }
+        if self.base_backoff.is_zero() {
+            return Err(self.invalid_policy("base_backoff must be greater than zero"));
+        }
+        if self.max_backoff.is_zero() {
+            return Err(self.invalid_policy("max_backoff must be greater than zero"));
+        }
+        if self.max_backoff < self.base_backoff {
+            return Err(
+                self.invalid_policy("max_backoff must be greater than or equal to base_backoff")
+            );
+        }
+        if !self.jitter_ratio.is_finite() || !(0.0..=1.0).contains(&self.jitter_ratio) {
+            return Err(self.invalid_policy("jitter_ratio must be finite and between 0.0 and 1.0"));
+        }
+        if self.status_retry_windows.values().any(|limit| *limit == 0) {
+            return Err(self.invalid_policy("status retry windows must be greater than zero"));
+        }
+        if self
+            .transport_retry_windows
+            .values()
+            .any(|limit| *limit == 0)
+        {
+            return Err(self.invalid_policy("transport retry windows must be greater than zero"));
+        }
+        if self.timeout_retry_windows.values().any(|limit| *limit == 0) {
+            return Err(self.invalid_policy("timeout retry windows must be greater than zero"));
+        }
+        if self.response_body_read_retry_window == Some(0) {
+            return Err(
+                self.invalid_policy("response body read retry window must be greater than zero")
+            );
+        }
+        Ok(())
+    }
+
+    fn invalid_policy(&self, message: &'static str) -> Error {
+        Error::InvalidRetryPolicy {
+            max_attempts: self.max_attempts,
+            base_backoff_ms: self.base_backoff.as_millis(),
+            max_backoff_ms: self.max_backoff.as_millis(),
+            jitter_ratio: self.jitter_ratio,
+            message,
+        }
+    }
+
     fn should_retry_status(&self, status: StatusCode) -> bool {
         self.retryable_status_codes.contains(&status.as_u16())
     }
@@ -351,7 +394,7 @@ impl RetryPolicy {
 
     fn is_within_retry_window(limit: Option<usize>, attempt: usize) -> bool {
         match limit {
-            Some(limit) => attempt < limit.max(1),
+            Some(limit) => attempt < limit,
             None => true,
         }
     }
@@ -452,15 +495,45 @@ mod tests {
     }
 
     #[test]
-    fn nan_jitter_ratio_is_normalized_to_zero() {
+    fn validate_rejects_nan_jitter_ratio() {
         let policy = RetryPolicy::standard()
             .base_backoff(std::time::Duration::from_millis(100))
             .max_backoff(std::time::Duration::from_millis(500))
             .jitter_ratio(f64::NAN);
 
-        assert_eq!(
-            policy.backoff_for_retry(1),
-            std::time::Duration::from_millis(100)
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_attempts_and_backoff() {
+        assert!(RetryPolicy::standard().max_attempts(0).validate().is_err());
+        assert!(
+            RetryPolicy::standard()
+                .base_backoff(std::time::Duration::ZERO)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            RetryPolicy::standard()
+                .max_backoff(std::time::Duration::ZERO)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_retry_windows() {
+        assert!(
+            RetryPolicy::standard()
+                .status_retry_window(503, 0)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            RetryPolicy::standard()
+                .response_body_read_retry_window(0)
+                .validate()
+                .is_err()
         );
     }
 

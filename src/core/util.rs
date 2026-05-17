@@ -171,7 +171,7 @@ fn redact_userinfo_in_authority(uri_text: &str) -> String {
         let at_index = authority.rfind('@')?;
         let host_port = &authority[at_index + 1..];
         if host_port.is_empty() {
-            return None;
+            return Some(format!("{prefix}<redacted>@{suffix}"));
         }
         Some(format!("{prefix}{host_port}{suffix}"))
     }

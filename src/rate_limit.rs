@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::error::Error;
 use crate::extensions::Clock;
 use crate::util::{duration_from_secs_f64_saturating, lock_unpoisoned, normalize_host_key};
 
@@ -161,13 +162,15 @@ impl RateLimitPolicy {
 
     /// Sets the sustained request rate.
     ///
-    /// Non-finite and non-positive values are clamped to `1.0`.
+    /// Non-finite and non-positive values are rejected when the client is built.
     pub fn requests_per_second(mut self, requests_per_second: f64) -> Self {
-        self.requests_per_second = normalize_requests_per_second(requests_per_second);
+        self.requests_per_second = requests_per_second;
         self
     }
 
     /// Sets the token bucket burst capacity.
+    ///
+    /// `0` is rejected when the client is built.
     pub const fn burst(mut self, burst: usize) -> Self {
         self.burst = burst;
         self
@@ -185,6 +188,24 @@ impl RateLimitPolicy {
             burst: self.burst.max(1),
             max_throttle_delay: self.max_throttle_delay,
         }
+    }
+
+    pub(crate) fn validate(self) -> crate::Result<()> {
+        if !self.requests_per_second.is_finite() || self.requests_per_second <= 0.0 {
+            return Err(Error::InvalidRateLimitPolicy {
+                requests_per_second: self.requests_per_second,
+                burst: self.burst,
+                message: "requests_per_second must be finite and > 0",
+            });
+        }
+        if self.burst == 0 {
+            return Err(Error::InvalidRateLimitPolicy {
+                requests_per_second: self.requests_per_second,
+                burst: self.burst,
+                message: "burst must be >= 1",
+            });
+        }
+        Ok(())
     }
 
     fn configured_requests_per_second(self) -> f64 {
@@ -878,13 +899,27 @@ mod tests {
         let now = Instant::now();
 
         for invalid_rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let bucket = TokenBucket::new(
-                RateLimitPolicy::standard().requests_per_second(invalid_rate),
-                now,
-            );
+            let policy = RateLimitPolicy::standard().requests_per_second(invalid_rate);
+            let bucket = TokenBucket::new(policy, now);
 
             assert_eq!(bucket.policy.configured_requests_per_second(), 1.0);
         }
+    }
+
+    #[test]
+    fn rate_limit_policy_validate_rejects_invalid_request_rate() {
+        for invalid_rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let policy = RateLimitPolicy::standard().requests_per_second(invalid_rate);
+
+            assert!(policy.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn rate_limit_policy_validate_rejects_zero_burst() {
+        let policy = RateLimitPolicy::standard().burst(0);
+
+        assert!(policy.validate().is_err());
     }
 
     #[test]
