@@ -111,7 +111,7 @@ impl NoProxyRule {
                 return None;
             }
             candidate = host.to_owned();
-            port = url.port();
+            port = url.port_or_known_default();
         } else if looks_like_url_rule(&candidate) {
             return None;
         }

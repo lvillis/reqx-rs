@@ -35,6 +35,7 @@ use crate::body::{
 };
 use crate::config::ClientProfile;
 use crate::content_encoding::should_decode_content_encoded_body;
+use crate::core::limiters::normalize_concurrency_limit;
 use crate::core::request_builder::RequestExecutionOptions;
 use crate::error::{Error, TransportErrorKind, transport_error};
 use crate::execution::{
@@ -500,7 +501,6 @@ struct StreamResponseInput {
     stream_total_timeout_ms: Option<u128>,
     stream_deadline_at: Option<Instant>,
     stream_deadline_slack: Duration,
-    clock: Arc<dyn Clock>,
     stream_lifecycle: Option<StreamLifecycle>,
     stream_global_permit: Option<GlobalRequestPermit>,
     host_permit: HostRequestPermit,
@@ -531,7 +531,6 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
         stream_total_timeout_ms,
         stream_deadline_at,
         stream_deadline_slack,
-        clock,
         stream_lifecycle,
         stream_global_permit,
         host_permit,
@@ -548,7 +547,6 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
             total_timeout_ms: stream_total_timeout_ms,
             deadline_at: stream_deadline_at,
             deadline_slack: stream_deadline_slack,
-            clock,
             lifecycle: stream_lifecycle,
             permits: StreamPermits::new(stream_global_permit, Some(host_permit)),
         },
@@ -866,6 +864,7 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy, clock: Arc<dyn Clock>) -> Self {
+        let policy = policy.normalize_for_runtime();
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState::new(policy)),
@@ -876,9 +875,12 @@ impl AdaptiveConcurrencyController {
 
     async fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
         loop {
-            // Register interest before checking capacity to avoid missed wakeups
-            // between `try_acquire` and awaiting the notifier.
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not store a permit for futures that have not
+            // been registered yet. Enable before checking capacity so a release
+            // racing with this check cannot be lost.
+            notified.as_mut().enable();
             {
                 let mut state = lock_unpoisoned(&self.state);
                 if state.try_acquire() {
@@ -1543,13 +1545,13 @@ impl ClientBuilder {
 
     /// Caps the total number of in-flight requests.
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = Some(max_in_flight.max(1));
+        self.max_in_flight = Some(normalize_concurrency_limit(max_in_flight));
         self
     }
 
     /// Caps the number of in-flight requests per host.
     pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
-        self.max_in_flight_per_host = Some(max_in_flight_per_host.max(1));
+        self.max_in_flight_per_host = Some(normalize_concurrency_limit(max_in_flight_per_host));
         self
     }
 
@@ -1920,7 +1922,6 @@ impl Client {
             stream_total_timeout_ms,
             stream_deadline_at,
             stream_deadline_slack: self.stream_deadline_slack,
-            clock: Arc::clone(&self.clock),
             stream_lifecycle,
             stream_global_permit: stream_global_permit.take(),
             host_permit,
@@ -2210,6 +2211,11 @@ impl Client {
     ) -> Result<BodyReadOutcome, Error> {
         let max_response_body_bytes = read_context.max_response_body_bytes();
         let context = read_context.context();
+        let deadline = read_context.deadline();
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         let response_body = match self
             .read_response_body_with_retry(body, read_context)
             .await?
@@ -2217,6 +2223,10 @@ impl Client {
             BodyReadOutcome::Body(body) => body,
             BodyReadOutcome::Retry(delay) => return Ok(BodyReadOutcome::Retry(delay)),
         };
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         let should_decode_response_body =
             should_decode_content_encoded_body(context.method(), status, response_body.len());
         let response_body = self.decode_response_body_limited(
@@ -2226,6 +2236,10 @@ impl Client {
             status,
             context,
         )?;
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         if should_decode_response_body && response_headers.contains_key(CONTENT_ENCODING) {
             remove_content_encoding_headers(response_headers);
         }
@@ -2606,11 +2620,6 @@ impl Client {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
-            let Some(transport_timeout) = execution.phase_timeout() else {
-                let error = execution.deadline_error();
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            };
             let host_permit = match self
                 .acquire_host_request_permit(
                     rate_limit_host.as_deref(),
@@ -2664,6 +2673,12 @@ impl Client {
             // Never forward hop-by-hop proxy credentials to origin servers.
             attempt_headers.remove(PROXY_AUTHORIZATION);
             self.apply_http_proxy_auth_header(execution.current_uri(), &mut attempt_headers);
+            let Some(transport_timeout) = execution.phase_timeout() else {
+                let error = execution.deadline_error();
+                attempts.cancel();
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
+            };
             let request_body = if let Some(body) = &buffered_body {
                 buffered_req_body(body.clone())
             } else {

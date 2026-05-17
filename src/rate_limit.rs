@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::extensions::Clock;
-use crate::util::{lock_unpoisoned, normalize_host_key};
+use crate::util::{duration_from_secs_f64_saturating, lock_unpoisoned, normalize_host_key};
 
 const PER_HOST_RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(300);
 const PER_HOST_RATE_LIMIT_MAX_ENTRIES: usize = 1024;
@@ -32,21 +32,57 @@ pub(crate) fn resolve_server_throttle_scope(
     has_per_host_rate_limit: bool,
 ) -> ServerThrottleScope {
     match configured_scope {
-        ServerThrottleScope::Auto => match header_scope_hint {
-            Some(ServerThrottleScope::Host) => ServerThrottleScope::Host,
-            Some(ServerThrottleScope::Global) => ServerThrottleScope::Global,
-            Some(ServerThrottleScope::Both) => ServerThrottleScope::Both,
-            _ => {
-                if has_host && has_per_host_rate_limit {
-                    ServerThrottleScope::Host
-                } else if has_global_rate_limit {
-                    ServerThrottleScope::Global
-                } else {
-                    ServerThrottleScope::Host
-                }
-            }
-        },
+        ServerThrottleScope::Auto => resolve_auto_server_throttle_scope(
+            header_scope_hint,
+            has_host,
+            has_global_rate_limit,
+            has_per_host_rate_limit,
+        ),
         other => other,
+    }
+}
+
+fn resolve_auto_server_throttle_scope(
+    header_scope_hint: Option<ServerThrottleScope>,
+    has_host: bool,
+    has_global_rate_limit: bool,
+    has_per_host_rate_limit: bool,
+) -> ServerThrottleScope {
+    let host_available = has_host && has_per_host_rate_limit;
+    match header_scope_hint {
+        Some(ServerThrottleScope::Both) => match (has_global_rate_limit, host_available) {
+            (true, true) => ServerThrottleScope::Both,
+            (true, false) => ServerThrottleScope::Global,
+            (false, true) => ServerThrottleScope::Host,
+            (false, false) => ServerThrottleScope::Both,
+        },
+        Some(ServerThrottleScope::Global) => {
+            if has_global_rate_limit {
+                ServerThrottleScope::Global
+            } else if host_available {
+                ServerThrottleScope::Host
+            } else {
+                ServerThrottleScope::Global
+            }
+        }
+        Some(ServerThrottleScope::Host) => {
+            if host_available {
+                ServerThrottleScope::Host
+            } else if has_global_rate_limit {
+                ServerThrottleScope::Global
+            } else {
+                ServerThrottleScope::Host
+            }
+        }
+        _ => {
+            if host_available {
+                ServerThrottleScope::Host
+            } else if has_global_rate_limit {
+                ServerThrottleScope::Global
+            } else {
+                ServerThrottleScope::Host
+            }
+        }
     }
 }
 
@@ -57,31 +93,52 @@ pub(crate) fn server_throttle_scope_from_headers(
         ["x-ratelimit-scope", "ratelimit-scope", "x-rate-limit-scope"];
 
     for header_name in RATE_LIMIT_SCOPE_HEADERS {
-        let Some(value) = headers.get(header_name).and_then(|raw| raw.to_str().ok()) else {
-            continue;
-        };
-
-        let normalized = value.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            continue;
-        }
-        if normalized.contains("both") || normalized.contains("all") {
-            return Some(ServerThrottleScope::Both);
-        }
-        if normalized.contains("global") || normalized.contains("shared") {
-            return Some(ServerThrottleScope::Global);
-        }
-        if normalized.contains("host")
-            || normalized.contains("resource")
-            || normalized.contains("bucket")
-            || normalized.contains("user")
-            || normalized.contains("local")
-        {
-            return Some(ServerThrottleScope::Host);
+        for value in headers.get_all(header_name) {
+            let Some(scope) = value
+                .to_str()
+                .ok()
+                .and_then(server_throttle_scope_from_header_value)
+            else {
+                continue;
+            };
+            return Some(scope);
         }
     }
 
     None
+}
+
+fn server_throttle_scope_from_header_value(value: &str) -> Option<ServerThrottleScope> {
+    const BOTH_SCOPE_TOKENS: &[&str] = &["both", "all"];
+    const GLOBAL_SCOPE_TOKENS: &[&str] = &["global", "shared"];
+    const HOST_SCOPE_TOKENS: &[&str] = &["host", "resource", "bucket", "user", "local"];
+
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let has_both_scope = contains_scope_token(&normalized, BOTH_SCOPE_TOKENS);
+    let has_global_scope = contains_scope_token(&normalized, GLOBAL_SCOPE_TOKENS);
+    let has_host_scope = contains_scope_token(&normalized, HOST_SCOPE_TOKENS);
+
+    if has_both_scope || (has_global_scope && has_host_scope) {
+        return Some(ServerThrottleScope::Both);
+    }
+    if has_global_scope {
+        return Some(ServerThrottleScope::Global);
+    }
+    if has_host_scope {
+        return Some(ServerThrottleScope::Host);
+    }
+
+    None
+}
+
+fn contains_scope_token(value: &str, tokens: &[&str]) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| tokens.contains(&token))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,11 +163,7 @@ impl RateLimitPolicy {
     ///
     /// Non-finite and non-positive values are clamped to `1.0`.
     pub fn requests_per_second(mut self, requests_per_second: f64) -> Self {
-        self.requests_per_second = if requests_per_second.is_finite() && requests_per_second > 0.0 {
-            requests_per_second
-        } else {
-            1.0
-        };
+        self.requests_per_second = normalize_requests_per_second(requests_per_second);
         self
     }
 
@@ -128,13 +181,7 @@ impl RateLimitPolicy {
 
     fn normalize(self) -> Self {
         Self {
-            requests_per_second: if self.requests_per_second.is_finite()
-                && self.requests_per_second > 0.0
-            {
-                self.requests_per_second
-            } else {
-                1.0
-            },
+            requests_per_second: normalize_requests_per_second(self.requests_per_second),
             burst: self.burst.max(1),
             max_throttle_delay: self.max_throttle_delay,
         }
@@ -150,6 +197,14 @@ impl RateLimitPolicy {
 
     fn configured_max_throttle_delay(self) -> Duration {
         self.max_throttle_delay
+    }
+}
+
+fn normalize_requests_per_second(requests_per_second: f64) -> f64 {
+    if requests_per_second.is_finite() && requests_per_second > 0.0 {
+        requests_per_second
+    } else {
+        1.0
     }
 }
 
@@ -205,15 +260,12 @@ impl TokenBucket {
         }
 
         let rate = self.policy.configured_requests_per_second();
-        if rate <= f64::EPSILON {
-            return Duration::from_secs(60);
-        }
         let needed_tokens = (1.0 - self.tokens).max(0.0);
         let delay_secs = needed_tokens / rate;
         if delay_secs <= f64::EPSILON {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(delay_secs)
+            duration_from_secs_f64_saturating(delay_secs)
         }
     }
 
@@ -371,18 +423,15 @@ impl RateLimiter {
 
         let now = self.clock.now_monotonic();
 
-        let mut applied = false;
-
         if resolved_scope.apply_global()
             && let Some(global) = &self.global
         {
             let mut bucket = lock_unpoisoned(global);
             bucket.apply_throttle(now, delay);
-            applied = true;
         }
 
         if resolved_scope.apply_host()
-            && let (Some(policy), Some(host)) = (self.per_host_policy, host_key.clone())
+            && let (Some(policy), Some(host)) = (self.per_host_policy, host_key)
         {
             let mut per_host = lock_unpoisoned(&self.per_host);
             self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
@@ -394,25 +443,6 @@ impl RateLimiter {
                 });
             entry.last_used_at = now;
             entry.bucket.apply_throttle(now, delay);
-            applied = true;
-        }
-
-        if !applied && matches!(configured_scope, ServerThrottleScope::Auto) {
-            if let (Some(policy), Some(host)) = (self.per_host_policy, host_key) {
-                let mut per_host = lock_unpoisoned(&self.per_host);
-                self.maybe_cleanup_stale_per_host_rate_limits(&mut per_host, now);
-                let entry = per_host
-                    .entry(host)
-                    .or_insert_with(|| PerHostRateLimitEntry {
-                        bucket: TokenBucket::new(policy, now),
-                        last_used_at: now,
-                    });
-                entry.last_used_at = now;
-                entry.bucket.apply_throttle(now, delay);
-            } else if let Some(global) = &self.global {
-                let mut bucket = lock_unpoisoned(global);
-                bucket.apply_throttle(now, delay);
-            }
         }
 
         resolved_scope
@@ -495,7 +525,8 @@ fn cleanup_stale_per_host_rate_limits(
 mod tests {
     use super::{
         PerHostRateLimitEntry, RateLimitPolicy, RateLimiter, ServerThrottleScope, TokenBucket,
-        cleanup_stale_per_host_rate_limits, server_throttle_scope_from_headers,
+        cleanup_stale_per_host_rate_limits, resolve_server_throttle_scope,
+        server_throttle_scope_from_headers,
     };
     use crate::extensions::Clock;
     use std::collections::BTreeMap;
@@ -716,6 +747,74 @@ mod tests {
     }
 
     #[test]
+    fn auto_server_throttle_scope_reports_available_fallback_scope() {
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
+        let host_only = RateLimiter::new(
+            None,
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+            Arc::clone(&clock),
+        )
+        .expect("host limiter should be built");
+
+        let host_scope = host_only.observe_server_throttle(
+            Some("api.example.com"),
+            Duration::from_millis(120),
+            ServerThrottleScope::Auto,
+            Some(ServerThrottleScope::Global),
+        );
+        assert_eq!(host_scope, ServerThrottleScope::Host);
+        assert!(host_only.acquire_delay(Some("api.example.com")) >= Duration::from_millis(110));
+
+        let global_only = RateLimiter::new(
+            Some(
+                RateLimitPolicy::standard()
+                    .requests_per_second(500.0)
+                    .burst(100),
+            ),
+            None,
+            clock,
+        )
+        .expect("global limiter should be built");
+
+        let global_scope = global_only.observe_server_throttle(
+            Some("api.example.com"),
+            Duration::from_millis(120),
+            ServerThrottleScope::Auto,
+            Some(ServerThrottleScope::Host),
+        );
+        assert_eq!(global_scope, ServerThrottleScope::Global);
+        assert!(global_only.acquire_delay(Some("other.example.com")) >= Duration::from_millis(110));
+    }
+
+    #[test]
+    fn auto_server_throttle_scope_preserves_header_hint_without_limiters() {
+        assert_eq!(
+            resolve_server_throttle_scope(
+                ServerThrottleScope::Auto,
+                Some(ServerThrottleScope::Global),
+                true,
+                false,
+                false,
+            ),
+            ServerThrottleScope::Global
+        );
+        assert_eq!(
+            resolve_server_throttle_scope(
+                ServerThrottleScope::Auto,
+                Some(ServerThrottleScope::Both),
+                true,
+                false,
+                false,
+            ),
+            ServerThrottleScope::Both
+        );
+    }
+
+    #[test]
     fn scope_header_is_parsed() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -726,6 +825,82 @@ mod tests {
             server_throttle_scope_from_headers(&headers),
             Some(ServerThrottleScope::Global)
         );
+    }
+
+    #[test]
+    fn scope_header_uses_tokens_instead_of_substrings() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("ghost overall"),
+        );
+        assert_eq!(server_throttle_scope_from_headers(&headers), None);
+
+        headers.insert(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("per-host bucket"),
+        );
+        assert_eq!(
+            server_throttle_scope_from_headers(&headers),
+            Some(ServerThrottleScope::Host)
+        );
+
+        headers.insert(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("global, host"),
+        );
+        assert_eq!(
+            server_throttle_scope_from_headers(&headers),
+            Some(ServerThrottleScope::Both)
+        );
+    }
+
+    #[test]
+    fn scope_header_checks_all_repeated_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("ghost overall"),
+        );
+        headers.append(
+            "x-ratelimit-scope",
+            http::HeaderValue::from_static("global"),
+        );
+
+        assert_eq!(
+            server_throttle_scope_from_headers(&headers),
+            Some(ServerThrottleScope::Global)
+        );
+    }
+
+    #[test]
+    fn rate_limit_policy_normalizes_invalid_request_rate() {
+        let now = Instant::now();
+
+        for invalid_rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let bucket = TokenBucket::new(
+                RateLimitPolicy::standard().requests_per_second(invalid_rate),
+                now,
+            );
+
+            assert_eq!(bucket.policy.configured_requests_per_second(), 1.0);
+        }
+    }
+
+    #[test]
+    fn tiny_positive_request_rate_saturates_wait_without_panicking() {
+        let now = Instant::now();
+        let mut bucket = TokenBucket::new(
+            RateLimitPolicy::standard()
+                .requests_per_second(f64::MIN_POSITIVE)
+                .burst(1),
+            now,
+        );
+
+        assert!(bucket.can_consume_now(now));
+        bucket.consume_ready_token();
+
+        assert_eq!(bucket.wait_duration(now), Duration::MAX);
     }
 
     #[test]

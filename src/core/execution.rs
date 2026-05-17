@@ -18,7 +18,8 @@ use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after,
     parse_retry_after_capped, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
     redirect_location, redirect_method, resolve_redirect_uri, same_origin,
-    sanitize_headers_for_redirect, total_timeout_expired, truncate_body, validate_base_url,
+    sanitize_headers_for_redirect, total_timeout_deadline, total_timeout_expired, truncate_body,
+    validate_base_url,
 };
 
 pub(crate) struct RetryRequestInput<Body> {
@@ -909,6 +910,27 @@ pub(crate) struct BodyReadRetryContext<'a> {
     attempt: &'a mut usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BodyReadDeadline<'a> {
+    total_timeout: Option<Duration>,
+    request_started_at: Instant,
+    method: &'a Method,
+    redacted_uri: &'a str,
+}
+
+impl BodyReadDeadline<'_> {
+    pub(crate) fn error_if_elapsed(self) -> Option<Error> {
+        if total_timeout_expired(self.total_timeout, self.request_started_at) {
+            return Some(deadline_exceeded_error(
+                self.total_timeout,
+                self.method,
+                self.redacted_uri,
+            ));
+        }
+        None
+    }
+}
+
 impl<'a> BodyReadRetryContext<'a> {
     pub(crate) fn context(&self) -> &'a RequestContext {
         self.context
@@ -921,6 +943,15 @@ impl<'a> BodyReadRetryContext<'a> {
     #[cfg(feature = "_async")]
     pub(crate) const fn read_timeout(&self) -> Duration {
         self.read_timeout
+    }
+
+    pub(crate) const fn deadline(&self) -> BodyReadDeadline<'a> {
+        BodyReadDeadline {
+            total_timeout: self.total_timeout,
+            request_started_at: self.request_started_at,
+            method: self.method,
+            redacted_uri: self.redacted_uri,
+        }
     }
 
     pub(crate) fn response_body_too_large_error(&self, actual_bytes: usize) -> Error {
@@ -1198,7 +1229,7 @@ pub(crate) fn stream_timing(
 ) -> StreamTiming {
     StreamTiming {
         total_timeout_ms: total_timeout.map(|timeout| timeout.as_millis()),
-        deadline_at: total_timeout.and_then(|timeout| request_started_at.checked_add(timeout)),
+        deadline_at: total_timeout_deadline(total_timeout, request_started_at),
     }
 }
 

@@ -5,6 +5,7 @@ use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
 use crate::config::ClientProfile;
+use crate::core::limiters::normalize_concurrency_limit;
 use crate::error::Error;
 use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
@@ -470,13 +471,13 @@ impl ClientBuilder {
 
     /// Caps the total number of in-flight requests.
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = Some(max_in_flight.max(1));
+        self.max_in_flight = Some(normalize_concurrency_limit(max_in_flight));
         self
     }
 
     /// Caps the number of in-flight requests per host.
     pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
-        self.max_in_flight_per_host = Some(max_in_flight_per_host.max(1));
+        self.max_in_flight_per_host = Some(normalize_concurrency_limit(max_in_flight_per_host));
         self
     }
 

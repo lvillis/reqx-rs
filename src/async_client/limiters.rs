@@ -9,6 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::core::limiters::{
     PER_HOST_LIMITER_ENTRY_TTL, PER_HOST_LIMITER_MAX_ENTRIES,
     PerHostLimiterEntry as PerHostLimiterEntryState, cleanup_stale_per_host_limiters,
+    normalize_optional_concurrency_limit,
 };
 use crate::error::Error;
 use crate::extensions::Clock;
@@ -55,6 +56,8 @@ impl RequestLimiters {
         per_host_limit: Option<usize>,
         clock: Arc<dyn Clock>,
     ) -> Option<Self> {
+        let max_in_flight = normalize_optional_concurrency_limit(max_in_flight);
+        let per_host_limit = normalize_optional_concurrency_limit(per_host_limit);
         if max_in_flight.is_none() && per_host_limit.is_none() {
             return None;
         }
@@ -148,6 +151,25 @@ mod tests {
         let entries = lock_unpoisoned(&limiters.per_host);
         assert!(entries.contains_key("api.example.com"));
         assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_normalized_to_one_permit() {
+        let limiters =
+            RequestLimiters::new(Some(0), Some(0), Arc::new(crate::extensions::SystemClock))
+                .expect("limiters should be built");
+
+        let _global = tokio::time::timeout(Duration::from_millis(50), limiters.acquire_global())
+            .await
+            .expect("zero global limit should be normalized")
+            .expect("global permit should be acquired");
+        let _host = tokio::time::timeout(
+            Duration::from_millis(50),
+            limiters.acquire_host(Some("api")),
+        )
+        .await
+        .expect("zero host limit should be normalized")
+        .expect("host permit should be acquired");
     }
 
     #[test]

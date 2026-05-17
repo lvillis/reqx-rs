@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,6 @@ use crate::execution::{
     RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan, select_base_url,
     server_throttle_delay,
 };
-use crate::extensions::Clock;
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
 use crate::rate_limit::{resolve_server_throttle_scope, server_throttle_scope_from_headers};
@@ -78,7 +76,6 @@ struct StreamResponseInput {
     stream_total_timeout_ms: Option<u128>,
     stream_deadline_at: Option<Instant>,
     stream_deadline_slack: Duration,
-    clock: Arc<dyn Clock>,
     stream_lifecycle: Option<StreamLifecycle>,
     stream_global_permit: Option<GlobalRequestPermit>,
     host_permit: HostRequestPermit,
@@ -109,7 +106,6 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
         stream_total_timeout_ms,
         stream_deadline_at,
         stream_deadline_slack,
-        clock,
         stream_lifecycle,
         stream_global_permit,
         host_permit,
@@ -126,7 +122,6 @@ fn stream_retry_response(input: StreamResponseInput) -> RetryResponse {
             total_timeout_ms: stream_total_timeout_ms,
             deadline_at: stream_deadline_at,
             deadline_slack: stream_deadline_slack,
-            clock,
             lifecycle: stream_lifecycle,
             global_permit: stream_global_permit,
             host_permit: Some(host_permit),
@@ -260,7 +255,6 @@ impl Client {
             stream_total_timeout_ms,
             stream_deadline_at,
             stream_deadline_slack: self.stream_deadline_slack,
-            clock: Arc::clone(&self.clock),
             stream_lifecycle,
             stream_global_permit: stream_global_permit.take(),
             host_permit,
@@ -543,10 +537,19 @@ impl Client {
     ) -> Result<BodyReadOutcome, Error> {
         let max_response_body_bytes = retry_context.max_response_body_bytes();
         let context = retry_context.context();
+        let deadline = retry_context.deadline();
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         let response_body = match self.read_response_body_with_retry(response, retry_context)? {
             BodyReadOutcome::Body(body) => body,
             BodyReadOutcome::Retry(delay) => return Ok(BodyReadOutcome::Retry(delay)),
         };
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         let should_decode_response_body =
             should_decode_content_encoded_body(context.method(), status, response_body.len());
         let response_body = self.decode_response_body_limited(
@@ -556,6 +559,10 @@ impl Client {
             status,
             context,
         )?;
+        if let Some(error) = deadline.error_if_elapsed() {
+            self.run_error_interceptors(context, &error);
+            return Err(error);
+        }
         if should_decode_response_body
             && response_headers.contains_key(http::header::CONTENT_ENCODING)
         {
@@ -957,11 +964,6 @@ impl Client {
                 self.run_error_interceptors(&context, &error);
                 return Err(error);
             }
-            let Some(transport_timeout) = execution.phase_timeout() else {
-                let error = execution.deadline_error();
-                self.run_error_interceptors(&context, &error);
-                return Err(error);
-            };
             let host_permit = match self.acquire_host_request_permit(
                 rate_limit_host.as_deref(),
                 execution.total_timeout(),
@@ -1003,6 +1005,18 @@ impl Client {
             };
             attempts.set_adaptive(adaptive_attempt);
 
+            let mut attempt_headers = execution.current_headers().clone();
+            self.run_request_interceptors(&context, &mut attempt_headers);
+            // Never forward hop-by-hop proxy credentials to origin servers.
+            attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
+            let current_uri_text = execution.current_uri().to_string();
+            let Some(transport_timeout) = execution.phase_timeout() else {
+                let error = execution.deadline_error();
+                attempts.cancel();
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
+            };
+
             let request_body = if let Some(body) = &buffered_body {
                 RequestBody::Buffered(body.clone())
             } else {
@@ -1011,11 +1025,6 @@ impl Client {
                     None => RequestBody::Buffered(Bytes::new()),
                 }
             };
-            let mut attempt_headers = execution.current_headers().clone();
-            self.run_request_interceptors(&context, &mut attempt_headers);
-            // Never forward hop-by-hop proxy credentials to origin servers.
-            attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
-            let current_uri_text = execution.current_uri().to_string();
 
             let mut response = match self.run_once(
                 execution.current_method().clone(),
@@ -1173,12 +1182,19 @@ impl Client {
                 }
             }
 
+            let Some(read_timeout) = execution.phase_timeout() else {
+                let error = execution.deadline_error();
+                attempts.mark_failure();
+                self.run_error_interceptors(&context, &error);
+                return Err(error);
+            };
+
             let response_body = match attempts.record_failure_on_error(
                 self.read_decoded_response_body_with_retry(
                     &mut response,
                     &mut response_headers,
                     status,
-                    execution.body_read_retry_context(&context, transport_timeout),
+                    execution.body_read_retry_context(&context, read_timeout),
                 ),
             )? {
                 BodyReadOutcome::Body(body) => body,

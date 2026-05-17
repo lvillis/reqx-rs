@@ -47,6 +47,7 @@ struct AdaptiveConcurrencyController {
 
 impl AdaptiveConcurrencyController {
     fn new(policy: AdaptiveConcurrencyPolicy, clock: Arc<dyn Clock>) -> Self {
+        let policy = policy.normalize_for_runtime();
         Self {
             policy,
             state: Mutex::new(AdaptiveConcurrencyState::new(policy)),

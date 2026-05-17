@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::extensions::Clock;
-use crate::util::lock_unpoisoned;
+use crate::util::{clamp_f64_or_fallback, lock_unpoisoned, normalize_usize_at_least_one};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 /// Limits how many retries can be spent relative to recent successful traffic.
@@ -40,7 +40,7 @@ impl RetryBudgetPolicy {
 
     /// Sets the retry allowance as a fraction of recent successful requests.
     pub fn retry_ratio(mut self, retry_ratio: f64) -> Self {
-        self.retry_ratio = retry_ratio.clamp(0.0, 1.0);
+        self.retry_ratio = clamp_f64_or_fallback(retry_ratio, 0.0, 1.0, 0.0);
         self
     }
 
@@ -60,6 +60,14 @@ impl RetryBudgetPolicy {
 
     pub(crate) const fn configured_min_retries_per_window(self) -> usize {
         self.min_retries_per_window
+    }
+
+    fn normalize_for_runtime(self) -> Self {
+        Self {
+            window: self.window.max(Duration::from_millis(1)),
+            retry_ratio: clamp_f64_or_fallback(self.retry_ratio, 0.0, 1.0, 0.0),
+            min_retries_per_window: self.min_retries_per_window,
+        }
     }
 }
 
@@ -83,6 +91,7 @@ pub(crate) struct RetryBudget {
 
 impl RetryBudget {
     pub(crate) fn new(policy: RetryBudgetPolicy, clock: Arc<dyn Clock>) -> Self {
+        let policy = policy.normalize_for_runtime();
         let window_started_at = clock.now_monotonic();
         Self {
             policy,
@@ -182,6 +191,17 @@ impl CircuitBreakerPolicy {
         self.half_open_success_threshold = half_open_success_threshold;
         self
     }
+
+    fn normalize_for_runtime(self) -> Self {
+        Self {
+            failure_threshold: normalize_usize_at_least_one(self.failure_threshold),
+            open_timeout: self.open_timeout,
+            half_open_max_requests: normalize_usize_at_least_one(self.half_open_max_requests),
+            half_open_success_threshold: normalize_usize_at_least_one(
+                self.half_open_success_threshold,
+            ),
+        }
+    }
 }
 
 impl Default for CircuitBreakerPolicy {
@@ -217,6 +237,7 @@ pub(crate) struct CircuitBreaker {
 
 impl CircuitBreaker {
     pub(crate) fn new(policy: CircuitBreakerPolicy, clock: Arc<dyn Clock>) -> Self {
+        let policy = policy.normalize_for_runtime();
         Self {
             policy,
             clock,
@@ -251,9 +272,12 @@ impl CircuitBreaker {
                 Err(self.policy.open_timeout - elapsed)
             }
             CircuitState::HalfOpen {
-                active_requests, ..
+                active_requests,
+                successful_requests,
             } => {
-                if *active_requests >= self.policy.half_open_max_requests.max(1) {
+                if *active_requests >= self.policy.half_open_max_requests
+                    || *successful_requests >= self.policy.half_open_success_threshold
+                {
                     return Err(Duration::from_millis(0));
                 }
                 *active_requests = active_requests.saturating_add(1);
@@ -286,11 +310,7 @@ impl CircuitBreaker {
             ) => {
                 *active_requests = active_requests.saturating_sub(1);
                 *successful_requests = successful_requests.saturating_add(1);
-                if *successful_requests >= self.policy.half_open_success_threshold.max(1) {
-                    *state = CircuitState::Closed {
-                        consecutive_failures: 0,
-                    };
-                }
+                close_half_open_if_recovered(&mut state, self.policy.half_open_success_threshold);
             }
             _ => {}
         }
@@ -306,7 +326,7 @@ impl CircuitBreaker {
                 CircuitAttemptKind::Closed,
             ) => {
                 *consecutive_failures = consecutive_failures.saturating_add(1);
-                if *consecutive_failures >= self.policy.failure_threshold.max(1) {
+                if *consecutive_failures >= self.policy.failure_threshold {
                     *state = CircuitState::Open {
                         opened_at: self.clock.now_monotonic(),
                     };
@@ -337,7 +357,22 @@ impl CircuitBreaker {
         ) = (&mut *state, kind)
         {
             *active_requests = active_requests.saturating_sub(1);
+            close_half_open_if_recovered(&mut state, self.policy.half_open_success_threshold);
         }
+    }
+}
+
+fn close_half_open_if_recovered(state: &mut CircuitState, half_open_success_threshold: usize) {
+    if let CircuitState::HalfOpen {
+        active_requests,
+        successful_requests,
+    } = state
+        && *active_requests == 0
+        && *successful_requests >= half_open_success_threshold
+    {
+        *state = CircuitState::Closed {
+            consecutive_failures: 0,
+        };
     }
 }
 
@@ -459,7 +494,8 @@ impl AdaptiveConcurrencyPolicy {
 
     /// Sets the multiplicative backoff applied after high-latency samples.
     pub fn decrease_ratio(mut self, decrease_ratio: f64) -> Self {
-        self.decrease_ratio = decrease_ratio.clamp(0.1, 0.99);
+        self.decrease_ratio =
+            clamp_f64_or_fallback(decrease_ratio, 0.1, 0.99, Self::standard().decrease_ratio);
         self
     }
 
@@ -502,6 +538,22 @@ impl AdaptiveConcurrencyPolicy {
                 message: "min_limit must be <= max_limit",
             });
         }
+        if self.initial_limit < self.min_limit {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "initial_limit must be >= min_limit",
+            });
+        }
+        if self.initial_limit > self.max_limit {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "initial_limit must be <= max_limit",
+            });
+        }
         Ok(())
     }
 
@@ -528,6 +580,27 @@ impl AdaptiveConcurrencyPolicy {
     pub(crate) const fn configured_high_latency_threshold(self) -> Duration {
         self.high_latency_threshold
     }
+
+    pub(crate) fn normalize_for_runtime(self) -> Self {
+        let min_limit = normalize_usize_at_least_one(self.min_limit);
+        let max_limit = self.max_limit.max(min_limit);
+        let initial_limit =
+            normalize_usize_at_least_one(self.initial_limit).clamp(min_limit, max_limit);
+
+        Self {
+            min_limit,
+            initial_limit,
+            max_limit,
+            increase_step: self.increase_step,
+            decrease_ratio: clamp_f64_or_fallback(
+                self.decrease_ratio,
+                0.1,
+                0.99,
+                Self::standard().decrease_ratio,
+            ),
+            high_latency_threshold: self.high_latency_threshold,
+        }
+    }
 }
 
 impl Default for AdaptiveConcurrencyPolicy {
@@ -538,15 +611,10 @@ impl Default for AdaptiveConcurrencyPolicy {
 
 impl AdaptiveConcurrencyState {
     pub(crate) fn new(policy: AdaptiveConcurrencyPolicy) -> Self {
-        let min_limit = policy.configured_min_limit().max(1);
-        let max_limit = policy.configured_max_limit().max(min_limit);
-        let initial_limit = policy
-            .configured_initial_limit()
-            .max(1)
-            .clamp(min_limit, max_limit);
+        let policy = policy.normalize_for_runtime();
         Self {
             in_flight: 0,
-            current_limit: initial_limit,
+            current_limit: policy.configured_initial_limit(),
             ewma_latency_ms: 0.0,
         }
     }
@@ -565,6 +633,7 @@ impl AdaptiveConcurrencyState {
         outcome: AdaptiveConcurrencyOutcome,
         latency: Duration,
     ) {
+        let policy = policy.normalize_for_runtime();
         self.in_flight = self.in_flight.saturating_sub(1);
 
         let latency_ms = latency.as_secs_f64() * 1000.0;
@@ -600,7 +669,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant, SystemTime};
 
-    use super::{CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy};
+    use super::{
+        AdaptiveConcurrencyOutcome, AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState,
+        CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
+    };
     use crate::extensions::Clock;
 
     #[derive(Debug)]
@@ -697,6 +769,13 @@ mod tests {
     }
 
     #[test]
+    fn retry_budget_nan_retry_ratio_is_normalized_to_zero() {
+        let policy = RetryBudgetPolicy::standard().retry_ratio(f64::NAN);
+
+        assert_eq!(policy.configured_retry_ratio(), 0.0);
+    }
+
+    #[test]
     fn circuit_breaker_opens_then_recovers_after_half_open_success() {
         let clock = Arc::new(TestClock::default());
         let breaker = Arc::new(CircuitBreaker::new(
@@ -733,6 +812,41 @@ mod tests {
         assert!(
             breaker.begin().is_ok(),
             "breaker should close again after successful half-open request"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_zero_thresholds_are_normalized_at_runtime() {
+        let clock = Arc::new(TestClock::default());
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(0)
+                .open_timeout(Duration::from_millis(20))
+                .half_open_max_requests(0)
+                .half_open_success_threshold(0),
+            clock.clone(),
+        ));
+
+        breaker
+            .begin()
+            .expect("closed attempt should be allowed")
+            .mark_failure();
+        assert!(
+            breaker.begin().is_err(),
+            "zero failure threshold should be normalized to one"
+        );
+
+        clock.advance(Duration::from_millis(25));
+        let half_open_attempt = breaker.begin().expect("half-open probe should be allowed");
+        assert!(
+            breaker.begin().is_err(),
+            "zero half-open concurrency should be normalized to one"
+        );
+        half_open_attempt.mark_success();
+
+        assert!(
+            breaker.begin().is_ok(),
+            "zero half-open success threshold should be normalized to one"
         );
     }
 
@@ -801,6 +915,119 @@ mod tests {
         assert!(
             breaker.begin().is_ok(),
             "breaker should allow requests again after replacement probe succeeds"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_does_not_ignore_late_half_open_failure_after_success_threshold() {
+        let clock = Arc::new(TestClock::default());
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_millis(20))
+                .half_open_max_requests(2)
+                .half_open_success_threshold(1),
+            clock.clone(),
+        ));
+
+        breaker
+            .begin()
+            .expect("closed attempt should be allowed")
+            .mark_failure();
+        clock.advance(Duration::from_millis(25));
+
+        let first_probe = breaker.begin().expect("first half-open probe should start");
+        let second_probe = breaker
+            .begin()
+            .expect("second half-open probe should start");
+
+        first_probe.mark_success();
+        assert!(
+            breaker.begin().is_err(),
+            "breaker should wait for active half-open probes before closing"
+        );
+
+        second_probe.mark_failure();
+        assert!(
+            breaker.begin().is_err(),
+            "late half-open failure should reopen the circuit"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_closes_when_success_threshold_met_and_pending_probe_cancels() {
+        let clock = Arc::new(TestClock::default());
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_millis(20))
+                .half_open_max_requests(2)
+                .half_open_success_threshold(1),
+            clock.clone(),
+        ));
+
+        breaker
+            .begin()
+            .expect("closed attempt should be allowed")
+            .mark_failure();
+        clock.advance(Duration::from_millis(25));
+
+        let successful_probe = breaker.begin().expect("first half-open probe should start");
+        let cancelled_probe = breaker
+            .begin()
+            .expect("second half-open probe should start");
+
+        successful_probe.mark_success();
+        cancelled_probe.cancel();
+
+        assert!(
+            breaker.begin().is_ok(),
+            "breaker should close after successful probes complete and cancellations drain"
+        );
+    }
+
+    #[test]
+    fn adaptive_concurrency_nan_decrease_ratio_uses_standard_default() {
+        let policy = AdaptiveConcurrencyPolicy::standard().decrease_ratio(f64::NAN);
+
+        assert_eq!(
+            policy.configured_decrease_ratio(),
+            AdaptiveConcurrencyPolicy::standard().configured_decrease_ratio()
+        );
+    }
+
+    #[test]
+    fn adaptive_concurrency_validate_rejects_initial_limit_outside_bounds() {
+        let below_min = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(4)
+            .initial_limit(3)
+            .max_limit(8);
+        let above_max = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(2)
+            .initial_limit(9)
+            .max_limit(8);
+
+        assert!(below_min.validate().is_err());
+        assert!(above_max.validate().is_err());
+    }
+
+    #[test]
+    fn adaptive_concurrency_release_uses_normalized_policy() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(0)
+            .initial_limit(0)
+            .max_limit(0);
+        let mut state = AdaptiveConcurrencyState::new(policy);
+
+        assert!(
+            state.try_acquire(),
+            "runtime normalization should allow the first request"
+        );
+        state.release_and_record(policy, AdaptiveConcurrencyOutcome::Success, Duration::ZERO);
+
+        assert!(
+            state.try_acquire(),
+            "release path should not collapse the normalized limit back to zero"
         );
     }
 }

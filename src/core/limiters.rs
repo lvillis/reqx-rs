@@ -1,8 +1,18 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::util::normalize_usize_at_least_one;
+
 pub(crate) const PER_HOST_LIMITER_ENTRY_TTL: Duration = Duration::from_secs(300);
 pub(crate) const PER_HOST_LIMITER_MAX_ENTRIES: usize = 1024;
+
+pub(crate) const fn normalize_concurrency_limit(limit: usize) -> usize {
+    normalize_usize_at_least_one(limit)
+}
+
+pub(crate) fn normalize_optional_concurrency_limit(limit: Option<usize>) -> Option<usize> {
+    limit.map(normalize_concurrency_limit)
+}
 
 pub(crate) trait PerHostLimiterEntry: Sized {
     fn is_idle(&self) -> bool;

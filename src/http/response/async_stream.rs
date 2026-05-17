@@ -1,7 +1,6 @@
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -15,7 +14,6 @@ use tokio::time::Sleep;
 use crate::body::decode_content_encoded_body_limited;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
-use crate::extensions::Clock;
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
 use crate::util::duration_from_millis_saturating;
 
@@ -47,7 +45,6 @@ pub(crate) struct ResponseStreamContext {
     pub(crate) total_timeout_ms: Option<u128>,
     pub(crate) deadline_at: Option<Instant>,
     pub(crate) deadline_slack: Duration,
-    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) lifecycle: Option<StreamLifecycle>,
     pub(crate) permits: StreamPermits,
 }
@@ -60,7 +57,6 @@ struct StreamBody {
     total_timeout_ms: Option<u128>,
     deadline_at: Option<Instant>,
     deadline_slack: Duration,
-    clock: Arc<dyn Clock>,
     frame_timeout: Option<Pin<Box<Sleep>>>,
     frame_timeout_deadline_limited: bool,
     read_buffer: Bytes,
@@ -79,7 +75,6 @@ impl StreamBody {
             total_timeout_ms,
             deadline_at,
             deadline_slack,
-            clock,
             lifecycle,
             permits,
         } = context;
@@ -91,7 +86,6 @@ impl StreamBody {
             total_timeout_ms,
             deadline_at,
             deadline_slack,
-            clock,
             frame_timeout: None,
             frame_timeout_deadline_limited: false,
             read_buffer: Bytes::new(),
@@ -150,7 +144,7 @@ impl StreamBody {
         let Some(deadline_at) = self.deadline_at else {
             return Ok((phase_timeout, false));
         };
-        let now = self.clock.now_monotonic();
+        let now = Instant::now();
         if deadline_elapsed(deadline_at, now) {
             return Err(self.deadline_exceeded_error());
         }
@@ -170,11 +164,26 @@ impl StreamBody {
         Ok(())
     }
 
+    fn ensure_within_deadline(&self) -> crate::Result<()> {
+        if let Some(deadline_at) = self.deadline_at
+            && deadline_elapsed(deadline_at, Instant::now())
+        {
+            return Err(self.deadline_exceeded_error());
+        }
+        Ok(())
+    }
+
     fn poll_next_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, Error>>> {
         loop {
+            if let Err(error) = self.ensure_within_deadline() {
+                self.frame_timeout = None;
+                self.frame_timeout_deadline_limited = false;
+                return Poll::Ready(Some(Err(error)));
+            }
+
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     self.frame_timeout = None;
@@ -205,7 +214,7 @@ impl StreamBody {
                         && timer.as_mut().poll(cx).is_ready()
                     {
                         self.frame_timeout = None;
-                        let now = self.clock.now_monotonic();
+                        let now = Instant::now();
                         let error = if self.deadline_at.is_some_and(|deadline_at| {
                             deadline_elapsed(deadline_at, now)
                                 || (self.frame_timeout_deadline_limited
@@ -232,11 +241,21 @@ impl StreamBody {
         }
     }
 
-    fn take_pending_chunk(&mut self) -> Option<Bytes> {
+    fn take_pending_chunk(&mut self) -> crate::Result<Option<Bytes>> {
         if self.read_buffer.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.read_buffer))
+            return Ok(None);
+        }
+        self.ensure_within_deadline()?;
+        Ok(Some(std::mem::take(&mut self.read_buffer)))
+    }
+
+    fn take_pending_chunk_or_complete(&mut self) -> crate::Result<Option<Bytes>> {
+        match self.take_pending_chunk() {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => {
+                self.complete_error(&error);
+                Err(error)
+            }
         }
     }
 
@@ -245,7 +264,7 @@ impl StreamBody {
         let mut collected = Vec::new();
         let mut total_len = 0_usize;
 
-        if let Some(chunk) = self.take_pending_chunk() {
+        if let Some(chunk) = self.take_pending_chunk()? {
             total_len = total_len.saturating_add(chunk.len());
             if total_len > max_bytes {
                 return Err(self.response_body_too_large_error(max_bytes, total_len));
@@ -293,7 +312,8 @@ impl StreamBody {
     {
         let mut copied = 0_u64;
 
-        if let Some(chunk) = self.take_pending_chunk() {
+        let pending_chunk = self.take_pending_chunk_or_complete()?;
+        if let Some(chunk) = pending_chunk {
             self.write_chunk(writer, &chunk).await?;
             copied = copied.saturating_add(chunk.len() as u64);
         }
@@ -324,7 +344,8 @@ impl StreamBody {
         let max_bytes = max_bytes.max(1);
         let mut copied = 0_u64;
 
-        if let Some(chunk) = self.take_pending_chunk() {
+        let pending_chunk = self.take_pending_chunk_or_complete()?;
+        if let Some(chunk) = pending_chunk {
             copied = copied.saturating_add(chunk.len() as u64);
             if copied > max_bytes as u64 {
                 let error = self.response_body_too_large_error(max_bytes, copied as usize);
@@ -522,6 +543,10 @@ impl ResponseStream {
                 return Err(error);
             }
         };
+        if let Err(error) = self.body.ensure_within_deadline() {
+            self.body.complete_error(&error);
+            return Err(error);
+        }
         let should_decode = should_decode_content_encoded_body(&method, self.status, body.len());
         let body = if should_decode {
             match decode_content_encoded_body_limited(body, &self.headers, max_bytes) {
@@ -539,6 +564,10 @@ impl ResponseStream {
         if should_decode && self.headers.contains_key(super::CONTENT_ENCODING) {
             self.headers.remove(super::CONTENT_ENCODING);
             self.headers.remove(super::CONTENT_LENGTH);
+        }
+        if let Err(error) = self.body.ensure_within_deadline() {
+            self.body.complete_error(&error);
+            return Err(error);
         }
         self.body.complete_success();
         Ok(Response::new(self.status, self.headers, body))
@@ -578,6 +607,10 @@ impl AsyncRead for StreamBody {
 
         loop {
             if !self.read_buffer.is_empty() {
+                if let Err(error) = self.ensure_within_deadline() {
+                    self.complete_error(&error);
+                    return Poll::Ready(Err(super::into_stream_read_io_error(error)));
+                }
                 let to_copy = self.read_buffer.len().min(buffer.remaining());
                 let chunk = self.read_buffer.split_to(to_copy);
                 buffer.put_slice(&chunk);

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use flate2::Compression;
-use flate2::write::GzEncoder;
+use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use http::header::{
     AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, EXPECT,
     HOST, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
@@ -1849,6 +1849,28 @@ fn no_proxy_rule_accepts_url_authority_without_path() {
 }
 
 #[test]
+fn no_proxy_url_rule_without_explicit_port_uses_scheme_default_port() {
+    let rules = vec![NoProxyRule::parse("https://api.example.com").expect("valid url-shaped rule")];
+    let https_default_uri: http::Uri = "https://api.example.com/v1"
+        .parse()
+        .expect("uri should parse");
+    let https_explicit_default_uri: http::Uri = "https://api.example.com:443/v1"
+        .parse()
+        .expect("uri should parse");
+    let https_non_default_uri: http::Uri = "https://api.example.com:8443/v1"
+        .parse()
+        .expect("uri should parse");
+    let http_uri: http::Uri = "http://api.example.com/v1"
+        .parse()
+        .expect("uri should parse");
+
+    assert!(should_bypass_proxy_uri(&rules, &https_default_uri));
+    assert!(should_bypass_proxy_uri(&rules, &https_explicit_default_uri));
+    assert!(!should_bypass_proxy_uri(&rules, &https_non_default_uri));
+    assert!(!should_bypass_proxy_uri(&rules, &http_uri));
+}
+
+#[test]
 fn no_proxy_bypass_uses_default_uri_port_when_missing() {
     let rules = vec![NoProxyRule::parse("api.example.com:443").expect("valid host:port rule")];
     let https_uri: http::Uri = "https://api.example.com/v1"
@@ -2255,6 +2277,67 @@ fn decode_content_encoded_body_decodes_gzip_payload() {
     let decoded =
         decode_content_encoded_body_limited(bytes::Bytes::from(compressed), &headers, 1024)
             .expect("gzip payload should decode");
+    assert_eq!(decoded.as_ref(), source);
+}
+
+#[test]
+fn decode_content_encoded_body_accepts_zlib_and_raw_deflate_payloads() {
+    let source = br#"{"ok":true}"#;
+    let mut zlib_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    zlib_encoder
+        .write_all(source)
+        .expect("write zlib deflate source bytes should succeed");
+    let zlib_compressed = zlib_encoder
+        .finish()
+        .expect("finish zlib deflate stream should succeed");
+
+    let mut raw_encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    raw_encoder
+        .write_all(source)
+        .expect("write raw deflate source bytes should succeed");
+    let raw_compressed = raw_encoder
+        .finish()
+        .expect("finish raw deflate stream should succeed");
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("deflate"),
+    );
+
+    let zlib_decoded =
+        decode_content_encoded_body_limited(bytes::Bytes::from(zlib_compressed), &headers, 1024)
+            .expect("zlib-wrapped deflate payload should decode");
+    assert_eq!(zlib_decoded.as_ref(), source);
+
+    let raw_decoded =
+        decode_content_encoded_body_limited(bytes::Bytes::from(raw_compressed), &headers, 1024)
+            .expect("raw deflate payload should decode");
+    assert_eq!(raw_decoded.as_ref(), source);
+}
+
+#[test]
+fn decode_content_encoded_body_combines_multiple_content_encoding_headers() {
+    let source = br#"{"ok":true}"#;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(source)
+        .expect("write gzip source bytes should succeed");
+    let compressed = encoder.finish().expect("finish gzip stream should succeed");
+
+    let mut headers = http::HeaderMap::new();
+    headers.append(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("identity"),
+    );
+    headers.append(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("gzip"),
+    );
+
+    let decoded =
+        decode_content_encoded_body_limited(bytes::Bytes::from(compressed), &headers, 1024)
+            .expect("split content-encoding headers should decode in wire order");
     assert_eq!(decoded.as_ref(), source);
 }
 

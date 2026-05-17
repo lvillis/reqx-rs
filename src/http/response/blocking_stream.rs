@@ -1,5 +1,4 @@
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -12,7 +11,6 @@ use crate::content_encoding::{
     decode_content_encoded_body_limited, should_decode_content_encoded_body,
 };
 use crate::error::{Error, TimeoutPhase};
-use crate::extensions::Clock;
 use crate::util::{duration_from_millis_saturating, is_timeout_io_error};
 
 use super::{
@@ -78,7 +76,6 @@ pub struct BlockingResponseStream {
     total_timeout_ms: Option<u128>,
     deadline_at: Option<Instant>,
     deadline_slack: Duration,
-    clock: Arc<dyn Clock>,
     lifecycle: Option<StreamLifecycle>,
     _global_permit: Option<GlobalRequestPermit>,
     _host_permit: Option<HostRequestPermit>,
@@ -92,7 +89,6 @@ pub(crate) struct BlockingResponseStreamContext {
     pub(crate) total_timeout_ms: Option<u128>,
     pub(crate) deadline_at: Option<Instant>,
     pub(crate) deadline_slack: Duration,
-    pub(crate) clock: Arc<dyn Clock>,
     pub(crate) lifecycle: Option<StreamLifecycle>,
     pub(crate) global_permit: Option<GlobalRequestPermit>,
     pub(crate) host_permit: Option<HostRequestPermit>,
@@ -113,7 +109,6 @@ impl BlockingResponseStream {
             total_timeout_ms,
             deadline_at,
             deadline_slack,
-            clock,
             lifecycle,
             global_permit,
             host_permit,
@@ -129,7 +124,6 @@ impl BlockingResponseStream {
             total_timeout_ms,
             deadline_at,
             deadline_slack,
-            clock,
             lifecycle,
             _global_permit: global_permit,
             _host_permit: host_permit,
@@ -193,13 +187,13 @@ impl BlockingResponseStream {
         deadline_limits_wait(
             duration_from_millis_saturating(self.timeout_ms.max(1)),
             deadline_at,
-            self.clock.now_monotonic(),
+            Instant::now(),
         )
     }
 
     fn map_read_error(&self, source: std::io::Error, deadline_limited: bool) -> Error {
         let mapped = map_read_error(source, &self.method, &self.uri_redacted, self.timeout_ms);
-        let now = self.clock.now_monotonic();
+        let now = Instant::now();
         if matches!(mapped, Error::Timeout { .. })
             && self.deadline_at.is_some_and(|deadline_at| {
                 deadline_elapsed(deadline_at, now)
@@ -219,7 +213,7 @@ impl BlockingResponseStream {
 
     fn ensure_within_deadline(&self) -> crate::Result<()> {
         if let Some(deadline_at) = self.deadline_at
-            && deadline_elapsed(deadline_at, self.clock.now_monotonic())
+            && deadline_elapsed(deadline_at, Instant::now())
         {
             return Err(deadline_exceeded_error(
                 &self.method,
@@ -400,6 +394,10 @@ impl BlockingResponseStream {
         let status = self.status;
         let method = self.method.clone();
         let uri_redacted = self.uri_redacted.clone();
+        if let Err(error) = self.ensure_within_deadline() {
+            self.complete_error(&error);
+            return Err(error);
+        }
         let mut headers = std::mem::take(&mut self.headers);
         let should_decode = should_decode_content_encoded_body(&method, status, body.len());
         let body = if should_decode {
@@ -414,6 +412,10 @@ impl BlockingResponseStream {
         if should_decode && headers.contains_key(super::CONTENT_ENCODING) {
             headers.remove(super::CONTENT_ENCODING);
             headers.remove(super::CONTENT_LENGTH);
+        }
+        if let Err(error) = self.ensure_within_deadline() {
+            self.complete_error(&error);
+            return Err(error);
         }
         self.complete_success();
         Ok(Response::new(status, headers, body))

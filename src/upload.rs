@@ -5,14 +5,16 @@ use std::io::{self, Read};
 use std::thread::sleep;
 use std::time::Duration;
 
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use thiserror::Error;
 
+use crate::util::{clamp_f64_or_fallback, exponential_backoff_with_jitter};
+
 /// Current resumable upload checkpoint schema version.
 pub const RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 2;
 const LEGACY_RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 1;
+const MAX_RESUMABLE_UPLOAD_PART_NUMBER: u32 = u32::MAX;
 
 fn legacy_checkpoint_version() -> u32 {
     LEGACY_RESUMABLE_UPLOAD_CHECKPOINT_VERSION
@@ -174,7 +176,7 @@ impl ResumableUploadOptions {
 
     /// Sets the backoff jitter ratio applied to retry delays.
     pub fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
-        self.jitter_ratio = jitter_ratio.clamp(0.0, 1.0);
+        self.jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
         self
     }
 
@@ -226,34 +228,12 @@ impl ResumableUploadOptions {
     }
 
     fn backoff_for_retry(&self, retry_index: usize) -> Duration {
-        let capped_exponent = retry_index.saturating_sub(1).min(31) as u32;
-        let multiplier = 1_u128 << capped_exponent;
-        let base_ms = self.base_backoff.as_millis().max(1);
-        let max_ms = self.max_backoff.as_millis().max(base_ms);
-        let delay_ms = base_ms
-            .saturating_mul(multiplier)
-            .min(max_ms)
-            .min(u64::MAX as u128) as u64;
-        self.apply_jitter(Duration::from_millis(delay_ms))
-    }
-
-    fn apply_jitter(&self, backoff: Duration) -> Duration {
-        if self.jitter_ratio <= f64::EPSILON {
-            return backoff;
-        }
-
-        let backoff_ms = backoff.as_millis().min(u64::MAX as u128) as u64;
-        if backoff_ms <= 1 {
-            return backoff;
-        }
-        let max_backoff_ms = self.max_backoff.as_millis().min(u64::MAX as u128) as u64;
-
-        let jitter_span = ((backoff_ms as f64) * self.jitter_ratio).round().max(1.0) as u64;
-        let low = backoff_ms.saturating_sub(jitter_span);
-        let high = backoff_ms.saturating_add(jitter_span).max(low);
-        let mut rng = rand::rng();
-        let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
-        Duration::from_millis(sampled_ms)
+        exponential_backoff_with_jitter(
+            retry_index,
+            self.base_backoff,
+            self.max_backoff,
+            self.jitter_ratio,
+        )
     }
 
     fn expected_checksum(&self, chunk: &[u8]) -> Option<String> {
@@ -436,6 +416,18 @@ where
         /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
+    /// The source stream requires more parts than this checkpoint format can represent.
+    #[error(
+        "resumable upload requires part {attempted_part_number}, which exceeds max supported part number {max_part_number}"
+    )]
+    TooManyUploadParts {
+        /// One-based part number that would have been needed.
+        attempted_part_number: u64,
+        /// Maximum one-based part number supported by the checkpoint format.
+        max_part_number: u32,
+        /// Last known checkpoint state.
+        checkpoint: ResumableUploadCheckpoint,
+    },
 }
 
 impl<E> ResumableUploadError<E>
@@ -450,7 +442,8 @@ where
             | Self::PartChecksumMismatch { checkpoint, .. }
             | Self::PartEtagMismatch { checkpoint, .. }
             | Self::CompleteFailed { checkpoint, .. }
-            | Self::MissingCompletedPart { checkpoint, .. } => Some(checkpoint),
+            | Self::MissingCompletedPart { checkpoint, .. }
+            | Self::TooManyUploadParts { checkpoint, .. } => Some(checkpoint),
             _ => None,
         }
     }
@@ -463,7 +456,8 @@ where
             | Self::PartChecksumMismatch { checkpoint, .. }
             | Self::PartEtagMismatch { checkpoint, .. }
             | Self::CompleteFailed { checkpoint, .. }
-            | Self::MissingCompletedPart { checkpoint, .. } => Some(checkpoint),
+            | Self::MissingCompletedPart { checkpoint, .. }
+            | Self::TooManyUploadParts { checkpoint, .. } => Some(checkpoint),
             _ => None,
         }
     }
@@ -641,8 +635,9 @@ fn checkpoint_part_matches(
 
 fn checkpoint_has_remaining_parts(
     checkpoint: &ResumableUploadCheckpoint,
-    next_part_number: u32,
+    next_part_number: u64,
 ) -> Option<u32> {
+    let next_part_number = u32::try_from(next_part_number).ok()?;
     checkpoint
         .completed_parts
         .range(next_part_number..)
@@ -703,12 +698,44 @@ enum UploadChunkAction {
     Upload(UploadPartPlan),
 }
 
+struct UploadPartRetry<'a> {
+    options: &'a ResumableUploadOptions,
+    attempt: usize,
+}
+
+impl<'a> UploadPartRetry<'a> {
+    const fn new(options: &'a ResumableUploadOptions) -> Self {
+        Self {
+            options,
+            attempt: 1,
+        }
+    }
+
+    fn record_failure<E>(
+        &mut self,
+        session: &ResumableUploadSession<'_>,
+        plan: &UploadPartPlan,
+        source: E,
+    ) -> Result<Duration, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if self.attempt >= self.options.max_attempts {
+            return Err(session.part_upload_failed(plan, self.attempt, source));
+        }
+
+        let delay = self.options.backoff_for_retry(self.attempt);
+        self.attempt += 1;
+        Ok(delay)
+    }
+}
+
 struct ResumableUploadSession<'a> {
     options: &'a ResumableUploadOptions,
     checkpoint: ResumableUploadCheckpoint,
     resumed: bool,
     total_bytes: u64,
-    part_number: u32,
+    part_number: u64,
 }
 
 impl<'a> ResumableUploadSession<'a> {
@@ -756,9 +783,10 @@ impl<'a> ResumableUploadSession<'a> {
             return Ok(UploadChunkAction::Finish);
         }
 
+        let part_number = self.current_part_number::<E>()?;
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         let expected_checksum = self.options.expected_checksum(&chunk);
-        if let Some(existing) = self.checkpoint.completed_parts.get(&self.part_number)
+        if let Some(existing) = self.checkpoint.completed_parts.get(&part_number)
             && checkpoint_part_matches(
                 existing,
                 chunk.len(),
@@ -766,12 +794,12 @@ impl<'a> ResumableUploadSession<'a> {
                 self.options.verify_remote_etag(),
             )
         {
-            self.part_number = self.part_number.saturating_add(1);
+            self.advance_part_number();
             return Ok(UploadChunkAction::Skip);
         }
 
         Ok(UploadChunkAction::Upload(UploadPartPlan {
-            part_number: self.part_number,
+            part_number,
             chunk,
             expected_checksum,
         }))
@@ -798,7 +826,7 @@ impl<'a> ResumableUploadSession<'a> {
         self.checkpoint
             .completed_parts
             .insert(plan.part_number, normalized);
-        self.part_number = self.part_number.saturating_add(1);
+        self.advance_part_number();
         Ok(())
     }
 
@@ -857,8 +885,20 @@ impl<'a> ResumableUploadSession<'a> {
         Ok(ordered_parts)
     }
 
+    fn ordered_completed_parts<E>(&self) -> Result<Vec<UploadedPart>, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if self.total_parts() == 0 {
+            return Err(ResumableUploadError::EmptyUploadBody);
+        }
+        self.ordered_parts()
+    }
+
     fn total_parts(&self) -> u32 {
-        self.part_number.saturating_sub(1)
+        self.part_number
+            .saturating_sub(1)
+            .min(u64::from(MAX_RESUMABLE_UPLOAD_PART_NUMBER)) as u32
     }
 
     fn finish(self, completed_parts: Vec<UploadedPart>) -> ResumableUploadResult {
@@ -870,6 +910,21 @@ impl<'a> ResumableUploadSession<'a> {
             resumed: self.resumed,
             completed_parts,
         }
+    }
+
+    fn current_part_number<E>(&self) -> Result<u32, ResumableUploadError<E>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        u32::try_from(self.part_number).map_err(|_| ResumableUploadError::TooManyUploadParts {
+            attempted_part_number: self.part_number,
+            max_part_number: MAX_RESUMABLE_UPLOAD_PART_NUMBER,
+            checkpoint: self.checkpoint.clone(),
+        })
+    }
+
+    fn advance_part_number(&mut self) {
+        self.part_number += 1;
     }
 }
 
@@ -974,12 +1029,7 @@ impl BlockingResumableUploader {
             }
         }
 
-        if session.total_parts() == 0 {
-            self.abort_if_configured(backend, session.upload_id());
-            return Err(ResumableUploadError::EmptyUploadBody);
-        }
-
-        let ordered_parts = match session.ordered_parts::<B::Error>() {
+        let ordered_parts = match session.ordered_completed_parts::<B::Error>() {
             Ok(parts) => parts,
             Err(error) => {
                 self.abort_if_configured(backend, session.upload_id());
@@ -1004,21 +1054,21 @@ impl BlockingResumableUploader {
     where
         B: BlockingResumableUploadBackend,
     {
-        let mut attempt = 1_usize;
+        let mut retry = UploadPartRetry::new(&self.options);
         loop {
             match backend.upload_part(session.upload_id(), plan.part_number, &plan.chunk) {
                 Ok(part) => return Ok(part),
-                Err(source) => {
-                    if attempt >= self.options.max_attempts {
+                Err(source) => match retry.record_failure(session, plan, source) {
+                    Ok(delay) => {
+                        if !delay.is_zero() {
+                            sleep(delay);
+                        }
+                    }
+                    Err(error) => {
                         self.abort_if_configured(backend, session.upload_id());
-                        return Err(session.part_upload_failed(plan, attempt, source));
+                        return Err(error);
                     }
-                    let delay = self.options.backoff_for_retry(attempt);
-                    if !delay.is_zero() {
-                        sleep(delay);
-                    }
-                    attempt = attempt.saturating_add(1);
-                }
+                },
             }
         }
     }
@@ -1146,12 +1196,7 @@ impl AsyncResumableUploader {
             }
         }
 
-        if session.total_parts() == 0 {
-            self.abort_if_configured(backend, session.upload_id()).await;
-            return Err(ResumableUploadError::EmptyUploadBody);
-        }
-
-        let ordered_parts = match session.ordered_parts::<B::Error>() {
+        let ordered_parts = match session.ordered_completed_parts::<B::Error>() {
             Ok(parts) => parts,
             Err(error) => {
                 self.abort_if_configured(backend, session.upload_id()).await;
@@ -1179,24 +1224,24 @@ impl AsyncResumableUploader {
     where
         B: AsyncResumableUploadBackend,
     {
-        let mut attempt = 1_usize;
+        let mut retry = UploadPartRetry::new(&self.options);
         loop {
             match backend
                 .upload_part(session.upload_id(), plan.part_number, &plan.chunk)
                 .await
             {
                 Ok(part) => return Ok(part),
-                Err(source) => {
-                    if attempt >= self.options.max_attempts {
+                Err(source) => match retry.record_failure(session, plan, source) {
+                    Ok(delay) => {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    Err(error) => {
                         self.abort_if_configured(backend, session.upload_id()).await;
-                        return Err(session.part_upload_failed(plan, attempt, source));
+                        return Err(error);
                     }
-                    let delay = self.options.backoff_for_retry(attempt);
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    attempt = attempt.saturating_add(1);
-                }
+                },
             }
         }
     }
@@ -1397,6 +1442,80 @@ mod tests {
                 .and_then(|item| item.checksum.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn upload_session_allows_maximum_part_number_as_final_chunk() {
+        let options = ResumableUploadOptions::new()
+            .with_part_size(1)
+            .with_max_attempts(1)
+            .with_jitter_ratio(0.0);
+        let checkpoint = ResumableUploadCheckpoint::new("upload-1", 1);
+        let mut session = ResumableUploadSession::new::<MockError>(&options, checkpoint, false)
+            .expect("session should be built");
+        session.part_number = u64::from(MAX_RESUMABLE_UPLOAD_PART_NUMBER);
+
+        let plan = match session
+            .next_chunk::<MockError>(b"x".to_vec())
+            .expect("max part number should be accepted")
+        {
+            UploadChunkAction::Upload(plan) => plan,
+            _ => panic!("max part number should produce an upload plan"),
+        };
+        assert_eq!(plan.part_number, MAX_RESUMABLE_UPLOAD_PART_NUMBER);
+
+        session
+            .accept_uploaded_part::<MockError>(
+                &plan,
+                UploadedPart {
+                    part_number: plan.part_number,
+                    etag: "etag-max".to_owned(),
+                    size: 1,
+                    checksum: None,
+                },
+            )
+            .expect("max part number should be accepted as the final part");
+
+        assert_eq!(session.total_parts(), MAX_RESUMABLE_UPLOAD_PART_NUMBER);
+        assert!(matches!(
+            session
+                .next_chunk::<MockError>(Vec::new())
+                .expect("empty chunk after max part should finish"),
+            UploadChunkAction::Finish
+        ));
+    }
+
+    #[test]
+    fn upload_session_rejects_part_numbers_past_checkpoint_range() {
+        let options = ResumableUploadOptions::new()
+            .with_part_size(1)
+            .with_max_attempts(1)
+            .with_jitter_ratio(0.0);
+        let checkpoint = ResumableUploadCheckpoint::new("upload-1", 1);
+        let mut session = ResumableUploadSession::new::<MockError>(&options, checkpoint, false)
+            .expect("session should be built");
+        session.part_number = u64::from(MAX_RESUMABLE_UPLOAD_PART_NUMBER) + 1;
+
+        let error = match session.next_chunk::<MockError>(b"x".to_vec()) {
+            Ok(_) => panic!("part number overflow should be rejected"),
+            Err(error) => error,
+        };
+
+        match error {
+            ResumableUploadError::TooManyUploadParts {
+                attempted_part_number,
+                max_part_number,
+                checkpoint,
+            } => {
+                assert_eq!(
+                    attempted_part_number,
+                    u64::from(MAX_RESUMABLE_UPLOAD_PART_NUMBER) + 1
+                );
+                assert_eq!(max_part_number, MAX_RESUMABLE_UPLOAD_PART_NUMBER);
+                assert!(checkpoint.completed_parts.is_empty());
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]
@@ -1836,6 +1955,16 @@ mod tests {
             let backoff = options.backoff_for_retry(4);
             assert!(backoff <= Duration::from_millis(80));
         }
+    }
+
+    #[test]
+    fn resumable_upload_nan_jitter_ratio_is_normalized_to_zero() {
+        let options = ResumableUploadOptions::new()
+            .with_base_backoff(Duration::from_millis(50))
+            .with_max_backoff(Duration::from_millis(80))
+            .with_jitter_ratio(f64::NAN);
+
+        assert_eq!(options.backoff_for_retry(1), Duration::from_millis(50));
     }
 
     #[cfg(feature = "_async")]

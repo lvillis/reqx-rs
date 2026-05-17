@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode};
-use rand::RngExt;
 
 use crate::IDEMPOTENCY_KEY_HEADER;
 use crate::error::{TimeoutPhase, TransportErrorKind};
+use crate::util::{clamp_f64_or_fallback, exponential_backoff_with_jitter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Reason a retry was considered.
@@ -266,7 +266,7 @@ impl RetryPolicy {
 
     /// Sets the random jitter ratio applied to computed backoffs.
     pub fn jitter_ratio(mut self, jitter_ratio: f64) -> Self {
-        self.jitter_ratio = jitter_ratio.clamp(0.0, 1.0);
+        self.jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
         self
     }
 
@@ -387,34 +387,12 @@ impl RetryPolicy {
     }
 
     pub(crate) fn backoff_for_retry(&self, retry_index: usize) -> Duration {
-        let capped_exponent = retry_index.saturating_sub(1).min(31) as u32;
-        let multiplier = 1_u128 << capped_exponent;
-        let base_ms = self.base_backoff.as_millis().max(1);
-        let max_ms = self.max_backoff.as_millis().max(base_ms);
-        let delay_ms = base_ms
-            .saturating_mul(multiplier)
-            .min(max_ms)
-            .min(u64::MAX as u128) as u64;
-        self.apply_jitter(Duration::from_millis(delay_ms))
-    }
-
-    fn apply_jitter(&self, backoff: Duration) -> Duration {
-        if self.jitter_ratio <= f64::EPSILON {
-            return backoff;
-        }
-
-        let backoff_ms = backoff.as_millis().min(u64::MAX as u128) as u64;
-        if backoff_ms <= 1 {
-            return backoff;
-        }
-        let max_backoff_ms = self.max_backoff.as_millis().min(u64::MAX as u128) as u64;
-
-        let jitter_span = ((backoff_ms as f64) * self.jitter_ratio).round().max(1.0) as u64;
-        let low = backoff_ms.saturating_sub(jitter_span);
-        let high = backoff_ms.saturating_add(jitter_span).max(low);
-        let mut rng = rand::rng();
-        let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
-        Duration::from_millis(sampled_ms)
+        exponential_backoff_with_jitter(
+            retry_index,
+            self.base_backoff,
+            self.max_backoff,
+            self.jitter_ratio,
+        )
     }
 }
 
@@ -471,6 +449,19 @@ mod tests {
             let backoff = policy.backoff_for_retry(3);
             assert!(backoff <= std::time::Duration::from_millis(120));
         }
+    }
+
+    #[test]
+    fn nan_jitter_ratio_is_normalized_to_zero() {
+        let policy = RetryPolicy::standard()
+            .base_backoff(std::time::Duration::from_millis(100))
+            .max_backoff(std::time::Duration::from_millis(500))
+            .jitter_ratio(f64::NAN);
+
+        assert_eq!(
+            policy.backoff_for_retry(1),
+            std::time::Duration::from_millis(100)
+        );
     }
 
     #[test]

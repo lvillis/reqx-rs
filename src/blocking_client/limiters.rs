@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::core::limiters::{
     PER_HOST_LIMITER_ENTRY_TTL, PER_HOST_LIMITER_MAX_ENTRIES,
     PerHostLimiterEntry as PerHostLimiterEntryState, cleanup_stale_per_host_limiters,
+    normalize_concurrency_limit, normalize_optional_concurrency_limit,
 };
 use crate::extensions::Clock;
 use crate::util::{lock_unpoisoned, normalize_host_key};
@@ -50,7 +51,7 @@ struct BlockingSemaphore {
 impl BlockingSemaphore {
     fn new(permits: usize) -> Self {
         Self {
-            state: Mutex::new(permits.max(1)),
+            state: Mutex::new(normalize_concurrency_limit(permits)),
             condvar: Condvar::new(),
         }
     }
@@ -128,6 +129,8 @@ impl RequestLimiters {
         per_host_limit: Option<usize>,
         clock: Arc<dyn Clock>,
     ) -> Option<Self> {
+        let max_in_flight = normalize_optional_concurrency_limit(max_in_flight);
+        let per_host_limit = normalize_optional_concurrency_limit(per_host_limit);
         if max_in_flight.is_none() && per_host_limit.is_none() {
             return None;
         }
@@ -232,6 +235,21 @@ mod tests {
         let entries = lock_unpoisoned(&limiters.per_host);
         assert!(entries.contains_key("api.example.com"));
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn zero_limits_are_normalized_to_one_permit() {
+        let limiters =
+            RequestLimiters::new(Some(0), Some(0), Arc::new(crate::extensions::SystemClock))
+                .expect("limiters should be built");
+        let deadline_at = Some(Instant::now() + Duration::from_millis(50));
+
+        let _global = limiters
+            .acquire_global(deadline_at)
+            .expect("zero global limit should be normalized");
+        let _host = limiters
+            .acquire_host(Some("api"), deadline_at)
+            .expect("zero host limit should be normalized");
     }
 
     #[test]

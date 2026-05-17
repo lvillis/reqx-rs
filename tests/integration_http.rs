@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use flate2::Compression;
@@ -16,8 +16,8 @@ use flate2::write::GzEncoder;
 use futures_util::stream;
 use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use reqx::advanced::{
-    AdaptiveConcurrencyPolicy, Interceptor, Observer, RateLimitPolicy, RequestContext,
-    RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
+    AdaptiveConcurrencyPolicy, BodyCodec, Clock, Interceptor, Observer, RateLimitPolicy,
+    RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
 };
 use reqx::prelude::{Client, Error, RedirectPolicy, RetryPolicy};
 use reqx::{ErrorCode, TimeoutPhase};
@@ -67,6 +67,38 @@ struct CapturedRequest {
     path: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct SlowBodyCodec {
+    delay: Duration,
+}
+
+#[derive(Debug)]
+struct FastForwardClock;
+
+impl Clock for FastForwardClock {
+    fn now_system(&self) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3_600)
+    }
+
+    fn now_monotonic(&self) -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
+    }
+}
+
+impl BodyCodec for SlowBodyCodec {
+    fn decode_response_body_limited(
+        &self,
+        body: Bytes,
+        _headers: &http::HeaderMap,
+        _max_response_body_bytes: usize,
+        _method: &http::Method,
+        _uri: &str,
+    ) -> Result<Bytes, Error> {
+        thread::sleep(self.delay);
+        Ok(body)
+    }
 }
 
 struct MockServer {
@@ -1885,6 +1917,38 @@ async fn response_body_timeout_maps_to_deadline_exceeded_when_total_timeout_is_e
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_response_decode_honors_total_timeout_deadline() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(60))
+        .body_codec(SlowBodyCodec {
+            delay: Duration::from_millis(120),
+        })
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/slow-buffered-decode")
+        .send()
+        .await
+        .expect_err("slow buffered decode should honor total timeout");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/slow-buffered-decode"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_stream_copy_to_writer_reports_response_body_timeout() {
     let server = SplitBodySequenceServer::start(vec![
         SplitBodyResponse::new(
@@ -2024,6 +2088,176 @@ async fn send_stream_copy_to_writer_respects_total_timeout_deadline() {
     match error {
         Error::DeadlineExceeded { uri, .. } => {
             assert!(uri.contains("/stream-total-timeout"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_ready_body_after_total_timeout_returns_deadline_exceeded() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        "ready",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(80))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/stream-ready-after-deadline")
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let error = stream
+        .into_bytes_limited(64)
+        .await
+        .expect_err("ready body must still honor the total timeout deadline");
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/stream-ready-after-deadline"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_total_deadline_uses_runtime_clock_not_control_clock() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain")],
+        "ok",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .control_clock(FastForwardClock)
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body = client
+        .get("/stream-runtime-clock")
+        .send_stream()
+        .await
+        .expect("stream request should return headers")
+        .into_text_limited(64)
+        .await
+        .expect("stream deadline should use runtime monotonic time");
+
+    assert_eq!(body, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn total_timeout_recomputes_transport_timeout_after_per_host_queue_wait() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/octet-stream")],
+            "held",
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "text/plain")],
+            "late",
+            Duration::from_millis(500),
+        ),
+    ]);
+    let client = Client::builder(server.base_url.clone())
+        .max_in_flight_per_host(1)
+        .request_timeout(Duration::from_millis(1_000))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let held_stream = client
+        .get("/hold-host-permit")
+        .send_stream()
+        .await
+        .expect("first stream should hold the host permit");
+
+    let started = Instant::now();
+    let queued = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .get("/queued-after-host-permit")
+                .total_timeout(Duration::from_millis(200))
+                .send()
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    drop(held_stream);
+
+    let error = queued
+        .await
+        .expect("join queued request")
+        .expect_err("queued request should use remaining total timeout for transport");
+    let elapsed = started.elapsed();
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/queued-after-host-permit"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(280),
+        "transport timeout was not recomputed after host queue wait: {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_async_read_buffer_honors_total_timeout_deadline() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        "buffered",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(80))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let mut stream = client
+        .get("/stream-buffered-after-deadline")
+        .send_stream()
+        .await
+        .expect("stream request should return headers");
+    let mut first_byte = [0_u8; 1];
+    stream
+        .read_exact(&mut first_byte)
+        .await
+        .expect("first read should fill the internal stream buffer");
+    assert_eq!(first_byte, [b'b']);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let mut next_byte = [0_u8; 1];
+    let error = stream
+        .read_exact(&mut next_byte)
+        .await
+        .expect_err("pending buffered bytes must still honor total timeout");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let inner = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+        .expect("io error should retain original reqx::Error");
+    match inner {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/stream-buffered-after-deadline"));
         }
         other => panic!("unexpected error variant: {other}"),
     }

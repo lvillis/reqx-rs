@@ -6,13 +6,14 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use bytes::Bytes;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use reqx::advanced::{
-    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, Interceptor, Observer, RateLimitPolicy,
-    RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
+    AdaptiveConcurrencyPolicy, BodyCodec, CircuitBreakerPolicy, Clock, Interceptor, Observer,
+    RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
 };
 use reqx::blocking::Client;
 use reqx::prelude::{Error, RedirectPolicy, RetryPolicy, TlsRootStore};
@@ -24,6 +25,7 @@ struct MockResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -39,6 +41,24 @@ impl MockResponse {
                 .map(|(name, value)| (name.into(), value.into()))
                 .collect(),
             body: body.into(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn delayed(
+        status: u16,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+        body: impl Into<Vec<u8>>,
+        delay: Duration,
+    ) -> Self {
+        Self {
+            status,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            body: body.into(),
+            delay,
         }
     }
 }
@@ -49,6 +69,38 @@ struct CapturedRequest {
     path: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct SlowBodyCodec {
+    delay: Duration,
+}
+
+#[derive(Debug)]
+struct FastForwardClock;
+
+impl Clock for FastForwardClock {
+    fn now_system(&self) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3_600)
+    }
+
+    fn now_monotonic(&self) -> Instant {
+        Instant::now() + Duration::from_secs(3_600)
+    }
+}
+
+impl BodyCodec for SlowBodyCodec {
+    fn decode_response_body_limited(
+        &self,
+        body: Bytes,
+        _headers: &http::HeaderMap,
+        _max_response_body_bytes: usize,
+        _method: &http::Method,
+        _uri: &str,
+    ) -> Result<Bytes, Error> {
+        thread::sleep(self.delay);
+        Ok(body)
+    }
 }
 
 struct MockServer {
@@ -88,6 +140,9 @@ impl MockServer {
                         served_clone.fetch_add(1, Ordering::SeqCst);
                         let response = &responses[response_index];
                         response_index += 1;
+                        if !response.delay.is_zero() {
+                            thread::sleep(response.delay);
+                        }
                         let _ = write_response(&mut stream, response);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1377,6 +1432,69 @@ fn blocking_total_timeout_includes_global_queue_wait_before_send_loop() {
         }
         other => panic!("unexpected error variant: {other}"),
     }
+}
+
+#[test]
+fn blocking_total_timeout_recomputes_transport_timeout_after_per_host_queue_wait() {
+    let server = MockServer::start(vec![
+        MockResponse::new(200, Vec::<(String, String)>::new(), b"held".to_vec()),
+        MockResponse::delayed(
+            200,
+            Vec::<(String, String)>::new(),
+            b"late".to_vec(),
+            Duration::from_millis(500),
+        ),
+    ]);
+    let client = Arc::new(
+        Client::builder(server.base_url.clone())
+            .max_in_flight_per_host(1)
+            .request_timeout(Duration::from_millis(1_000))
+            .retry_policy(RetryPolicy::disabled())
+            .build()
+            .expect("client should build"),
+    );
+
+    let held_stream = client
+        .get("/hold-host-permit")
+        .send_stream()
+        .expect("first stream should hold the host permit");
+
+    let queued_client = Arc::clone(&client);
+    let started = Instant::now();
+    let queued = thread::spawn(move || {
+        queued_client
+            .get("/queued-after-host-permit")
+            .total_timeout(Duration::from_millis(200))
+            .send()
+    });
+
+    thread::sleep(Duration::from_millis(120));
+    drop(held_stream);
+
+    let error = queued
+        .join()
+        .expect("join queued request")
+        .expect_err("queued request should use remaining total timeout for transport");
+    let elapsed = started.elapsed();
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/queued-after-host-permit"));
+        }
+        Error::Timeout {
+            timeout_ms, uri, ..
+        } => {
+            assert!(uri.contains("/queued-after-host-permit"));
+            assert!(
+                timeout_ms < 200,
+                "transport timeout should be bounded by elapsed host queue wait"
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(280),
+        "transport timeout was not recomputed after host queue wait: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -2691,6 +2809,37 @@ fn blocking_buffered_response_body_timeout_maps_to_deadline_exceeded_when_total_
 }
 
 #[test]
+fn blocking_buffered_response_decode_honors_total_timeout_deadline() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        br#"{"ok":true}"#.to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(60))
+        .body_codec(SlowBodyCodec {
+            delay: Duration::from_millis(120),
+        })
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/slow-buffered-decode")
+        .send()
+        .expect_err("slow buffered decode should honor total timeout");
+
+    match error {
+        Error::DeadlineExceeded { uri, .. } => {
+            assert!(uri.contains("/v1/slow-buffered-decode"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+}
+
+#[test]
 fn blocking_send_stream_respects_total_timeout_deadline() {
     let server = ChunkedBodyServer::start(
         200,
@@ -2723,6 +2872,32 @@ fn blocking_send_stream_respects_total_timeout_deadline() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn blocking_send_stream_total_deadline_uses_runtime_clock_not_control_clock() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "text/plain")],
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .control_clock(FastForwardClock)
+        .request_timeout(Duration::from_millis(500))
+        .total_timeout(Duration::from_millis(500))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body = client
+        .get("/v1/stream-runtime-clock")
+        .send_stream()
+        .expect("stream request should return headers")
+        .into_text_limited(64)
+        .expect("stream deadline should use runtime monotonic time");
+
+    assert_eq!(body, "ok");
 }
 
 #[test]

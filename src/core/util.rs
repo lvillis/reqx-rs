@@ -9,6 +9,7 @@ use http::header::{
     TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{HeaderMap, Method, StatusCode, Uri};
+use rand::RngExt;
 
 use crate::error::Error;
 #[cfg(feature = "_async")]
@@ -21,6 +22,60 @@ pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+pub(crate) const fn normalize_usize_at_least_one(value: usize) -> usize {
+    if value == 0 { 1 } else { value }
+}
+
+pub(crate) fn clamp_f64_or_fallback(value: f64, min: f64, max: f64, nan_fallback: f64) -> f64 {
+    debug_assert!(min.is_finite());
+    debug_assert!(max.is_finite());
+    debug_assert!(nan_fallback.is_finite());
+    debug_assert!(min <= max);
+
+    if value.is_nan() {
+        nan_fallback.clamp(min, max)
+    } else {
+        value.clamp(min, max)
+    }
+}
+
+pub(crate) fn exponential_backoff_with_jitter(
+    retry_index: usize,
+    base_backoff: Duration,
+    max_backoff: Duration,
+    jitter_ratio: f64,
+) -> Duration {
+    let capped_exponent = retry_index.saturating_sub(1).min(31) as u32;
+    let multiplier = 1_u128 << capped_exponent;
+    let base_ms = base_backoff.as_millis().max(1);
+    let max_ms = max_backoff.as_millis().max(base_ms);
+    let delay_ms = base_ms
+        .saturating_mul(multiplier)
+        .min(max_ms)
+        .min(u64::MAX as u128) as u64;
+    apply_backoff_jitter(Duration::from_millis(delay_ms), max_ms, jitter_ratio)
+}
+
+fn apply_backoff_jitter(backoff: Duration, max_backoff_ms: u128, jitter_ratio: f64) -> Duration {
+    let jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
+    if jitter_ratio <= f64::EPSILON {
+        return backoff;
+    }
+
+    let backoff_ms = backoff.as_millis().min(u64::MAX as u128) as u64;
+    if backoff_ms <= 1 {
+        return backoff;
+    }
+
+    let max_backoff_ms = max_backoff_ms.min(u64::MAX as u128) as u64;
+    let jitter_span = ((backoff_ms as f64) * jitter_ratio).round().max(1.0) as u64;
+    let low = backoff_ms.saturating_sub(jitter_span);
+    let high = backoff_ms.saturating_add(jitter_span).max(low);
+    let mut rng = rand::rng();
+    let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
+    Duration::from_millis(sampled_ms)
 }
 
 pub(crate) fn merge_headers(default_headers: &HeaderMap, request_headers: &HeaderMap) -> HeaderMap {
@@ -803,6 +858,16 @@ pub(crate) fn duration_millis_u64_saturating(duration: Duration) -> u64 {
 
 pub(crate) fn duration_from_millis_saturating(milliseconds: u128) -> Duration {
     Duration::from_millis(milliseconds.min(u64::MAX as u128) as u64)
+}
+
+pub(crate) fn duration_from_secs_f64_saturating(seconds: f64) -> Duration {
+    if seconds <= 0.0 {
+        return Duration::ZERO;
+    }
+    if !seconds.is_finite() || seconds >= Duration::MAX.as_secs_f64() {
+        return Duration::MAX;
+    }
+    Duration::from_secs_f64(seconds)
 }
 
 pub(crate) fn total_timeout_expired(
