@@ -1,3 +1,20 @@
+## [0.1.38] - 2026-05-18
+
+### 🐛 Bug Fixes
+
+- [**breaking**] Harden transport edge-case handling
+- [**breaking**] Reject invalid client configuration instead of clamping
+- Harden request execution and client validation
+
+### 🚜 Refactor
+
+- Centralize request execution flow
+- [**breaking**] Consolidate execution state machines
+## [0.1.37] - 2026-05-12
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.37
 ## [0.1.36] - 2026-05-12
 
 ### 🐛 Bug Fixes
