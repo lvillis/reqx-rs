@@ -233,30 +233,30 @@ impl BlockingResponseStream {
         if buffer.is_empty() {
             return Ok(0);
         }
-        if let Err(error) = self.ensure_within_deadline() {
-            self.complete_error(&error);
-            return Err(error);
-        }
-        let deadline_limited = self.current_read_is_deadline_limited();
-        let read = self
-            .body
-            .as_reader()
-            .read(buffer)
-            .map_err(|source| self.map_read_error(source, deadline_limited));
-        match read {
-            Ok(read) => {
-                if let Err(error) = self.ensure_within_deadline() {
+
+        loop {
+            if let Err(error) = self.ensure_within_deadline() {
+                self.complete_error(&error);
+                return Err(error);
+            }
+            let deadline_limited = self.current_read_is_deadline_limited();
+            match self.body.as_reader().read(buffer) {
+                Ok(read) => {
+                    if let Err(error) = self.ensure_within_deadline() {
+                        self.complete_error(&error);
+                        return Err(error);
+                    }
+                    if read == 0 && complete_success_on_eof {
+                        self.complete_success();
+                    }
+                    return Ok(read);
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    let error = self.map_read_error(source, deadline_limited);
                     self.complete_error(&error);
                     return Err(error);
                 }
-                if read == 0 && complete_success_on_eof {
-                    self.complete_success();
-                }
-                Ok(read)
-            }
-            Err(error) => {
-                self.complete_error(&error);
-                Err(error)
             }
         }
     }

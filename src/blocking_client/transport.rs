@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,6 +13,7 @@ use crate::tls::{TlsBackend, TlsOptions, tls_version_bounds};
     feature = "blocking-tls-native"
 ))]
 use crate::tls::{TlsClientIdentity, TlsRootCertificate, TlsRootStore, tls_config_error};
+use crate::util::read_retry_interrupted;
 
 #[cfg(feature = "blocking-tls-rustls-aws-lc-rs")]
 use std::sync::Arc;
@@ -356,6 +356,7 @@ pub(super) fn classify_ureq_transport_error(error: &ureq::Error) -> TransportErr
     }
 }
 
+#[derive(Debug)]
 pub(super) enum ReadBodyError {
     Read(std::io::Error),
     TooLarge { actual_bytes: usize },
@@ -366,12 +367,19 @@ pub(super) fn read_all_body_limited(
     max_bytes: usize,
 ) -> Result<Bytes, ReadBodyError> {
     let mut reader = response.body_mut().as_reader();
+    read_reader_limited(&mut reader, max_bytes)
+}
+
+fn read_reader_limited<R: std::io::Read>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Bytes, ReadBodyError> {
     let mut collected = Vec::new();
     let mut chunk = [0_u8; 8192];
     let mut total_len = 0_usize;
 
     loop {
-        let read = reader.read(&mut chunk).map_err(ReadBodyError::Read)?;
+        let read = read_retry_interrupted(reader, &mut chunk).map_err(ReadBodyError::Read)?;
         if read == 0 {
             break;
         }
@@ -385,6 +393,55 @@ pub(super) fn read_all_body_limited(
     }
 
     Ok(Bytes::from(collected))
+}
+
+#[cfg(test)]
+mod read_tests {
+    use std::io::{self, Read};
+
+    use super::read_reader_limited;
+
+    struct InterruptedOnceReader {
+        data: Vec<u8>,
+        offset: usize,
+        interrupted: bool,
+    }
+
+    impl InterruptedOnceReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                interrupted: false,
+            }
+        }
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.offset >= self.data.len() {
+                return Ok(0);
+            }
+
+            let read = buffer.len().min(self.data.len() - self.offset);
+            buffer[..read].copy_from_slice(&self.data[self.offset..self.offset + read]);
+            self.offset += read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn read_reader_limited_retries_interrupted_reads() {
+        let mut reader = InterruptedOnceReader::new(b"response");
+        let body =
+            read_reader_limited(&mut reader, 16).expect("interrupted read should be retried");
+
+        assert_eq!(body.as_ref(), b"response");
+    }
 }
 
 #[cfg(all(test, feature = "blocking-tls-native"))]

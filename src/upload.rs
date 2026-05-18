@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use thiserror::Error;
 
-use crate::util::exponential_backoff_with_jitter;
+#[cfg(feature = "_async")]
+use crate::util::read_async_retry_interrupted;
+use crate::util::{exponential_backoff_with_jitter, read_retry_interrupted};
 
 /// Current resumable upload checkpoint schema version.
 pub const RESUMABLE_UPLOAD_CHECKPOINT_VERSION: u32 = 2;
@@ -198,7 +200,9 @@ impl ResumableUploadOptions {
         self
     }
 
-    /// Verifies that the remote ETag matches the computed checksum when possible.
+    /// Verifies that the remote ETag matches the computed checksum.
+    ///
+    /// Enabling this requires a part checksum algorithm.
     pub fn with_verify_remote_etag(mut self, verify_remote_etag: bool) -> Self {
         self.verify_remote_etag = verify_remote_etag;
         self
@@ -256,6 +260,9 @@ impl ResumableUploadOptions {
         }
         if !self.jitter_ratio.is_finite() || !(0.0..=1.0).contains(&self.jitter_ratio) {
             return Err(self.invalid_options("jitter_ratio must be finite and between 0.0 and 1.0"));
+        }
+        if self.verify_remote_etag && self.part_checksum_algorithm.is_none() {
+            return Err(self.invalid_options("verify_remote_etag requires part_checksum_algorithm"));
         }
         Ok(())
     }
@@ -424,6 +431,30 @@ where
         /// Source error returned by the backend.
         source: E,
     },
+    /// The backend returned metadata for a different part number.
+    #[error("upload part {expected_part_number} returned metadata for part {actual_part_number}")]
+    PartNumberMismatch {
+        /// Expected one-based part number.
+        expected_part_number: u32,
+        /// Backend-reported one-based part number.
+        actual_part_number: u32,
+        /// Last known checkpoint state.
+        checkpoint: ResumableUploadCheckpoint,
+    },
+    /// The backend returned a byte size that did not match the uploaded chunk.
+    #[error(
+        "upload part {part_number} returned size {actual_size} but uploaded {expected_size} bytes"
+    )]
+    PartSizeMismatch {
+        /// One-based part number.
+        part_number: u32,
+        /// Expected uploaded byte count.
+        expected_size: usize,
+        /// Backend-reported byte count.
+        actual_size: usize,
+        /// Last known checkpoint state.
+        checkpoint: ResumableUploadCheckpoint,
+    },
     /// A backend-reported checksum did not match the expected checksum.
     #[error(
         "upload part {part_number} checksum mismatch: expected={expected_checksum} actual={actual_checksum}"
@@ -495,6 +526,8 @@ where
         match self {
             Self::SourceRead { checkpoint, .. }
             | Self::PartUploadFailed { checkpoint, .. }
+            | Self::PartNumberMismatch { checkpoint, .. }
+            | Self::PartSizeMismatch { checkpoint, .. }
             | Self::PartChecksumMismatch { checkpoint, .. }
             | Self::PartEtagMismatch { checkpoint, .. }
             | Self::CompleteFailed { checkpoint, .. }
@@ -509,6 +542,8 @@ where
         match self {
             Self::SourceRead { checkpoint, .. }
             | Self::PartUploadFailed { checkpoint, .. }
+            | Self::PartNumberMismatch { checkpoint, .. }
+            | Self::PartSizeMismatch { checkpoint, .. }
             | Self::PartChecksumMismatch { checkpoint, .. }
             | Self::PartEtagMismatch { checkpoint, .. }
             | Self::CompleteFailed { checkpoint, .. }
@@ -527,7 +562,9 @@ pub trait BlockingResumableUploadBackend {
     /// Starts a new remote upload session and returns its upload id.
     fn create_upload(&self) -> Result<String, Self::Error>;
 
-    /// Uploads one part and returns normalized metadata for the completed part.
+    /// Uploads one part and returns metadata for the completed part.
+    ///
+    /// The returned `part_number` and `size` must match the requested part.
     fn upload_part(
         &self,
         upload_id: &str,
@@ -560,7 +597,9 @@ pub trait AsyncResumableUploadBackend {
     /// Starts a new remote upload session and returns its upload id.
     fn create_upload(&self) -> impl Future<Output = Result<String, Self::Error>> + Send;
 
-    /// Uploads one part and returns normalized metadata for the completed part.
+    /// Uploads one part and returns metadata for the completed part.
+    ///
+    /// The returned `part_number` and `size` must match the requested part.
     fn upload_part(
         &self,
         upload_id: &str,
@@ -582,12 +621,6 @@ pub trait AsyncResumableUploadBackend {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async { Ok(()) }
     }
-}
-
-fn normalize_part(mut part: UploadedPart, part_number: u32, expected_size: usize) -> UploadedPart {
-    part.part_number = part_number;
-    part.size = expected_size;
-    part
 }
 
 fn checkpoint_supports_version(version: u32) -> bool {
@@ -709,7 +742,7 @@ where
     let mut read_len = 0_usize;
 
     while read_len < part_size {
-        let read = reader.read(&mut buffer[read_len..])?;
+        let read = read_retry_interrupted(reader, &mut buffer[read_len..])?;
         if read == 0 {
             break;
         }
@@ -725,13 +758,11 @@ async fn read_chunk_async<R>(reader: &mut R, part_size: usize) -> io::Result<Vec
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
-
     let mut buffer = vec![0_u8; part_size];
     let mut read_len = 0_usize;
 
     while read_len < part_size {
-        let read = reader.read(&mut buffer[read_len..]).await?;
+        let read = read_async_retry_interrupted(reader, &mut buffer[read_len..]).await?;
         if read == 0 {
             break;
         }
@@ -870,19 +901,35 @@ impl<'a> ResumableUploadSession<'a> {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
-        let mut normalized = normalize_part(uploaded, plan.part_number, plan.chunk.len());
+        if uploaded.part_number != plan.part_number {
+            return Err(ResumableUploadError::PartNumberMismatch {
+                expected_part_number: plan.part_number,
+                actual_part_number: uploaded.part_number,
+                checkpoint: self.checkpoint.clone(),
+            });
+        }
+        if uploaded.size != plan.chunk.len() {
+            return Err(ResumableUploadError::PartSizeMismatch {
+                part_number: plan.part_number,
+                expected_size: plan.chunk.len(),
+                actual_size: uploaded.size,
+                checkpoint: self.checkpoint.clone(),
+            });
+        }
+
+        let mut uploaded = uploaded;
         self.options.validate_uploaded_part::<E>(
             &self.checkpoint,
             plan.part_number,
-            &normalized,
+            &uploaded,
             plan.expected_checksum.as_deref(),
         )?;
-        if normalized.checksum.is_none() {
-            normalized.checksum = plan.expected_checksum.clone();
+        if uploaded.checksum.is_none() {
+            uploaded.checksum = plan.expected_checksum.clone();
         }
         self.checkpoint
             .completed_parts
-            .insert(plan.part_number, normalized);
+            .insert(plan.part_number, uploaded);
         self.advance_part_number();
         Ok(())
     }
@@ -1317,9 +1364,13 @@ impl Default for AsyncResumableUploader {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(feature = "_async")]
+    use std::pin::Pin;
+    #[cfg(feature = "_async")]
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(feature = "_async")]
+    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -1476,6 +1527,107 @@ mod tests {
         }
     }
 
+    struct InterruptedOnceReader {
+        data: Vec<u8>,
+        offset: usize,
+        interrupted: bool,
+    }
+
+    impl InterruptedOnceReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                interrupted: false,
+            }
+        }
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.offset >= self.data.len() {
+                return Ok(0);
+            }
+
+            let read = buffer.len().min(self.data.len() - self.offset);
+            buffer[..read].copy_from_slice(&self.data[self.offset..self.offset + read]);
+            self.offset += read;
+            Ok(read)
+        }
+    }
+
+    #[cfg(feature = "_async")]
+    struct AsyncInterruptedOnceReader {
+        data: Vec<u8>,
+        offset: usize,
+        interrupted: bool,
+    }
+
+    #[cfg(feature = "_async")]
+    impl AsyncInterruptedOnceReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                interrupted: false,
+            }
+        }
+    }
+
+    #[cfg(feature = "_async")]
+    impl tokio::io::AsyncRead for AsyncInterruptedOnceReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let reader = self.get_mut();
+            if !reader.interrupted {
+                reader.interrupted = true;
+                return Poll::Ready(Err(std::io::ErrorKind::Interrupted.into()));
+            }
+            if reader.offset >= reader.data.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let read = buffer.remaining().min(reader.data.len() - reader.offset);
+            buffer.put_slice(&reader.data[reader.offset..reader.offset + read]);
+            reader.offset += read;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn read_chunk_retries_interrupted_reads() {
+        let mut reader = InterruptedOnceReader::new(b"abcdef");
+
+        let first = read_chunk(&mut reader, 4).expect("interrupted read should be retried");
+        let second = read_chunk(&mut reader, 4).expect("remaining bytes should be readable");
+
+        assert_eq!(first, b"abcd");
+        assert_eq!(second, b"ef");
+    }
+
+    #[cfg(feature = "_async")]
+    #[tokio::test]
+    async fn read_chunk_async_retries_interrupted_reads() {
+        let mut reader = AsyncInterruptedOnceReader::new(b"abcdef");
+
+        let first = read_chunk_async(&mut reader, 4)
+            .await
+            .expect("interrupted read should be retried");
+        let second = read_chunk_async(&mut reader, 4)
+            .await
+            .expect("remaining bytes should be readable");
+
+        assert_eq!(first, b"abcd");
+        assert_eq!(second, b"ef");
+    }
+
     #[test]
     fn checkpoint_deserializes_legacy_payload_without_version() {
         let payload = r#"{
@@ -1571,6 +1723,94 @@ mod tests {
                     u64::from(MAX_RESUMABLE_UPLOAD_PART_NUMBER) + 1
                 );
                 assert_eq!(max_part_number, MAX_RESUMABLE_UPLOAD_PART_NUMBER);
+                assert!(checkpoint.completed_parts.is_empty());
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn upload_session_rejects_backend_part_number_mismatch() {
+        let options = ResumableUploadOptions::new()
+            .with_part_size(4)
+            .with_max_attempts(1)
+            .with_jitter_ratio(0.0);
+        let checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        let mut session = ResumableUploadSession::new::<MockError>(&options, checkpoint, false)
+            .expect("session should be built");
+
+        let plan = match session
+            .next_chunk::<MockError>(b"abcd".to_vec())
+            .expect("chunk should produce an upload plan")
+        {
+            UploadChunkAction::Upload(plan) => plan,
+            _ => panic!("chunk should produce an upload plan"),
+        };
+        let error = session
+            .accept_uploaded_part::<MockError>(
+                &plan,
+                UploadedPart {
+                    part_number: 99,
+                    etag: "etag-1".to_owned(),
+                    size: 4,
+                    checksum: None,
+                },
+            )
+            .expect_err("backend part number mismatch should be rejected");
+
+        match error {
+            ResumableUploadError::PartNumberMismatch {
+                expected_part_number,
+                actual_part_number,
+                checkpoint,
+            } => {
+                assert_eq!(expected_part_number, 1);
+                assert_eq!(actual_part_number, 99);
+                assert!(checkpoint.completed_parts.is_empty());
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn upload_session_rejects_backend_part_size_mismatch() {
+        let options = ResumableUploadOptions::new()
+            .with_part_size(4)
+            .with_max_attempts(1)
+            .with_jitter_ratio(0.0);
+        let checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        let mut session = ResumableUploadSession::new::<MockError>(&options, checkpoint, false)
+            .expect("session should be built");
+
+        let plan = match session
+            .next_chunk::<MockError>(b"abcd".to_vec())
+            .expect("chunk should produce an upload plan")
+        {
+            UploadChunkAction::Upload(plan) => plan,
+            _ => panic!("chunk should produce an upload plan"),
+        };
+        let error = session
+            .accept_uploaded_part::<MockError>(
+                &plan,
+                UploadedPart {
+                    part_number: 1,
+                    etag: "etag-1".to_owned(),
+                    size: 3,
+                    checksum: None,
+                },
+            )
+            .expect_err("backend part size mismatch should be rejected");
+
+        match error {
+            ResumableUploadError::PartSizeMismatch {
+                part_number,
+                expected_size,
+                actual_size,
+                checkpoint,
+            } => {
+                assert_eq!(part_number, 1);
+                assert_eq!(expected_size, 4);
+                assert_eq!(actual_size, 3);
                 assert!(checkpoint.completed_parts.is_empty());
             }
             other => panic!("unexpected error variant: {other}"),
@@ -2089,6 +2329,25 @@ mod tests {
                 assert_eq!(
                     message,
                     "jitter_ratio must be finite and between 0.0 and 1.0"
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn resumable_upload_options_reject_etag_verification_without_checksum() {
+        let options = ResumableUploadOptions::new().with_verify_remote_etag(true);
+
+        let error = options
+            .validate::<MockError>()
+            .expect_err("etag verification without checksums should be invalid");
+
+        match error {
+            ResumableUploadError::InvalidOptions { message, .. } => {
+                assert_eq!(
+                    message,
+                    "verify_remote_etag requires part_checksum_algorithm"
                 );
             }
             other => panic!("unexpected error variant: {other}"),

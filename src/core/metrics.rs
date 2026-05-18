@@ -307,7 +307,10 @@ impl ClientMetrics {
             | Error::InvalidProxyConfig { .. }
             | Error::ProxyAuthorizationRequiresHttpProxy
             | Error::InvalidTimeoutConfig { .. }
+            | Error::InvalidClientNameConfig { .. }
+            | Error::InvalidConcurrencyLimitConfig { .. }
             | Error::InvalidRetryPolicy { .. }
+            | Error::InvalidRetryBudgetPolicy { .. }
             | Error::InvalidAdaptiveConcurrencyPolicy { .. }
             | Error::InvalidCircuitBreakerPolicy { .. }
             | Error::InvalidRateLimitPolicy { .. }

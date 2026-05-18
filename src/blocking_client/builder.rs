@@ -4,8 +4,10 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Uri};
 
-use crate::config::{ClientControlPolicies, ClientProfile, ClientTimeoutConfig};
-use crate::core::limiters::normalize_concurrency_limit;
+use crate::config::{
+    ClientCommonBuildConfig, ClientConcurrencyLimits, ClientControlPolicies, ClientProfile,
+    ClientTimeoutConfig,
+};
 use crate::error::Error;
 use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
@@ -475,21 +477,29 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the client name used in metrics and user-facing diagnostics.
+    /// Sets the client name used in metrics, diagnostics, and default `User-Agent`.
+    ///
+    /// The value must be non-empty and valid as an HTTP header value.
     pub fn client_name(mut self, client_name: impl Into<String>) -> Self {
         self.client_name = client_name.into();
         self
     }
 
     /// Caps the total number of in-flight requests.
+    ///
+    /// A zero limit is rejected by [`Self::build`]. Leave the option unset for
+    /// no global in-flight limit.
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = Some(normalize_concurrency_limit(max_in_flight));
+        self.max_in_flight = Some(max_in_flight);
         self
     }
 
     /// Caps the number of in-flight requests per host.
+    ///
+    /// A zero limit is rejected by [`Self::build`]. Leave the option unset for
+    /// no per-host in-flight limit.
     pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
-        self.max_in_flight_per_host = Some(normalize_concurrency_limit(max_in_flight_per_host));
+        self.max_in_flight_per_host = Some(max_in_flight_per_host);
         self
     }
 
@@ -580,21 +590,27 @@ impl ClientBuilder {
                 message: "blocking proxy_authorization(...) is unsupported for ureq transport; set credentials in http_proxy URI (e.g. http://user:pass@proxy:port)".to_owned(),
             });
         }
-        if let Some(rule) = self.invalid_no_proxy_rules.first() {
-            return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
-        }
-        ClientTimeoutConfig {
-            request_timeout: self.request_timeout,
-            total_timeout: self.total_timeout,
-            connect_timeout: self.connect_timeout,
-        }
-        .validate()?;
-        self.retry_policy.validate()?;
-        ClientControlPolicies {
-            circuit_breaker: self.circuit_breaker_policy,
-            adaptive_concurrency: self.adaptive_concurrency_policy,
-            global_rate_limit: self.global_rate_limit_policy,
-            per_host_rate_limit: self.per_host_rate_limit_policy,
+        let default_headers = ClientCommonBuildConfig {
+            invalid_no_proxy_rule: self.invalid_no_proxy_rules.first().map(String::as_str),
+            timeout_config: ClientTimeoutConfig {
+                request_timeout: self.request_timeout,
+                total_timeout: self.total_timeout,
+                connect_timeout: self.connect_timeout,
+            },
+            concurrency_limits: ClientConcurrencyLimits {
+                max_in_flight: self.max_in_flight,
+                max_in_flight_per_host: self.max_in_flight_per_host,
+            },
+            retry_policy: &self.retry_policy,
+            control_policies: ClientControlPolicies {
+                retry_budget: self.retry_budget_policy,
+                circuit_breaker: self.circuit_breaker_policy,
+                adaptive_concurrency: self.adaptive_concurrency_policy,
+                global_rate_limit: self.global_rate_limit_policy,
+                per_host_rate_limit: self.per_host_rate_limit_policy,
+            },
+            client_name: &self.client_name,
+            default_headers: self.default_headers,
         }
         .validate()?;
 
@@ -652,7 +668,7 @@ impl ClientBuilder {
 
         Ok(Client {
             base_url: self.base_url,
-            default_headers: self.default_headers,
+            default_headers,
             buffered_auto_accept_encoding: self.buffered_auto_accept_encoding,
             stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,

@@ -97,8 +97,14 @@ pub enum ErrorCode {
     InvalidProxyConfig,
     /// Timeout settings were invalid.
     InvalidTimeoutConfig,
+    /// The client name was invalid for diagnostics or HTTP header usage.
+    InvalidClientNameConfig,
+    /// Concurrency limit settings were invalid.
+    InvalidConcurrencyLimitConfig,
     /// Retry settings were invalid.
     InvalidRetryPolicy,
+    /// Retry budget settings were invalid.
+    InvalidRetryBudgetPolicy,
     /// Adaptive concurrency settings were invalid.
     InvalidAdaptiveConcurrencyPolicy,
     /// Circuit breaker settings were invalid.
@@ -165,7 +171,10 @@ impl ErrorCode {
         Self::InvalidNoProxyRule,
         Self::InvalidProxyConfig,
         Self::InvalidTimeoutConfig,
+        Self::InvalidClientNameConfig,
+        Self::InvalidConcurrencyLimitConfig,
         Self::InvalidRetryPolicy,
+        Self::InvalidRetryBudgetPolicy,
         Self::InvalidAdaptiveConcurrencyPolicy,
         Self::InvalidCircuitBreakerPolicy,
         Self::InvalidRateLimitPolicy,
@@ -209,7 +218,10 @@ impl ErrorCode {
             Self::InvalidNoProxyRule => "invalid_no_proxy_rule",
             Self::InvalidProxyConfig => "invalid_proxy_config",
             Self::InvalidTimeoutConfig => "invalid_timeout_config",
+            Self::InvalidClientNameConfig => "invalid_client_name_config",
+            Self::InvalidConcurrencyLimitConfig => "invalid_concurrency_limit_config",
             Self::InvalidRetryPolicy => "invalid_retry_policy",
+            Self::InvalidRetryBudgetPolicy => "invalid_retry_budget_policy",
             Self::InvalidAdaptiveConcurrencyPolicy => "invalid_adaptive_concurrency_policy",
             Self::InvalidCircuitBreakerPolicy => "invalid_circuit_breaker_policy",
             Self::InvalidRateLimitPolicy => "invalid_rate_limit_policy",
@@ -284,6 +296,26 @@ pub enum Error {
         /// Validation failure explanation.
         message: &'static str,
     },
+    /// The client name was invalid for diagnostics or HTTP header usage.
+    #[error("invalid client name configuration (len={client_name_len}): {message}")]
+    InvalidClientNameConfig {
+        /// Configured client name length.
+        client_name_len: usize,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
+    /// Concurrency limit settings were invalid.
+    #[error(
+        "invalid concurrency limit configuration (max_in_flight={max_in_flight:?}, max_in_flight_per_host={max_in_flight_per_host:?}): {message}"
+    )]
+    InvalidConcurrencyLimitConfig {
+        /// Configured global in-flight request limit.
+        max_in_flight: Option<usize>,
+        /// Configured per-host in-flight request limit.
+        max_in_flight_per_host: Option<usize>,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
     /// Retry settings were invalid.
     #[error(
         "invalid retry policy (max_attempts={max_attempts}, base_backoff_ms={base_backoff_ms}, max_backoff_ms={max_backoff_ms}, jitter_ratio={jitter_ratio}): {message}"
@@ -297,6 +329,20 @@ pub enum Error {
         max_backoff_ms: u128,
         /// Configured jitter ratio.
         jitter_ratio: f64,
+        /// Validation failure explanation.
+        message: &'static str,
+    },
+    /// Retry budget settings were invalid.
+    #[error(
+        "invalid retry budget policy (window_ms={window_ms}, retry_ratio={retry_ratio}, min_retries_per_window={min_retries_per_window}): {message}"
+    )]
+    InvalidRetryBudgetPolicy {
+        /// Configured accounting window in milliseconds.
+        window_ms: u128,
+        /// Configured retry allowance ratio.
+        retry_ratio: f64,
+        /// Configured minimum retries per accounting window.
+        min_retries_per_window: usize,
         /// Validation failure explanation.
         message: &'static str,
     },
@@ -604,7 +650,10 @@ impl Error {
                 ErrorCode::InvalidProxyConfig
             }
             Self::InvalidTimeoutConfig { .. } => ErrorCode::InvalidTimeoutConfig,
+            Self::InvalidClientNameConfig { .. } => ErrorCode::InvalidClientNameConfig,
+            Self::InvalidConcurrencyLimitConfig { .. } => ErrorCode::InvalidConcurrencyLimitConfig,
             Self::InvalidRetryPolicy { .. } => ErrorCode::InvalidRetryPolicy,
+            Self::InvalidRetryBudgetPolicy { .. } => ErrorCode::InvalidRetryBudgetPolicy,
             Self::InvalidAdaptiveConcurrencyPolicy { .. } => {
                 ErrorCode::InvalidAdaptiveConcurrencyPolicy
             }

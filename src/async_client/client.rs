@@ -34,17 +34,17 @@ use crate::body::{
     read_all_body_limited,
 };
 use crate::config::{
-    ClientControlPolicies, ClientProfile, ClientTimeoutConfig, RequestTimeoutConfig,
+    ClientCommonBuildConfig, ClientConcurrencyLimits, ClientControlPolicies, ClientProfile,
+    ClientTimeoutConfig,
 };
 use crate::content_encoding::should_decode_content_encoded_body;
-use crate::core::limiters::normalize_concurrency_limit;
-use crate::core::request_builder::RequestExecutionOptions;
+use crate::core::request_builder::{RequestExecutionDefaults, RequestExecutionOptions};
 use crate::error::{Error, TransportErrorKind, transport_error};
 use crate::execution::{
     AttemptGuards, BodyReadFailure, BodyReadOutcome, BodyReadRetryContext, RequestCompletion,
-    RequestExecutionState, RequestExecutionStateInput, ResponseMode, ResponseProgress,
-    RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan, select_base_url,
-    server_throttle_delay,
+    RequestExecutionPreparation, RequestExecutionState, RequestExecutionStateInput, ResponseMode,
+    ResponseProgress, RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan,
+    prepare_retry_request_input, server_throttle_delay,
 };
 use crate::extensions::{
     BackoffSource, BodyCodec, Clock, EndpointSelector, OtelPathNormalizer, PolicyBackoffSource,
@@ -94,9 +94,9 @@ use crate::tls::{
 };
 use crate::util::{
     bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
-    duration_millis_u64_saturating, ensure_accept_encoding_async, lock_unpoisoned, merge_headers,
-    parse_header_name, parse_header_value, redact_uri_for_logs, resolve_uri,
-    total_timeout_deadline, validate_base_url, validate_http_proxy_uri,
+    duration_millis_u64_saturating, ensure_accept_encoding_async, lock_unpoisoned,
+    parse_header_name, parse_header_value, redact_uri_for_logs, total_timeout_deadline,
+    validate_base_url, validate_http_proxy_uri,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1549,21 +1549,29 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the client name used in metrics and user-facing diagnostics.
+    /// Sets the client name used in metrics, diagnostics, and default `User-Agent`.
+    ///
+    /// The value must be non-empty and valid as an HTTP header value.
     pub fn client_name(mut self, client_name: impl Into<String>) -> Self {
         self.client_name = client_name.into();
         self
     }
 
     /// Caps the total number of in-flight requests.
+    ///
+    /// A zero limit is rejected by [`Self::build`]. Leave the option unset for
+    /// no global in-flight limit.
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = Some(normalize_concurrency_limit(max_in_flight));
+        self.max_in_flight = Some(max_in_flight);
         self
     }
 
     /// Caps the number of in-flight requests per host.
+    ///
+    /// A zero limit is rejected by [`Self::build`]. Leave the option unset for
+    /// no per-host in-flight limit.
     pub fn max_in_flight_per_host(mut self, max_in_flight_per_host: usize) -> Self {
-        self.max_in_flight_per_host = Some(normalize_concurrency_limit(max_in_flight_per_host));
+        self.max_in_flight_per_host = Some(max_in_flight_per_host);
         self
     }
 
@@ -1657,21 +1665,27 @@ impl ClientBuilder {
         if self.proxy_authorization.is_some() && self.http_proxy.is_none() {
             return Err(Error::ProxyAuthorizationRequiresHttpProxy);
         }
-        if let Some(rule) = self.invalid_no_proxy_rules.first() {
-            return Err(Error::InvalidNoProxyRule { rule: rule.clone() });
-        }
-        ClientTimeoutConfig {
-            request_timeout: self.request_timeout,
-            total_timeout: self.total_timeout,
-            connect_timeout: self.connect_timeout,
-        }
-        .validate()?;
-        self.retry_policy.validate()?;
-        ClientControlPolicies {
-            circuit_breaker: self.circuit_breaker_policy,
-            adaptive_concurrency: self.adaptive_concurrency_policy,
-            global_rate_limit: self.global_rate_limit_policy,
-            per_host_rate_limit: self.per_host_rate_limit_policy,
+        let default_headers = ClientCommonBuildConfig {
+            invalid_no_proxy_rule: self.invalid_no_proxy_rules.first().map(String::as_str),
+            timeout_config: ClientTimeoutConfig {
+                request_timeout: self.request_timeout,
+                total_timeout: self.total_timeout,
+                connect_timeout: self.connect_timeout,
+            },
+            concurrency_limits: ClientConcurrencyLimits {
+                max_in_flight: self.max_in_flight,
+                max_in_flight_per_host: self.max_in_flight_per_host,
+            },
+            retry_policy: &self.retry_policy,
+            control_policies: ClientControlPolicies {
+                retry_budget: self.retry_budget_policy,
+                circuit_breaker: self.circuit_breaker_policy,
+                adaptive_concurrency: self.adaptive_concurrency_policy,
+                global_rate_limit: self.global_rate_limit_policy,
+                per_host_rate_limit: self.per_host_rate_limit_policy,
+            },
+            client_name: &self.client_name,
+            default_headers: self.default_headers,
         }
         .validate()?;
 
@@ -1701,7 +1715,7 @@ impl ClientBuilder {
 
         Ok(Client {
             base_url: self.base_url,
-            default_headers: self.default_headers,
+            default_headers,
             buffered_auto_accept_encoding: self.buffered_auto_accept_encoding,
             stream_auto_accept_encoding: self.stream_auto_accept_encoding,
             request_timeout: self.request_timeout,
@@ -2346,32 +2360,41 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<Response, Error> {
-        let base_url = select_base_url(
-            self.endpoint_selector.as_ref(),
-            &method,
-            &path,
-            &self.base_url,
+        let request_input = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: self.endpoint_selector.as_ref(),
+                configured_base_url: &self.base_url,
+                method,
+                path,
+                default_headers: &self.default_headers,
+                headers,
+                body,
+                execution_options,
+                defaults: RequestExecutionDefaults {
+                    request_timeout: self.request_timeout,
+                    total_timeout: self.total_timeout,
+                    retry_policy: &self.retry_policy,
+                    max_response_body_bytes: self.max_response_body_bytes,
+                    redirect_policy: self.redirect_policy,
+                    status_policy: self.default_status_policy,
+                    auto_accept_encoding: self.buffered_auto_accept_encoding,
+                },
+            },
+            RequestBody::empty,
+            ensure_accept_encoding_async,
         )?;
-        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
-        let redacted_uri_text = redact_uri_for_logs(&uri_text);
-        let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        let auto_accept_encoding = execution_options
-            .auto_accept_encoding
-            .unwrap_or(self.buffered_auto_accept_encoding);
-        if auto_accept_encoding {
-            ensure_accept_encoding_async(&method, &mut merged_headers);
-        }
-        let body = body.unwrap_or_else(RequestBody::empty);
+        let redacted_uri_text = request_input.redacted_uri_text.clone();
+        let method = request_input.method.clone();
+        let total_timeout = request_input.execution_options.total_timeout;
         let otel_span = self
             .metrics
             .start_otel_request_span(&method, &redacted_uri_text, false);
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
         let _global_permit = match self
             .acquire_global_request_permit(
-                effective_total_timeout,
+                total_timeout,
                 request_started_at,
                 &method,
                 &redacted_uri_text,
@@ -2389,17 +2412,7 @@ impl Client {
         };
 
         let result = self
-            .send_request_with_retry(
-                RetryRequestInput {
-                    method,
-                    uri,
-                    redacted_uri_text,
-                    merged_headers,
-                    body,
-                    execution_options,
-                },
-                request_started_at,
-            )
+            .send_request_with_retry(request_input, request_started_at)
             .await;
         self.metrics
             .record_request_completed(&result, request_started_at.elapsed());
@@ -2422,22 +2435,32 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<ResponseStream, Error> {
-        let base_url = select_base_url(
-            self.endpoint_selector.as_ref(),
-            &method,
-            &path,
-            &self.base_url,
+        let request_input = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: self.endpoint_selector.as_ref(),
+                configured_base_url: &self.base_url,
+                method,
+                path,
+                default_headers: &self.default_headers,
+                headers,
+                body,
+                execution_options,
+                defaults: RequestExecutionDefaults {
+                    request_timeout: self.request_timeout,
+                    total_timeout: self.total_timeout,
+                    retry_policy: &self.retry_policy,
+                    max_response_body_bytes: self.max_response_body_bytes,
+                    redirect_policy: self.redirect_policy,
+                    status_policy: self.default_status_policy,
+                    auto_accept_encoding: self.stream_auto_accept_encoding,
+                },
+            },
+            RequestBody::empty,
+            ensure_accept_encoding_async,
         )?;
-        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
-        let redacted_uri_text = redact_uri_for_logs(&uri_text);
-        let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        let auto_accept_encoding = execution_options
-            .auto_accept_encoding
-            .unwrap_or(self.stream_auto_accept_encoding);
-        if auto_accept_encoding {
-            ensure_accept_encoding_async(&method, &mut merged_headers);
-        }
-        let body = body.unwrap_or_else(RequestBody::empty);
+        let redacted_uri_text = request_input.redacted_uri_text.clone();
+        let method = request_input.method.clone();
+        let total_timeout = request_input.execution_options.total_timeout;
         let mut otel_span = Some(self.metrics.start_otel_request_span(
             &method,
             &redacted_uri_text,
@@ -2446,10 +2469,9 @@ impl Client {
         self.metrics.record_request_started();
         let in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
         let global_permit = match self
             .acquire_global_request_permit(
-                effective_total_timeout,
+                total_timeout,
                 request_started_at,
                 &method,
                 &redacted_uri_text,
@@ -2472,14 +2494,7 @@ impl Client {
 
         match self
             .send_request_with_retry_mode(
-                RetryRequestInput {
-                    method,
-                    uri,
-                    redacted_uri_text,
-                    merged_headers,
-                    body,
-                    execution_options,
-                },
+                request_input,
                 ResponseMode::Stream,
                 Some(global_permit),
                 request_started_at,
@@ -2558,33 +2573,17 @@ impl Client {
             body,
             execution_options,
         } = input;
-        let timeout_value = execution_options
-            .request_timeout
-            .unwrap_or(self.request_timeout);
-        let total_timeout = execution_options.total_timeout.or(self.total_timeout);
-        RequestTimeoutConfig {
-            request_timeout: timeout_value,
-            total_timeout,
-        }
-        .validate()?;
-        let max_response_body_bytes = execution_options
-            .max_response_body_bytes
-            .unwrap_or(self.max_response_body_bytes);
+        let timeout_value = execution_options.request_timeout;
+        let total_timeout = execution_options.total_timeout;
+        let max_response_body_bytes = execution_options.max_response_body_bytes;
         let (mut buffered_body, mut streaming_body) = match body {
             RequestBody::Buffered(body) => (Some(body), None),
             RequestBody::Streaming(body) => (None, Some(body)),
         };
         let body_replayable = buffered_body.is_some();
-        let retry_policy = execution_options
-            .retry_policy
-            .unwrap_or_else(|| self.retry_policy.clone());
-        retry_policy.validate()?;
-        let redirect_policy = execution_options
-            .redirect_policy
-            .unwrap_or(self.redirect_policy);
-        let status_policy = execution_options
-            .status_policy
-            .unwrap_or(self.default_status_policy);
+        let retry_policy = execution_options.retry_policy;
+        let redirect_policy = execution_options.redirect_policy;
+        let status_policy = execution_options.status_policy;
         let mut execution = RequestExecutionState::new(
             RequestExecutionStateInput {
                 method,

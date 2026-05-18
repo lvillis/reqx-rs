@@ -33,14 +33,18 @@ impl RetryBudgetPolicy {
     }
 
     /// Sets the rolling window used to account for successes and retries.
+    ///
+    /// A zero duration is rejected by client builders.
     pub fn window(mut self, window: Duration) -> Self {
-        self.window = window.max(Duration::from_millis(1));
+        self.window = window;
         self
     }
 
     /// Sets the retry allowance as a fraction of recent successful requests.
+    ///
+    /// Values must be finite and in the inclusive range `0.0..=1.0`.
     pub fn retry_ratio(mut self, retry_ratio: f64) -> Self {
-        self.retry_ratio = clamp_f64_or_fallback(retry_ratio, 0.0, 1.0, 0.0);
+        self.retry_ratio = retry_ratio;
         self
     }
 
@@ -60,6 +64,25 @@ impl RetryBudgetPolicy {
 
     pub(crate) const fn configured_min_retries_per_window(self) -> usize {
         self.min_retries_per_window
+    }
+
+    pub(crate) fn validate(self) -> crate::Result<()> {
+        if self.window.is_zero() {
+            return Err(self.invalid_policy("window must be greater than zero"));
+        }
+        if !self.retry_ratio.is_finite() || !(0.0..=1.0).contains(&self.retry_ratio) {
+            return Err(self.invalid_policy("retry_ratio must be finite and between 0.0 and 1.0"));
+        }
+        Ok(())
+    }
+
+    fn invalid_policy(self, message: &'static str) -> Error {
+        Error::InvalidRetryBudgetPolicy {
+            window_ms: self.window.as_millis(),
+            retry_ratio: self.retry_ratio,
+            min_retries_per_window: self.min_retries_per_window,
+            message,
+        }
     }
 
     fn normalize_for_runtime(self) -> Self {
@@ -533,9 +556,10 @@ impl AdaptiveConcurrencyPolicy {
     }
 
     /// Sets the multiplicative backoff applied after high-latency samples.
+    ///
+    /// Values must be finite and in the range `0.0..1.0`.
     pub fn decrease_ratio(mut self, decrease_ratio: f64) -> Self {
-        self.decrease_ratio =
-            clamp_f64_or_fallback(decrease_ratio, 0.1, 0.99, Self::standard().decrease_ratio);
+        self.decrease_ratio = decrease_ratio;
         self
     }
 
@@ -584,6 +608,14 @@ impl AdaptiveConcurrencyPolicy {
                 initial_limit: self.initial_limit,
                 max_limit: self.max_limit,
                 message: "high_latency_threshold must be >= 1ms",
+            });
+        }
+        if !self.decrease_ratio.is_finite() || !(0.0..1.0).contains(&self.decrease_ratio) {
+            return Err(Error::InvalidAdaptiveConcurrencyPolicy {
+                min_limit: self.min_limit,
+                initial_limit: self.initial_limit,
+                max_limit: self.max_limit,
+                message: "decrease_ratio must be finite and between 0.0 and 1.0",
             });
         }
         if self.min_limit > self.max_limit {
@@ -648,12 +680,13 @@ impl AdaptiveConcurrencyPolicy {
             initial_limit,
             max_limit,
             increase_step: normalize_usize_at_least_one(self.increase_step),
-            decrease_ratio: clamp_f64_or_fallback(
-                self.decrease_ratio,
-                0.1,
-                0.99,
-                Self::standard().decrease_ratio,
-            ),
+            decrease_ratio: if self.decrease_ratio.is_finite()
+                && (0.0..1.0).contains(&self.decrease_ratio)
+            {
+                self.decrease_ratio
+            } else {
+                Self::standard().decrease_ratio
+            },
             high_latency_threshold: self.high_latency_threshold.max(Duration::from_millis(1)),
         }
     }
@@ -729,6 +762,7 @@ mod tests {
         AdaptiveConcurrencyOutcome, AdaptiveConcurrencyPolicy, AdaptiveConcurrencyState,
         CircuitBreaker, CircuitBreakerPolicy, RetryBudget, RetryBudgetPolicy,
     };
+    use crate::error::Error;
     use crate::extensions::Clock;
 
     #[derive(Debug)]
@@ -807,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_zero_window_is_clamped() {
+    fn retry_budget_runtime_normalizes_zero_window_defensively() {
         let clock = Arc::new(TestClock::default());
         let budget = RetryBudget::new(
             RetryBudgetPolicy::standard()
@@ -825,10 +859,15 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_nan_retry_ratio_is_normalized_to_zero() {
+    fn retry_budget_validate_rejects_nan_retry_ratio() {
         let policy = RetryBudgetPolicy::standard().retry_ratio(f64::NAN);
 
-        assert_eq!(policy.configured_retry_ratio(), 0.0);
+        match policy.validate() {
+            Err(Error::InvalidRetryBudgetPolicy { retry_ratio, .. }) => {
+                assert!(retry_ratio.is_nan());
+            }
+            other => panic!("unexpected validation result: {other:?}"),
+        }
     }
 
     #[test]
@@ -1071,13 +1110,33 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_concurrency_nan_decrease_ratio_uses_standard_default() {
+    fn adaptive_concurrency_validate_rejects_nan_decrease_ratio() {
         let policy = AdaptiveConcurrencyPolicy::standard().decrease_ratio(f64::NAN);
 
-        assert_eq!(
-            policy.configured_decrease_ratio(),
-            AdaptiveConcurrencyPolicy::standard().configured_decrease_ratio()
-        );
+        match policy.validate() {
+            Err(Error::InvalidAdaptiveConcurrencyPolicy { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "decrease_ratio must be finite and between 0.0 and 1.0"
+                );
+            }
+            other => panic!("unexpected validation result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adaptive_concurrency_runtime_preserves_valid_small_decrease_ratio() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(1)
+            .initial_limit(20)
+            .max_limit(20)
+            .decrease_ratio(0.05);
+        let mut state = AdaptiveConcurrencyState::new(policy);
+
+        assert!(state.try_acquire());
+        state.release_and_record(policy, AdaptiveConcurrencyOutcome::Failure, Duration::ZERO);
+
+        assert_eq!(state.current_limit, 1);
     }
 
     #[test]

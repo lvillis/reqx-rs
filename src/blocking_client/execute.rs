@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 
-use crate::config::RequestTimeoutConfig;
 use crate::content_encoding::should_decode_content_encoded_body;
+use crate::core::request_builder::{RequestExecutionDefaults, RequestExecutionOptions};
 use crate::error::{Error, TimeoutPhase, TransportErrorKind, transport_error};
 use crate::execution::{
     AttemptGuards, BodyReadFailure, BodyReadOutcome, BodyReadRetryContext, RequestCompletion,
-    RequestExecutionState, RequestExecutionStateInput, ResponseMode, ResponseProgress,
-    RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan, select_base_url,
-    server_throttle_delay,
+    RequestExecutionPreparation, RequestExecutionState, RequestExecutionStateInput, ResponseMode,
+    ResponseProgress, RetryAttemptState, RetryRequestInput, RetrySchedule, TransportFailurePlan,
+    prepare_retry_request_input, server_throttle_delay,
 };
 use crate::metrics::MetricsSnapshot;
 use crate::policy::{RequestContext, StatusPolicy};
@@ -23,7 +23,7 @@ use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
-    is_timeout_io_error, merge_headers, redact_uri_for_logs, resolve_uri, total_timeout_deadline,
+    is_timeout_io_error, redact_uri_for_logs, total_timeout_deadline,
 };
 
 use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
@@ -31,10 +31,7 @@ use super::transport::{
     ReadBodyError, classify_ureq_transport_error, is_proxy_bypassed, read_all_body_limited,
     remove_content_encoding_headers,
 };
-use super::{
-    AdaptiveConcurrencyPermit, Client, ClientBuilder, RequestBody, RequestBuilder,
-    RequestExecutionOptions,
-};
+use super::{AdaptiveConcurrencyPermit, Client, ClientBuilder, RequestBody, RequestBuilder};
 
 impl crate::execution::AttemptOutcome for AdaptiveConcurrencyPermit {
     fn mark_success(self) {
@@ -695,23 +692,32 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<Response, Error> {
-        let base_url = select_base_url(
-            self.endpoint_selector.as_ref(),
-            &method,
-            &path,
-            &self.base_url,
+        let request_input = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: self.endpoint_selector.as_ref(),
+                configured_base_url: &self.base_url,
+                method,
+                path,
+                default_headers: &self.default_headers,
+                headers,
+                body,
+                execution_options,
+                defaults: RequestExecutionDefaults {
+                    request_timeout: self.request_timeout,
+                    total_timeout: self.total_timeout,
+                    retry_policy: &self.retry_policy,
+                    max_response_body_bytes: self.max_response_body_bytes,
+                    redirect_policy: self.redirect_policy,
+                    status_policy: self.default_status_policy,
+                    auto_accept_encoding: self.buffered_auto_accept_encoding,
+                },
+            },
+            RequestBody::empty,
+            ensure_accept_encoding_blocking,
         )?;
-        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
-        let redacted_uri_text = redact_uri_for_logs(&uri_text);
-        let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        let auto_accept_encoding = execution_options
-            .auto_accept_encoding
-            .unwrap_or(self.buffered_auto_accept_encoding);
-        if auto_accept_encoding {
-            ensure_accept_encoding_blocking(&method, &mut merged_headers);
-        }
-
-        let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
+        let redacted_uri_text = request_input.redacted_uri_text.clone();
+        let method = request_input.method.clone();
+        let total_timeout = request_input.execution_options.total_timeout;
         let otel_span = self
             .metrics
             .start_otel_request_span(&method, &redacted_uri_text, false);
@@ -719,9 +725,8 @@ impl Client {
         self.metrics.record_request_started();
         let _in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
         let _global_permit = match self.acquire_global_request_permit(
-            effective_total_timeout,
+            total_timeout,
             request_started_at,
             &method,
             &redacted_uri_text,
@@ -736,17 +741,7 @@ impl Client {
             }
         };
 
-        let result = self.send_request_with_retry(
-            RetryRequestInput {
-                method,
-                uri,
-                redacted_uri_text,
-                merged_headers,
-                body,
-                execution_options,
-            },
-            request_started_at,
-        );
+        let result = self.send_request_with_retry(request_input, request_started_at);
 
         self.metrics
             .record_request_completed(&result, request_started_at.elapsed());
@@ -769,23 +764,32 @@ impl Client {
         body: Option<RequestBody>,
         execution_options: RequestExecutionOptions,
     ) -> Result<BlockingResponseStream, Error> {
-        let base_url = select_base_url(
-            self.endpoint_selector.as_ref(),
-            &method,
-            &path,
-            &self.base_url,
+        let request_input = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: self.endpoint_selector.as_ref(),
+                configured_base_url: &self.base_url,
+                method,
+                path,
+                default_headers: &self.default_headers,
+                headers,
+                body,
+                execution_options,
+                defaults: RequestExecutionDefaults {
+                    request_timeout: self.request_timeout,
+                    total_timeout: self.total_timeout,
+                    retry_policy: &self.retry_policy,
+                    max_response_body_bytes: self.max_response_body_bytes,
+                    redirect_policy: self.redirect_policy,
+                    status_policy: self.default_status_policy,
+                    auto_accept_encoding: self.stream_auto_accept_encoding,
+                },
+            },
+            RequestBody::empty,
+            ensure_accept_encoding_blocking,
         )?;
-        let (uri_text, uri) = resolve_uri(&base_url, &path)?;
-        let redacted_uri_text = redact_uri_for_logs(&uri_text);
-        let mut merged_headers = merge_headers(&self.default_headers, &headers);
-        let auto_accept_encoding = execution_options
-            .auto_accept_encoding
-            .unwrap_or(self.stream_auto_accept_encoding);
-        if auto_accept_encoding {
-            ensure_accept_encoding_blocking(&method, &mut merged_headers);
-        }
-
-        let body = body.unwrap_or_else(|| RequestBody::Buffered(Bytes::new()));
+        let redacted_uri_text = request_input.redacted_uri_text.clone();
+        let method = request_input.method.clone();
+        let total_timeout = request_input.execution_options.total_timeout;
         let mut otel_span = Some(self.metrics.start_otel_request_span(
             &method,
             &redacted_uri_text,
@@ -795,9 +799,8 @@ impl Client {
         self.metrics.record_request_started();
         let in_flight = self.metrics.enter_in_flight();
         let request_started_at = Instant::now();
-        let effective_total_timeout = execution_options.total_timeout.or(self.total_timeout);
         let global_permit = match self.acquire_global_request_permit(
-            effective_total_timeout,
+            total_timeout,
             request_started_at,
             &method,
             &redacted_uri_text,
@@ -817,14 +820,7 @@ impl Client {
         let expected_redacted_uri = redacted_uri_text.clone();
 
         match self.send_request_with_retry_mode(
-            RetryRequestInput {
-                method,
-                uri,
-                redacted_uri_text,
-                merged_headers,
-                body,
-                execution_options,
-            },
+            request_input,
             ResponseMode::Stream,
             Some(global_permit),
             request_started_at,
@@ -903,18 +899,9 @@ impl Client {
             body,
             execution_options,
         } = input;
-        let timeout_value = execution_options
-            .request_timeout
-            .unwrap_or(self.request_timeout);
-        let total_timeout = execution_options.total_timeout.or(self.total_timeout);
-        RequestTimeoutConfig {
-            request_timeout: timeout_value,
-            total_timeout,
-        }
-        .validate()?;
-        let max_response_body_bytes = execution_options
-            .max_response_body_bytes
-            .unwrap_or(self.max_response_body_bytes);
+        let timeout_value = execution_options.request_timeout;
+        let total_timeout = execution_options.total_timeout;
+        let max_response_body_bytes = execution_options.max_response_body_bytes;
 
         let (mut buffered_body, mut reader_body) = match body {
             RequestBody::Buffered(body) => (Some(body), None),
@@ -922,16 +909,9 @@ impl Client {
         };
 
         let body_replayable = buffered_body.is_some();
-        let retry_policy = execution_options
-            .retry_policy
-            .unwrap_or_else(|| self.retry_policy.clone());
-        retry_policy.validate()?;
-        let redirect_policy = execution_options
-            .redirect_policy
-            .unwrap_or(self.redirect_policy);
-        let status_policy = execution_options
-            .status_policy
-            .unwrap_or(self.default_status_policy);
+        let retry_policy = execution_options.retry_policy;
+        let redirect_policy = execution_options.redirect_policy;
+        let status_policy = execution_options.status_policy;
         let mut execution = RequestExecutionState::new(
             RequestExecutionStateInput {
                 method,

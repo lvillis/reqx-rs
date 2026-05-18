@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 
-use crate::core::request_builder::RequestExecutionOptions;
+use crate::core::request_builder::{
+    EffectiveRequestExecutionOptions, RequestExecutionDefaults, RequestExecutionOptions,
+};
 use crate::error::{Error, TimeoutPhase, TransportErrorKind};
 use crate::extensions::{BackoffSource, Clock, EndpointSelector};
 use crate::policy::{RedirectPolicy, RequestContext, StatusPolicy};
@@ -15,11 +17,11 @@ use crate::resilience::RetryBudget;
 use crate::response::{StreamLifecycle, StreamOutcomeHooks};
 use crate::retry::{RetryDecision, RetryEligibility, RetryPolicy, RetryReason};
 use crate::util::{
-    bounded_retry_delay, deadline_exceeded_error, is_redirect_status, parse_retry_after,
-    parse_retry_after_capped, phase_timeout, rate_limit_bucket_key, redact_uri_for_logs,
-    redirect_location, redirect_method, resolve_redirect_uri, same_origin,
-    sanitize_headers_for_redirect, total_timeout_deadline, total_timeout_expired, truncate_body,
-    validate_base_url,
+    bounded_retry_delay, deadline_exceeded_error, is_redirect_status, merge_headers,
+    parse_retry_after, parse_retry_after_capped, phase_timeout, rate_limit_bucket_key,
+    redact_uri_for_logs, redirect_location, redirect_method, resolve_redirect_uri, resolve_uri,
+    same_origin, sanitize_headers_for_redirect, total_timeout_deadline, total_timeout_expired,
+    truncate_body, validate_base_url,
 };
 
 pub(crate) struct RetryRequestInput<Body> {
@@ -28,7 +30,55 @@ pub(crate) struct RetryRequestInput<Body> {
     pub(crate) redacted_uri_text: String,
     pub(crate) merged_headers: HeaderMap,
     pub(crate) body: Body,
+    pub(crate) execution_options: EffectiveRequestExecutionOptions,
+}
+
+pub(crate) struct RequestExecutionPreparation<'a, Body> {
+    pub(crate) endpoint_selector: &'a dyn EndpointSelector,
+    pub(crate) configured_base_url: &'a str,
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) default_headers: &'a HeaderMap,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Option<Body>,
     pub(crate) execution_options: RequestExecutionOptions,
+    pub(crate) defaults: RequestExecutionDefaults<'a>,
+}
+
+pub(crate) fn prepare_retry_request_input<Body>(
+    input: RequestExecutionPreparation<'_, Body>,
+    default_body: impl FnOnce() -> Body,
+    ensure_auto_accept_encoding: impl FnOnce(&Method, &mut HeaderMap),
+) -> Result<RetryRequestInput<Body>, Error> {
+    let RequestExecutionPreparation {
+        endpoint_selector,
+        configured_base_url,
+        method,
+        path,
+        default_headers,
+        headers,
+        body,
+        execution_options,
+        defaults,
+    } = input;
+
+    let base_url = select_base_url(endpoint_selector, &method, &path, configured_base_url)?;
+    let (uri_text, uri) = resolve_uri(&base_url, &path)?;
+    let redacted_uri_text = redact_uri_for_logs(&uri_text);
+    let execution_options = execution_options.resolve(defaults)?;
+    let mut merged_headers = merge_headers(default_headers, &headers);
+    if execution_options.auto_accept_encoding {
+        ensure_auto_accept_encoding(&method, &mut merged_headers);
+    }
+
+    Ok(RetryRequestInput {
+        method,
+        uri,
+        redacted_uri_text,
+        merged_headers,
+        body: body.unwrap_or_else(default_body),
+        execution_options,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1355,16 +1405,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use http::HeaderMap;
-    use http::header::{HeaderName, HeaderValue};
+    use http::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, USER_AGENT};
 
     use super::{
-        AttemptDisposition, BodyReadFailure, RedirectAction, RedirectInput, RequestExecutionState,
-        RequestExecutionStateInput, ResponseProgress, RetryBudgetDisposition, RetrySchedule,
-        RetryScheduleInput, TransportFailurePlan, next_redirect_action, prepare_retry_schedule,
-        server_throttle_delay, status_retry_delay, transport_retry_decision,
+        AttemptDisposition, BodyReadFailure, RedirectAction, RedirectInput,
+        RequestExecutionPreparation, RequestExecutionState, RequestExecutionStateInput,
+        ResponseProgress, RetryBudgetDisposition, RetrySchedule, RetryScheduleInput,
+        TransportFailurePlan, next_redirect_action, prepare_retry_request_input,
+        prepare_retry_schedule, server_throttle_delay, status_retry_delay,
+        transport_retry_decision,
     };
+    use crate::core::request_builder::{RequestExecutionDefaults, RequestExecutionOptions};
     use crate::error::{Error, TransportErrorKind, transport_error};
-    use crate::extensions::{BackoffSource, SystemClock};
+    use crate::extensions::{BackoffSource, PrimaryEndpointSelector, SystemClock};
     use crate::policy::{RedirectPolicy, StatusPolicy};
     use crate::retry::{PermissiveRetryEligibility, RetryPolicy, RetryReason};
 
@@ -1411,6 +1464,134 @@ mod tests {
         fn backoff_for_retry(&self, _retry_policy: &RetryPolicy, _attempt: usize) -> Duration {
             self.0
         }
+    }
+
+    fn empty_execution_options() -> RequestExecutionOptions {
+        RequestExecutionOptions {
+            request_timeout: None,
+            total_timeout: None,
+            retry_policy: None,
+            max_response_body_bytes: None,
+            redirect_policy: None,
+            status_policy: None,
+            auto_accept_encoding: None,
+        }
+    }
+
+    fn execution_defaults<'a>(
+        retry_policy: &'a RetryPolicy,
+        auto_accept_encoding: bool,
+    ) -> RequestExecutionDefaults<'a> {
+        RequestExecutionDefaults {
+            request_timeout: Duration::from_secs(5),
+            total_timeout: Some(Duration::from_secs(20)),
+            retry_policy,
+            max_response_body_bytes: 4096,
+            redirect_policy: RedirectPolicy::limited(2),
+            status_policy: StatusPolicy::Error,
+            auto_accept_encoding,
+        }
+    }
+
+    #[test]
+    fn prepare_retry_request_input_centralizes_common_request_setup() {
+        let retry_policy = RetryPolicy::disabled();
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(USER_AGENT, HeaderValue::from_static("reqx-test"));
+        default_headers.insert(
+            HeaderName::from_static("x-shared"),
+            HeaderValue::from_static("default"),
+        );
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            HeaderName::from_static("x-shared"),
+            HeaderValue::from_static("request"),
+        );
+        request_headers.insert(
+            HeaderName::from_static("x-request"),
+            HeaderValue::from_static("1"),
+        );
+
+        let prepared = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: &PrimaryEndpointSelector,
+                configured_base_url: "https://api.example.com/v1",
+                method: http::Method::GET,
+                path: "items?q=secret".to_owned(),
+                default_headers: &default_headers,
+                headers: request_headers,
+                body: None::<&'static str>,
+                execution_options: empty_execution_options(),
+                defaults: execution_defaults(&retry_policy, true),
+            },
+            || "empty",
+            |method, headers| {
+                assert_eq!(method, http::Method::GET);
+                headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("test-encoding"));
+            },
+        )
+        .expect("request preparation should succeed");
+
+        assert_eq!(prepared.method, http::Method::GET);
+        assert_eq!(
+            prepared.uri.to_string(),
+            "https://api.example.com/v1/items?q=secret"
+        );
+        assert_eq!(
+            prepared.redacted_uri_text,
+            "https://api.example.com/v1/items"
+        );
+        assert_eq!(prepared.body, "empty");
+        assert_eq!(
+            prepared.merged_headers.get(USER_AGENT),
+            Some(&HeaderValue::from_static("reqx-test"))
+        );
+        assert_eq!(
+            prepared.merged_headers.get("x-shared"),
+            Some(&HeaderValue::from_static("request"))
+        );
+        assert_eq!(
+            prepared.merged_headers.get("x-request"),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_eq!(
+            prepared.merged_headers.get(ACCEPT_ENCODING),
+            Some(&HeaderValue::from_static("test-encoding"))
+        );
+        assert_eq!(
+            prepared.execution_options.request_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            prepared.execution_options.total_timeout,
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(prepared.execution_options.max_response_body_bytes, 4096);
+    }
+
+    #[test]
+    fn prepare_retry_request_input_preserves_body_and_skips_auto_encoding_when_disabled() {
+        let retry_policy = RetryPolicy::disabled();
+
+        let prepared = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: &PrimaryEndpointSelector,
+                configured_base_url: "https://api.example.com",
+                method: http::Method::POST,
+                path: "/v1/items".to_owned(),
+                default_headers: &HeaderMap::new(),
+                headers: HeaderMap::new(),
+                body: Some("request-body"),
+                execution_options: empty_execution_options(),
+                defaults: execution_defaults(&retry_policy, false),
+            },
+            || "empty",
+            |_method, _headers| panic!("auto accept-encoding should be disabled"),
+        )
+        .expect("request preparation should succeed");
+
+        assert_eq!(prepared.body, "request-body");
+        assert!(!prepared.merged_headers.contains_key(ACCEPT_ENCODING));
     }
 
     fn test_execution_state(

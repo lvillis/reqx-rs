@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, Method};
 
+use crate::config::RequestTimeoutConfig;
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
 use crate::util::append_query_pairs;
@@ -32,6 +33,60 @@ pub(crate) struct RequestExecutionOptions {
     pub(crate) redirect_policy: Option<RedirectPolicy>,
     pub(crate) status_policy: Option<StatusPolicy>,
     pub(crate) auto_accept_encoding: Option<bool>,
+}
+
+pub(crate) struct RequestExecutionDefaults<'a> {
+    pub(crate) request_timeout: Duration,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) retry_policy: &'a RetryPolicy,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) redirect_policy: RedirectPolicy,
+    pub(crate) status_policy: StatusPolicy,
+    pub(crate) auto_accept_encoding: bool,
+}
+
+pub(crate) struct EffectiveRequestExecutionOptions {
+    pub(crate) request_timeout: Duration,
+    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) retry_policy: RetryPolicy,
+    pub(crate) max_response_body_bytes: usize,
+    pub(crate) redirect_policy: RedirectPolicy,
+    pub(crate) status_policy: StatusPolicy,
+    pub(crate) auto_accept_encoding: bool,
+}
+
+impl RequestExecutionOptions {
+    pub(crate) fn resolve(
+        self,
+        defaults: RequestExecutionDefaults<'_>,
+    ) -> crate::Result<EffectiveRequestExecutionOptions> {
+        let request_timeout = self.request_timeout.unwrap_or(defaults.request_timeout);
+        let total_timeout = self.total_timeout.or(defaults.total_timeout);
+        RequestTimeoutConfig {
+            request_timeout,
+            total_timeout,
+        }
+        .validate()?;
+
+        let retry_policy = self
+            .retry_policy
+            .unwrap_or_else(|| defaults.retry_policy.clone());
+        retry_policy.validate()?;
+
+        Ok(EffectiveRequestExecutionOptions {
+            request_timeout,
+            total_timeout,
+            retry_policy,
+            max_response_body_bytes: self
+                .max_response_body_bytes
+                .unwrap_or(defaults.max_response_body_bytes),
+            redirect_policy: self.redirect_policy.unwrap_or(defaults.redirect_policy),
+            status_policy: self.status_policy.unwrap_or(defaults.status_policy),
+            auto_accept_encoding: self
+                .auto_accept_encoding
+                .unwrap_or(defaults.auto_accept_encoding),
+        })
+    }
 }
 
 impl From<RequestExecutionOverrides> for RequestExecutionOptions {

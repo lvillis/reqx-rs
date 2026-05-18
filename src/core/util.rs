@@ -1,4 +1,3 @@
-#[cfg(any(feature = "_async", feature = "_blocking"))]
 use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,6 +20,38 @@ pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn read_retry_interrupted<R>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usize>
+where
+    R: io::Read + ?Sized,
+{
+    loop {
+        match reader.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "_async")]
+pub(crate) async fn read_async_retry_interrupted<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    use tokio::io::AsyncReadExt;
+
+    loop {
+        match reader.read(buffer).await {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 

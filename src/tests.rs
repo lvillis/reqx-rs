@@ -17,7 +17,8 @@ use http::header::{
 use http::{HeaderMap, StatusCode, header::HeaderName};
 
 use crate::advanced::{
-    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, ClientProfile, RateLimitPolicy, StatusPolicy,
+    AdaptiveConcurrencyPolicy, CircuitBreakerPolicy, ClientProfile, RateLimitPolicy,
+    RetryBudgetPolicy, StatusPolicy,
 };
 use crate::client::Client;
 use crate::content_encoding::should_decode_content_encoded_body;
@@ -1247,7 +1248,7 @@ fn blocking_timeout_io_error_helper_detects_plain_and_wrapped_timeouts() {
 #[test]
 fn error_code_contract_table_is_stable() {
     let codes = ErrorCode::all();
-    assert_eq!(codes.len(), 34);
+    assert_eq!(codes.len(), 37);
 
     let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
     assert_eq!(
@@ -1257,7 +1258,10 @@ fn error_code_contract_table_is_stable() {
             "invalid_no_proxy_rule",
             "invalid_proxy_config",
             "invalid_timeout_config",
+            "invalid_client_name_config",
+            "invalid_concurrency_limit_config",
             "invalid_retry_policy",
+            "invalid_retry_budget_policy",
             "invalid_adaptive_concurrency_policy",
             "invalid_circuit_breaker_policy",
             "invalid_rate_limit_policy",
@@ -1334,6 +1338,27 @@ fn error_code_maps_invalid_timeout_config_variant() {
 }
 
 #[test]
+fn error_code_maps_invalid_client_name_config_variant() {
+    let error = Error::InvalidClientNameConfig {
+        client_name_len: 4,
+        message: "client_name must be a valid HTTP header value",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidClientNameConfig);
+    assert_eq!(error.code().as_str(), "invalid_client_name_config");
+}
+
+#[test]
+fn error_code_maps_invalid_concurrency_limit_config_variant() {
+    let error = Error::InvalidConcurrencyLimitConfig {
+        max_in_flight: Some(0),
+        max_in_flight_per_host: Some(8),
+        message: "max_in_flight must be greater than zero",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidConcurrencyLimitConfig);
+    assert_eq!(error.code().as_str(), "invalid_concurrency_limit_config");
+}
+
+#[test]
 fn error_code_maps_invalid_retry_policy_variant() {
     let error = Error::InvalidRetryPolicy {
         max_attempts: 0,
@@ -1344,6 +1369,18 @@ fn error_code_maps_invalid_retry_policy_variant() {
     };
     assert_eq!(error.code(), ErrorCode::InvalidRetryPolicy);
     assert_eq!(error.code().as_str(), "invalid_retry_policy");
+}
+
+#[test]
+fn error_code_maps_invalid_retry_budget_policy_variant() {
+    let error = Error::InvalidRetryBudgetPolicy {
+        window_ms: 0,
+        retry_ratio: f64::NAN,
+        min_retries_per_window: 3,
+        message: "retry_ratio must be finite and between 0.0 and 1.0",
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidRetryBudgetPolicy);
+    assert_eq!(error.code().as_str(), "invalid_retry_budget_policy");
 }
 
 #[test]
@@ -1717,6 +1754,97 @@ fn build_rejects_invalid_adaptive_concurrency_policy() {
             assert_eq!(min_limit, 10);
             assert_eq!(initial_limit, 8);
             assert_eq!(max_limit, 5);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_invalid_retry_budget_policy() {
+    let policy = RetryBudgetPolicy::standard().window(Duration::ZERO);
+    let result = Client::builder("https://api.example.com")
+        .retry_budget_policy(policy)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid retry budget policy should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidRetryBudgetPolicy {
+            window_ms,
+            retry_ratio,
+            min_retries_per_window,
+            message,
+        } => {
+            assert_eq!(window_ms, 0);
+            assert_eq!(retry_ratio, 0.2);
+            assert_eq!(min_retries_per_window, 3);
+            assert_eq!(message, "window must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_invalid_concurrency_limit_config() {
+    let result = Client::builder("https://api.example.com")
+        .max_in_flight(0)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid concurrency limit should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidConcurrencyLimitConfig {
+            max_in_flight,
+            max_in_flight_per_host,
+            message,
+        } => {
+            assert_eq!(max_in_flight, Some(0));
+            assert_eq!(max_in_flight_per_host, None);
+            assert_eq!(message, "max_in_flight must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_empty_client_name() {
+    let result = Client::builder("https://api.example.com")
+        .client_name("   ")
+        .build();
+    let error = match result {
+        Ok(_) => panic!("empty client name should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidClientNameConfig {
+            client_name_len,
+            message,
+        } => {
+            assert_eq!(client_name_len, 3);
+            assert_eq!(message, "client_name must not be empty");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn build_rejects_client_name_that_is_not_a_header_value() {
+    let result = Client::builder("https://api.example.com")
+        .client_name("bad\r\nuser-agent")
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid client name should fail"),
+        Err(error) => error,
+    };
+    match error {
+        Error::InvalidClientNameConfig {
+            client_name_len,
+            message,
+        } => {
+            assert_eq!(client_name_len, "bad\r\nuser-agent".len());
+            assert_eq!(message, "client_name must be a valid HTTP header value");
         }
         other => panic!("unexpected error: {other}"),
     }

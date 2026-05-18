@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http::Uri;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{HeaderName, HeaderValue, USER_AGENT};
 use reqx::advanced::{
     AdaptiveConcurrencyPolicy, BodyCodec, CircuitBreakerPolicy, Clock, Interceptor, Observer,
     RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
@@ -683,6 +683,53 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
             .get("accept-encoding")
             .map(String::as_str),
         Some("gzip, br, deflate, zstd")
+    );
+}
+
+#[test]
+fn blocking_client_name_sets_default_user_agent_and_request_header_can_override() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            br#"{"ok":true}"#.to_vec(),
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .client_name("reqx-test/1.0")
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .get("/default-user-agent")
+        .send_json()
+        .expect("request should succeed");
+    assert_eq!(body["ok"], true);
+
+    let body: Value = client
+        .get("/override-user-agent")
+        .header(USER_AGENT, HeaderValue::from_static("override-sdk/2.0"))
+        .send_json()
+        .expect("request should succeed");
+    assert_eq!(body["ok"], true);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers.get("user-agent").map(String::as_str),
+        Some("reqx-test/1.0")
+    );
+    assert_eq!(
+        requests[1].headers.get("user-agent").map(String::as_str),
+        Some("override-sdk/2.0")
     );
 }
 
@@ -1831,6 +1878,50 @@ fn blocking_build_rejects_invalid_retry_policy() {
 }
 
 #[test]
+fn blocking_build_rejects_invalid_retry_status_policy() {
+    let result = Client::builder("https://api.example.com")
+        .retry_policy(RetryPolicy::standard().status_retry_window(204, 2))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid retry status policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRetryPolicy { message, .. } => {
+            assert_eq!(
+                message,
+                "status retry windows must target valid non-success statuses"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_retry_budget_policy() {
+    let result = Client::builder("https://api.example.com")
+        .retry_budget_policy(RetryBudgetPolicy::standard().window(Duration::ZERO))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid retry budget policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRetryBudgetPolicy {
+            window_ms, message, ..
+        } => {
+            assert_eq!(window_ms, 0);
+            assert_eq!(message, "window must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn blocking_build_rejects_invalid_timeout_config() {
     let result = Client::builder("https://api.example.com")
         .connect_timeout(Duration::ZERO)
@@ -1852,6 +1943,54 @@ fn blocking_build_rejects_invalid_timeout_config() {
             assert_eq!(total_timeout_ms, None);
             assert_eq!(connect_timeout_ms, Some(0));
             assert_eq!(message, "connect_timeout must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_client_name() {
+    let result = Client::builder("https://api.example.com")
+        .client_name("bad\r\nuser-agent")
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid client name should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidClientNameConfig {
+            client_name_len,
+            message,
+        } => {
+            assert_eq!(client_name_len, "bad\r\nuser-agent".len());
+            assert_eq!(message, "client_name must be a valid HTTP header value");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
+fn blocking_build_rejects_invalid_concurrency_limit_config() {
+    let result = Client::builder("https://api.example.com")
+        .max_in_flight(0)
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid concurrency limit should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidConcurrencyLimitConfig {
+            max_in_flight,
+            max_in_flight_per_host,
+            message,
+        } => {
+            assert_eq!(max_in_flight, Some(0));
+            assert_eq!(max_in_flight_per_host, None);
+            assert_eq!(message, "max_in_flight must be greater than zero");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -1881,15 +2020,62 @@ fn blocking_request_rejects_invalid_retry_policy_override() {
 
     let error = client
         .get("/v1/invalid-retry-policy")
-        .retry_policy(RetryPolicy::standard().jitter_ratio(f64::NAN))
+        .retry_policy(RetryPolicy::standard().retryable_status_codes([1000]))
         .send()
         .expect_err("invalid request retry override should fail");
 
     match error {
-        Error::InvalidRetryPolicy { jitter_ratio, .. } => assert!(jitter_ratio.is_nan()),
+        Error::InvalidRetryPolicy { message, .. } => {
+            assert_eq!(
+                message,
+                "retryable status codes must be valid non-success statuses"
+            );
+        }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(server.served_count(), 0);
+}
+
+#[test]
+fn blocking_request_validates_retry_policy_before_waiting_for_global_permit() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"held-stream".to_vec(),
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .max_in_flight(1)
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/hold-permit")
+        .send_stream()
+        .expect("first stream should hold the global permit");
+
+    let error = client
+        .get("/invalid-before-queue")
+        .total_timeout(Duration::from_millis(50))
+        .retry_policy(RetryPolicy::standard().retryable_status_codes([1000]))
+        .send()
+        .expect_err("invalid retry policy should fail before queueing");
+
+    match error {
+        Error::InvalidRetryPolicy { message, .. } => {
+            assert_eq!(
+                message,
+                "retryable status codes must be valid non-success statuses"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(server.served_count(), 1);
+    assert_eq!(client.metrics_snapshot().requests.started, 1);
+
+    drop(stream);
 }
 
 #[test]

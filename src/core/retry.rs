@@ -268,6 +268,8 @@ impl RetryPolicy {
     }
 
     /// Replaces the set of retryable HTTP status codes.
+    ///
+    /// Values must be valid non-success HTTP status codes.
     pub fn retryable_status_codes(mut self, codes: impl IntoIterator<Item = u16>) -> Self {
         self.retryable_status_codes = codes.into_iter().collect();
         self
@@ -298,6 +300,9 @@ impl RetryPolicy {
     }
 
     /// Sets a per-status retry window measured in maximum attempts.
+    ///
+    /// `status` must be a valid non-success HTTP status code, and
+    /// `max_attempts` must be greater than zero.
     pub fn status_retry_window(mut self, status: u16, max_attempts: usize) -> Self {
         self.status_retry_windows.insert(status, max_attempts);
         self
@@ -352,6 +357,24 @@ impl RetryPolicy {
         }
         if !self.jitter_ratio.is_finite() || !(0.0..=1.0).contains(&self.jitter_ratio) {
             return Err(self.invalid_policy("jitter_ratio must be finite and between 0.0 and 1.0"));
+        }
+        if self
+            .retryable_status_codes
+            .iter()
+            .any(|status| !is_valid_retryable_status_code(*status))
+        {
+            return Err(
+                self.invalid_policy("retryable status codes must be valid non-success statuses")
+            );
+        }
+        if self
+            .status_retry_windows
+            .keys()
+            .any(|status| !is_valid_retryable_status_code(*status))
+        {
+            return Err(
+                self.invalid_policy("status retry windows must target valid non-success statuses")
+            );
         }
         if self.status_retry_windows.values().any(|limit| *limit == 0) {
             return Err(self.invalid_policy("status retry windows must be greater than zero"));
@@ -449,6 +472,10 @@ fn default_retryable_status_codes() -> BTreeSet<u16> {
     [429_u16, 500, 502, 503, 504].into_iter().collect()
 }
 
+fn is_valid_retryable_status_code(status: u16) -> bool {
+    StatusCode::from_u16(status).is_ok_and(|status| !status.is_success())
+}
+
 fn default_retryable_transport_error_kinds() -> BTreeSet<TransportErrorKind> {
     [
         TransportErrorKind::Dns,
@@ -532,6 +559,34 @@ mod tests {
         assert!(
             RetryPolicy::standard()
                 .response_body_read_retry_window(0)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_or_success_status_policy_entries() {
+        assert!(
+            RetryPolicy::standard()
+                .retryable_status_codes([99])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            RetryPolicy::standard()
+                .retryable_status_codes([200])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            RetryPolicy::standard()
+                .status_retry_window(1000, 2)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            RetryPolicy::standard()
+                .status_retry_window(204, 2)
                 .validate()
                 .is_err()
         );

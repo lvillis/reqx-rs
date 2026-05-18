@@ -14,7 +14,7 @@ use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::stream;
-use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
+use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue, USER_AGENT};
 use reqx::advanced::{
     AdaptiveConcurrencyPolicy, BodyCodec, CircuitBreakerPolicy, Clock, Interceptor, Observer,
     RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
@@ -840,6 +840,57 @@ async fn decodes_gzip_response_and_sets_accept_encoding() {
             .get("accept-encoding")
             .map(String::as_str),
         Some("gzip, br, deflate, zstd")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_name_sets_default_user_agent_and_request_header_can_override() {
+    let server = MockServer::start(vec![
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            r#"{"ok":true}"#,
+            Duration::ZERO,
+        ),
+        MockResponse::new(
+            200,
+            vec![("Content-Type", "application/json")],
+            r#"{"ok":true}"#,
+            Duration::ZERO,
+        ),
+    ]);
+
+    let client = Client::builder(server.base_url.clone())
+        .client_name("reqx-test/1.0")
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response: Value = client
+        .get("/default-user-agent")
+        .send_json()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response["ok"], Value::Bool(true));
+
+    let response: Value = client
+        .get("/override-user-agent")
+        .header(USER_AGENT, HeaderValue::from_static("override-sdk/2.0"))
+        .send_json()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response["ok"], Value::Bool(true));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers.get("user-agent").map(String::as_str),
+        Some("reqx-test/1.0")
+    );
+    assert_eq!(
+        requests[1].headers.get("user-agent").map(String::as_str),
+        Some("override-sdk/2.0")
     );
 }
 
@@ -2787,6 +2838,55 @@ async fn build_rejects_invalid_retry_policy() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn build_rejects_invalid_retry_status_policy() {
+    let result = Client::builder("https://api.example.com")
+        .retry_policy(RetryPolicy::standard().retryable_status_codes([200, 503]))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid retry status policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRetryPolicy { message, .. } => {
+            assert_eq!(
+                message,
+                "retryable status codes must be valid non-success statuses"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_rejects_invalid_retry_budget_policy() {
+    let result = Client::builder("https://api.example.com")
+        .retry_budget_policy(RetryBudgetPolicy::standard().retry_ratio(f64::NAN))
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid retry budget policy should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidRetryBudgetPolicy {
+            retry_ratio,
+            message,
+            ..
+        } => {
+            assert!(retry_ratio.is_nan());
+            assert_eq!(
+                message,
+                "retry_ratio must be finite and between 0.0 and 1.0"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn build_rejects_invalid_timeout_config() {
     let result = Client::builder("https://api.example.com")
         .request_timeout(Duration::ZERO)
@@ -2808,6 +2908,54 @@ async fn build_rejects_invalid_timeout_config() {
             assert_eq!(total_timeout_ms, None);
             assert_eq!(connect_timeout_ms, Some(5_000));
             assert_eq!(message, "request_timeout must be greater than zero");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_rejects_invalid_client_name() {
+    let result = Client::builder("https://api.example.com")
+        .client_name("bad\r\nuser-agent")
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid client name should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidClientNameConfig {
+            client_name_len,
+            message,
+        } => {
+            assert_eq!(client_name_len, "bad\r\nuser-agent".len());
+            assert_eq!(message, "client_name must be a valid HTTP header value");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_rejects_invalid_concurrency_limit_config() {
+    let result = Client::builder("https://api.example.com")
+        .max_in_flight_per_host(0)
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("invalid concurrency limit should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::InvalidConcurrencyLimitConfig {
+            max_in_flight,
+            max_in_flight_per_host,
+            message,
+        } => {
+            assert_eq!(max_in_flight, None);
+            assert_eq!(max_in_flight_per_host, Some(0));
+            assert_eq!(message, "max_in_flight_per_host must be greater than zero");
         }
         other => panic!("unexpected error: {other}"),
     }
@@ -2837,7 +2985,7 @@ async fn request_rejects_invalid_retry_policy_override() {
 
     let error = client
         .get("/invalid-retry-policy")
-        .retry_policy(RetryPolicy::standard().response_body_read_retry_window(0))
+        .retry_policy(RetryPolicy::standard().status_retry_window(99, 2))
         .send()
         .await
         .expect_err("invalid request retry override should fail");
@@ -2846,12 +2994,57 @@ async fn request_rejects_invalid_retry_policy_override() {
         Error::InvalidRetryPolicy { message, .. } => {
             assert_eq!(
                 message,
-                "response body read retry window must be greater than zero"
+                "status retry windows must target valid non-success statuses"
             );
         }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(server.served_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_validates_retry_policy_before_waiting_for_global_permit() {
+    let server = MockServer::start(vec![MockResponse::new_bytes(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"held-stream".to_vec(),
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .max_in_flight(1)
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .metrics_enabled(true)
+        .build()
+        .expect("client should build");
+
+    let stream = client
+        .get("/hold-permit")
+        .send_stream()
+        .await
+        .expect("first stream should hold the global permit");
+
+    let error = client
+        .get("/invalid-before-queue")
+        .total_timeout(Duration::from_millis(50))
+        .retry_policy(RetryPolicy::standard().status_retry_window(99, 2))
+        .send()
+        .await
+        .expect_err("invalid retry policy should fail before queueing");
+
+    match error {
+        Error::InvalidRetryPolicy { message, .. } => {
+            assert_eq!(
+                message,
+                "status retry windows must target valid non-success statuses"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(server.served_count(), 1);
+    assert_eq!(client.metrics_snapshot().requests.started, 1);
+
+    drop(stream);
 }
 
 #[tokio::test(flavor = "current_thread")]

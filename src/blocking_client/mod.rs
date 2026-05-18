@@ -26,8 +26,6 @@ mod request;
 mod transport;
 
 use crate::blocking_client::limiters::RequestLimiters;
-use crate::core::request_builder::RequestExecutionOptions;
-
 pub use request::RequestBuilder;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,6 +149,12 @@ impl Drop for AdaptiveConcurrencyPermit {
 enum RequestBody {
     Buffered(Bytes),
     Reader(Box<dyn Read + Send>),
+}
+
+impl RequestBody {
+    fn empty() -> Self {
+        Self::Buffered(Bytes::new())
+    }
 }
 
 /// Builds a blocking [`Client`] with transport, timeout, retry, TLS, and

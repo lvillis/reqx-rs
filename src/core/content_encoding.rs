@@ -1,9 +1,11 @@
-use std::io::{self, Read};
+use std::io::Read;
 
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_ENCODING;
 use http::{Method, StatusCode};
+
+use crate::util::read_retry_interrupted;
 
 #[derive(Debug)]
 pub(crate) enum DecodeContentEncodingError {
@@ -20,7 +22,7 @@ fn read_to_end_limited<R: Read>(
     let mut chunk = [0_u8; 8 * 1024];
 
     loop {
-        let read = reader.read(&mut chunk).map_err(|error: io::Error| {
+        let read = read_retry_interrupted(reader, &mut chunk).map_err(|error| {
             DecodeContentEncodingError::Decode {
                 encoding: encoding.to_owned(),
                 message: error.to_string(),
@@ -144,4 +146,53 @@ pub(crate) fn decode_content_encoded_body_limited(
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read};
+
+    use super::read_to_end_limited;
+
+    struct InterruptedOnceReader {
+        data: Vec<u8>,
+        offset: usize,
+        interrupted: bool,
+    }
+
+    impl InterruptedOnceReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                offset: 0,
+                interrupted: false,
+            }
+        }
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.offset >= self.data.len() {
+                return Ok(0);
+            }
+
+            let read = buffer.len().min(self.data.len() - self.offset);
+            buffer[..read].copy_from_slice(&self.data[self.offset..self.offset + read]);
+            self.offset += read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn read_to_end_limited_retries_interrupted_reads() {
+        let mut reader = InterruptedOnceReader::new(b"decoded");
+        let decoded = read_to_end_limited(&mut reader, "test", 16)
+            .expect("interrupted read should be retried");
+
+        assert_eq!(decoded, b"decoded");
+    }
 }
