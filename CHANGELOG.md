@@ -1,3 +1,8 @@
+## [0.1.39] - 2026-05-26
+
+### 🚀 Features
+
+- *(tls)* Append custom roots to webpki trust store
 ## [0.1.38] - 2026-05-18
 
 ### 🐛 Bug Fixes
@@ -10,6 +15,10 @@
 
 - Centralize request execution flow
 - [**breaking**] Consolidate execution state machines
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.38
 ## [0.1.37] - 2026-05-12
 
 ### ⚙️ Miscellaneous Tasks
