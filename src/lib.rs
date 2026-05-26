@@ -103,8 +103,11 @@
 //! - Async `native-tls` forwards TLS version bounds to the platform TLS stack.
 //! - Blocking `ureq` transport currently rejects TLS version bounds at
 //!   `build()` time.
-//! - Custom root CAs require [`TlsRootStore::System`] or
-//!   [`TlsRootStore::Specific`].
+//! - Custom root CAs require [`TlsRootStore::WebPki`],
+//!   [`TlsRootStore::System`], or [`TlsRootStore::Specific`].
+//! - Rustls backends append custom root CAs to [`TlsRootStore::WebPki`]'s
+//!   bundled Mozilla roots. [`TlsRootStore::Specific`] trusts only explicit
+//!   custom roots.
 //! - Blocking `native-tls` cannot merge custom root CAs into the system trust
 //!   store; use [`TlsRootStore::Specific`] when adding explicit roots there.
 

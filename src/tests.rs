@@ -1951,6 +1951,7 @@ fn custom_root_ca_requires_explicit_root_store() {
     };
     match error {
         Error::TlsConfig { message, .. } => {
+            assert!(message.contains("TlsRootStore::WebPki"));
             assert!(message.contains("TlsRootStore::System"));
             assert!(message.contains("TlsRootStore::Specific"));
         }

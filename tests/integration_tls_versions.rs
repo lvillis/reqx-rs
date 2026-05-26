@@ -182,6 +182,31 @@ fn tls_test_client(base_url: &str, ca_cert_pem: &str, version: TlsVersion) -> Cl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rustls_webpki_root_store_appends_custom_ca() {
+    let tls_material = test_tls_material();
+    let (base_url, server) = start_tls_server(&[TlsVersion::V1_3], &tls_material).await;
+
+    let client = Client::builder(&base_url)
+        .request_timeout(Duration::from_secs(2))
+        .retry_policy(RetryPolicy::disabled())
+        .tls_backend(test_tls_backend())
+        .tls_root_store(TlsRootStore::WebPki)
+        .tls_root_ca_pem(tls_material.ca_cert_pem.as_str())
+        .tls_version(TlsVersion::V1_3)
+        .build()
+        .expect("build webpki plus custom CA client");
+
+    let response = client
+        .get("/webpki-plus-custom-ca")
+        .send()
+        .await
+        .expect("custom CA should be appended to bundled webpki roots");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(server.await.expect("join webpki custom CA server"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rustls_tls_version_constraints_restrict_handshake_versions() {
     let tls_material = test_tls_material();
 

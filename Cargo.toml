@@ -70,6 +70,7 @@ async-tls-native = ["_async", "dep:hyper-tls", "hyper-tls/alpn"]
 blocking-tls-rustls-ring = [
     "_blocking",
     "dep:rustls-native-certs",
+    "dep:webpki-root-certs",
     "ureq/rustls",
     "ureq/platform-verifier",
 ]
@@ -77,6 +78,7 @@ blocking-tls-rustls-aws-lc-rs = [
     "_blocking",
     "dep:rustls",
     "dep:rustls-native-certs",
+    "dep:webpki-root-certs",
     "ureq/rustls-no-provider",
     "ureq/rustls-webpki-roots",
     "ureq/platform-verifier",
@@ -108,6 +110,7 @@ hyper-rustls = { version = "0.27.9", default-features = false, features = ["http
 rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
+webpki-root-certs = { version = "1.0.6", optional = true }
 webpki-roots = { version = "1.0.7", optional = true }
 
 # Blocking transport backend (feature-gated).

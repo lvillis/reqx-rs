@@ -235,12 +235,12 @@ fn build_rustls_root_store(
     if !tls_options.root_certificates.is_empty()
         && !matches!(
             tls_options.root_store,
-            TlsRootStore::System | TlsRootStore::Specific
+            TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
         )
     {
         return Err(tls_config_error(
             tls_backend,
-            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::WebPki), tls_root_store(TlsRootStore::System), or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -275,7 +275,7 @@ fn build_rustls_root_store(
 
     let custom_added = if matches!(
         tls_options.root_store,
-        TlsRootStore::System | TlsRootStore::Specific
+        TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
     ) && !tls_options.root_certificates.is_empty()
     {
         add_custom_rustls_root_certificates(tls_backend, tls_options, &mut root_store)?
@@ -679,12 +679,12 @@ fn build_native_tls_connector(
     if !tls_options.root_certificates.is_empty()
         && !matches!(
             tls_options.root_store,
-            TlsRootStore::System | TlsRootStore::Specific
+            TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
         )
     {
         return Err(tls_config_error(
             TlsBackend::NativeTls,
-            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::WebPki), tls_root_store(TlsRootStore::System), or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -1464,9 +1464,10 @@ impl ClientBuilder {
 
     /// Selects which root trust store the TLS backend should use.
     ///
-    /// Custom root CAs require [`TlsRootStore::System`] or
-    /// [`TlsRootStore::Specific`]. Async `native-tls` rejects
-    /// [`TlsRootStore::WebPki`].
+    /// Custom root CAs require [`TlsRootStore::WebPki`],
+    /// [`TlsRootStore::System`], or [`TlsRootStore::Specific`]. For rustls
+    /// backends, [`TlsRootStore::WebPki`] appends explicit custom roots to the
+    /// bundled Mozilla roots. Async `native-tls` rejects [`TlsRootStore::WebPki`].
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
         self.tls_options.root_store = tls_root_store;
         self
@@ -1475,7 +1476,9 @@ impl ClientBuilder {
     /// Adds a PEM-encoded root CA certificate.
     ///
     /// Pair this with [`Self::tls_root_store`] set to
-    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
+    /// [`TlsRootStore::WebPki`], [`TlsRootStore::System`], or
+    /// [`TlsRootStore::Specific`]. With rustls and [`TlsRootStore::WebPki`],
+    /// this appends to the bundled Mozilla roots.
     pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -1486,7 +1489,9 @@ impl ClientBuilder {
     /// Adds a DER-encoded root CA certificate.
     ///
     /// Pair this with [`Self::tls_root_store`] set to
-    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`].
+    /// [`TlsRootStore::WebPki`], [`TlsRootStore::System`], or
+    /// [`TlsRootStore::Specific`]. With rustls and [`TlsRootStore::WebPki`],
+    /// this appends to the bundled Mozilla roots.
     pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates

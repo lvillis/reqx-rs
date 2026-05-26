@@ -115,6 +115,26 @@ fn load_system_root_certificates(
 
 #[cfg(any(
     feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs"
+))]
+fn bundled_webpki_root_certificates() -> Vec<ureq::tls::Certificate<'static>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|certificate| ureq::tls::Certificate::from_der(certificate.as_ref()).to_owned())
+        .collect()
+}
+
+#[cfg(all(
+    not(feature = "blocking-tls-rustls-ring"),
+    not(feature = "blocking-tls-rustls-aws-lc-rs"),
+    feature = "blocking-tls-native"
+))]
+fn bundled_webpki_root_certificates() -> Vec<ureq::tls::Certificate<'static>> {
+    unreachable!("native-tls rejects TlsRootStore::WebPki before roots are combined")
+}
+
+#[cfg(any(
+    feature = "blocking-tls-rustls-ring",
     feature = "blocking-tls-rustls-aws-lc-rs",
     feature = "blocking-tls-native"
 ))]
@@ -152,12 +172,12 @@ fn build_sync_tls_config(
     if !roots.is_empty()
         && !matches!(
             tls_options.root_store,
-            TlsRootStore::System | TlsRootStore::Specific
+            TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
         )
     {
         return Err(tls_config_error(
             backend,
-            "custom root CAs require tls_root_store(TlsRootStore::System) or tls_root_store(TlsRootStore::Specific)",
+            "custom root CAs require tls_root_store(TlsRootStore::WebPki), tls_root_store(TlsRootStore::System), or tls_root_store(TlsRootStore::Specific)",
         ));
     }
 
@@ -177,7 +197,14 @@ fn build_sync_tls_config(
                     "tls_root_store(TlsRootStore::WebPki) is unsupported for native-tls backend; use BackendDefault, System, or Specific",
                 ));
             }
-            tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+            if roots.is_empty() {
+                tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+            } else {
+                let mut combined_roots = bundled_webpki_root_certificates();
+                combined_roots.extend(roots);
+                tls_config_builder = tls_config_builder
+                    .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
+            }
         }
         TlsRootStore::System => {
             if roots.is_empty() {
@@ -444,8 +471,58 @@ mod read_tests {
     }
 }
 
+#[cfg(all(
+    test,
+    any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs"
+    )
+))]
+mod rustls_tls_config_tests {
+    use super::build_sync_tls_config;
+    use crate::tls::{TlsBackend, TlsOptions, TlsRootCertificate, TlsRootStore};
+
+    #[cfg(feature = "blocking-tls-rustls-ring")]
+    fn test_tls_backend() -> TlsBackend {
+        TlsBackend::RustlsRing
+    }
+
+    #[cfg(all(
+        not(feature = "blocking-tls-rustls-ring"),
+        feature = "blocking-tls-rustls-aws-lc-rs"
+    ))]
+    fn test_tls_backend() -> TlsBackend {
+        TlsBackend::RustlsAwsLcRs
+    }
+
+    #[test]
+    fn webpki_root_store_appends_custom_roots() {
+        let custom_root = webpki_root_certs::TLS_SERVER_ROOT_CERTS[0]
+            .as_ref()
+            .to_vec();
+        let options = TlsOptions {
+            root_store: TlsRootStore::WebPki,
+            root_certificates: vec![TlsRootCertificate::Der(custom_root)],
+            ..TlsOptions::default()
+        };
+
+        let config = build_sync_tls_config(test_tls_backend(), &options)
+            .expect("rustls should combine webpki roots with custom roots");
+
+        match config.root_certs() {
+            ureq::tls::RootCerts::Specific(certs) => {
+                assert_eq!(
+                    certs.len(),
+                    webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
+                );
+            }
+            other => panic!("unexpected root cert config: {other:?}"),
+        }
+    }
+}
+
 #[cfg(all(test, feature = "blocking-tls-native"))]
-mod tests {
+mod native_tls_config_tests {
     use super::build_sync_tls_config;
     use crate::error::Error;
     use crate::tls::{TlsBackend, TlsOptions, TlsRootStore};

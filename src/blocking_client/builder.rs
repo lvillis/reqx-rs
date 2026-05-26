@@ -396,8 +396,10 @@ impl ClientBuilder {
 
     /// Selects which root trust store the TLS backend should use.
     ///
-    /// Custom root CAs require [`TlsRootStore::System`] or
-    /// [`TlsRootStore::Specific`]. Blocking `native-tls` rejects
+    /// Custom root CAs require [`TlsRootStore::WebPki`],
+    /// [`TlsRootStore::System`], or [`TlsRootStore::Specific`]. For rustls
+    /// backends, [`TlsRootStore::WebPki`] appends explicit custom roots to the
+    /// bundled Mozilla roots. Blocking `native-tls` rejects
     /// [`TlsRootStore::WebPki`], and also cannot merge custom root CAs into the
     /// system trust store.
     pub fn tls_root_store(mut self, tls_root_store: TlsRootStore) -> Self {
@@ -408,8 +410,10 @@ impl ClientBuilder {
     /// Adds a PEM-encoded root CA certificate.
     ///
     /// Pair this with [`Self::tls_root_store`] set to
-    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`]. Blocking
-    /// `native-tls` supports custom roots only with [`TlsRootStore::Specific`].
+    /// [`TlsRootStore::WebPki`], [`TlsRootStore::System`], or
+    /// [`TlsRootStore::Specific`]. With rustls and [`TlsRootStore::WebPki`],
+    /// this appends to the bundled Mozilla roots. Blocking `native-tls`
+    /// supports custom roots only with [`TlsRootStore::Specific`].
     pub fn tls_root_ca_pem(mut self, certificate_pem: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates
@@ -420,8 +424,10 @@ impl ClientBuilder {
     /// Adds a DER-encoded root CA certificate.
     ///
     /// Pair this with [`Self::tls_root_store`] set to
-    /// [`TlsRootStore::System`] or [`TlsRootStore::Specific`]. Blocking
-    /// `native-tls` supports custom roots only with [`TlsRootStore::Specific`].
+    /// [`TlsRootStore::WebPki`], [`TlsRootStore::System`], or
+    /// [`TlsRootStore::Specific`]. With rustls and [`TlsRootStore::WebPki`],
+    /// this appends to the bundled Mozilla roots. Blocking `native-tls`
+    /// supports custom roots only with [`TlsRootStore::Specific`].
     pub fn tls_root_ca_der(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
         self.tls_options
             .root_certificates

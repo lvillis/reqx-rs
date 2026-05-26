@@ -55,7 +55,8 @@ pub enum TlsRootStore {
     BackendDefault,
     /// Use the bundled Mozilla roots from `webpki-roots`.
     ///
-    /// This is unsupported by `native-tls` backends.
+    /// Rustls backends append any certificates supplied with `tls_root_ca_*`
+    /// to this bundled root set. This is unsupported by `native-tls` backends.
     WebPki,
     /// Use the operating system trust store.
     System,
