@@ -1,8 +1,17 @@
+## [0.1.40] - 2026-06-03
+
+### 🐛 Bug Fixes
+
+- *(tls)* Reject invalid custom root CAs
 ## [0.1.39] - 2026-05-26
 
 ### 🚀 Features
 
 - *(tls)* Append custom roots to webpki trust store
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.39
 ## [0.1.38] - 2026-05-18
 
 ### 🐛 Bug Fixes
