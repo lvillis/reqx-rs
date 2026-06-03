@@ -206,6 +206,32 @@ async fn rustls_webpki_root_store_appends_custom_ca() {
     assert!(server.await.expect("join webpki custom CA server"));
 }
 
+#[test]
+fn rustls_webpki_root_store_rejects_mixed_valid_and_invalid_custom_pem_roots() {
+    let tls_material = test_tls_material();
+    let mixed_pem = format!(
+        "{}\n-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+        tls_material.ca_cert_pem
+    );
+
+    let result = Client::builder("https://api.example.com")
+        .tls_backend(test_tls_backend())
+        .tls_root_store(TlsRootStore::WebPki)
+        .tls_root_ca_pem(mixed_pem)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("invalid custom PEM root should not be silently ignored"),
+        Err(error) => error,
+    };
+
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("failed to add PEM root certificate"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rustls_tls_version_constraints_restrict_handshake_versions() {
     let tls_material = test_tls_material();

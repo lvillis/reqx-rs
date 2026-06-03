@@ -2,7 +2,7 @@
 name = "reqx"
 version = "0.1.39"
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 description = "Rust HTTP transport client for API SDK libraries with retry, timeout, idempotency, proxy, and pluggable TLS backends"
 readme = "README.md"
 license = "MIT"
@@ -69,6 +69,7 @@ async-tls-rustls-ring = [
 async-tls-native = ["_async", "dep:hyper-tls", "hyper-tls/alpn"]
 blocking-tls-rustls-ring = [
     "_blocking",
+    "dep:rustls",
     "dep:rustls-native-certs",
     "dep:webpki-root-certs",
     "ureq/rustls",
@@ -84,7 +85,11 @@ blocking-tls-rustls-aws-lc-rs = [
     "ureq/platform-verifier",
     "rustls/aws_lc_rs",
 ]
-blocking-tls-native = ["_blocking", "dep:rustls-native-certs", "ureq/native-tls"]
+blocking-tls-native = [
+    "_blocking",
+    "dep:native-tls",
+    "ureq/native-tls",
+]
 
 otel = ["dep:opentelemetry"]
 
@@ -110,6 +115,7 @@ hyper-rustls = { version = "0.27.9", default-features = false, features = ["http
 rustls = { version = "0.23.37", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 hyper-tls = { version = "0.6.0", default-features = false, optional = true }
+native-tls = { version = "0.2.18", optional = true }
 webpki-root-certs = { version = "1.0.6", optional = true }
 webpki-roots = { version = "1.0.7", optional = true }
 

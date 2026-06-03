@@ -90,8 +90,7 @@ fn parse_pem_certificates(
 
 #[cfg(any(
     feature = "blocking-tls-rustls-ring",
-    feature = "blocking-tls-rustls-aws-lc-rs",
-    feature = "blocking-tls-native"
+    feature = "blocking-tls-rustls-aws-lc-rs"
 ))]
 fn load_system_root_certificates(
     backend: TlsBackend,
@@ -124,13 +123,42 @@ fn bundled_webpki_root_certificates() -> Vec<ureq::tls::Certificate<'static>> {
         .collect()
 }
 
-#[cfg(all(
-    not(feature = "blocking-tls-rustls-ring"),
-    not(feature = "blocking-tls-rustls-aws-lc-rs"),
-    feature = "blocking-tls-native"
+#[cfg(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs"
 ))]
-fn bundled_webpki_root_certificates() -> Vec<ureq::tls::Certificate<'static>> {
-    unreachable!("native-tls rejects TlsRootStore::WebPki before roots are combined")
+fn validate_custom_rustls_root_certificates(
+    backend: TlsBackend,
+    roots: &[ureq::tls::Certificate<'static>],
+) -> crate::Result<()> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for root in roots {
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(root.der().to_vec()))
+            .map_err(|source| {
+                tls_config_error(
+                    backend,
+                    format!("failed to parse custom root certificate: {source}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "blocking-tls-native")]
+fn validate_custom_native_tls_root_certificates(
+    backend: TlsBackend,
+    roots: &[ureq::tls::Certificate<'static>],
+) -> crate::Result<()> {
+    for root in roots {
+        native_tls::Certificate::from_der(root.der()).map_err(|source| {
+            tls_config_error(
+                backend,
+                format!("failed to parse custom root certificate: {source}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -142,6 +170,12 @@ fn build_sync_tls_config(
     backend: TlsBackend,
     tls_options: &TlsOptions,
 ) -> crate::Result<ureq::tls::TlsConfig> {
+    if !backend_is_available(backend) {
+        return Err(crate::error::Error::TlsBackendUnavailable {
+            backend: backend.as_str(),
+        });
+    }
+
     let version_bounds = tls_version_bounds(backend, tls_options)?;
     if version_bounds.min.is_some() || version_bounds.max.is_some() {
         return Err(tls_config_error(
@@ -157,6 +191,43 @@ fn build_sync_tls_config(
 
     let mut tls_config_builder = ureq::tls::TlsConfig::builder().provider(provider);
 
+    if !tls_options.root_certificates.is_empty()
+        && !matches!(
+            tls_options.root_store,
+            TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
+        )
+    {
+        return Err(tls_config_error(
+            backend,
+            "custom root CAs require tls_root_store(TlsRootStore::WebPki), tls_root_store(TlsRootStore::System), or tls_root_store(TlsRootStore::Specific)",
+        ));
+    }
+
+    if backend == TlsBackend::NativeTls && tls_options.root_store == TlsRootStore::WebPki {
+        return Err(tls_config_error(
+            backend,
+            "tls_root_store(TlsRootStore::WebPki) is unsupported for native-tls backend; use BackendDefault, System, or Specific",
+        ));
+    }
+
+    if backend == TlsBackend::NativeTls
+        && tls_options.root_store == TlsRootStore::System
+        && !tls_options.root_certificates.is_empty()
+    {
+        return Err(tls_config_error(
+            backend,
+            "blocking native-tls backend cannot combine system roots with custom root CAs; use tls_root_store(TlsRootStore::Specific) to trust only explicit roots",
+        ));
+    }
+
+    if tls_options.root_store == TlsRootStore::Specific && tls_options.root_certificates.is_empty()
+    {
+        return Err(tls_config_error(
+            backend,
+            "tls_root_store(TlsRootStore::Specific) requires at least one root CA",
+        ));
+    }
+
     let mut roots = Vec::new();
     for root_certificate in &tls_options.root_certificates {
         match root_certificate {
@@ -169,16 +240,17 @@ fn build_sync_tls_config(
         }
     }
 
-    if !roots.is_empty()
-        && !matches!(
-            tls_options.root_store,
-            TlsRootStore::WebPki | TlsRootStore::System | TlsRootStore::Specific
-        )
-    {
-        return Err(tls_config_error(
-            backend,
-            "custom root CAs require tls_root_store(TlsRootStore::WebPki), tls_root_store(TlsRootStore::System), or tls_root_store(TlsRootStore::Specific)",
-        ));
+    #[cfg(any(
+        feature = "blocking-tls-rustls-ring",
+        feature = "blocking-tls-rustls-aws-lc-rs"
+    ))]
+    if matches!(backend, TlsBackend::RustlsRing | TlsBackend::RustlsAwsLcRs) {
+        validate_custom_rustls_root_certificates(backend, &roots)?;
+    }
+
+    #[cfg(feature = "blocking-tls-native")]
+    if backend == TlsBackend::NativeTls {
+        validate_custom_native_tls_root_certificates(backend, &roots)?;
     }
 
     match tls_options.root_store {
@@ -191,19 +263,29 @@ fn build_sync_tls_config(
             }
         }
         TlsRootStore::WebPki => {
-            if backend == TlsBackend::NativeTls {
-                return Err(tls_config_error(
-                    backend,
-                    "tls_root_store(TlsRootStore::WebPki) is unsupported for native-tls backend; use BackendDefault, System, or Specific",
-                ));
+            #[cfg(any(
+                feature = "blocking-tls-rustls-ring",
+                feature = "blocking-tls-rustls-aws-lc-rs"
+            ))]
+            {
+                if roots.is_empty() {
+                    tls_config_builder =
+                        tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
+                } else {
+                    let mut combined_roots = bundled_webpki_root_certificates();
+                    combined_roots.extend(roots);
+                    tls_config_builder = tls_config_builder
+                        .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
+                }
             }
-            if roots.is_empty() {
-                tls_config_builder = tls_config_builder.root_certs(ureq::tls::RootCerts::WebPki);
-            } else {
-                let mut combined_roots = bundled_webpki_root_certificates();
-                combined_roots.extend(roots);
-                tls_config_builder = tls_config_builder
-                    .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
+            #[cfg(not(any(
+                feature = "blocking-tls-rustls-ring",
+                feature = "blocking-tls-rustls-aws-lc-rs"
+            )))]
+            {
+                return Err(crate::error::Error::TlsBackendUnavailable {
+                    backend: backend.as_str(),
+                });
             }
         }
         TlsRootStore::System => {
@@ -211,31 +293,34 @@ fn build_sync_tls_config(
                 tls_config_builder =
                     tls_config_builder.root_certs(ureq::tls::RootCerts::PlatformVerifier);
             } else {
-                if backend == TlsBackend::NativeTls {
-                    return Err(tls_config_error(
-                        backend,
-                        "blocking native-tls backend cannot combine system roots with custom root CAs; use tls_root_store(TlsRootStore::Specific) to trust only explicit roots",
-                    ));
+                #[cfg(any(
+                    feature = "blocking-tls-rustls-ring",
+                    feature = "blocking-tls-rustls-aws-lc-rs"
+                ))]
+                {
+                    let mut combined_roots = load_system_root_certificates(backend)?;
+                    combined_roots.extend(roots);
+                    if combined_roots.is_empty() {
+                        return Err(tls_config_error(
+                            backend,
+                            "failed to load system root certificates",
+                        ));
+                    }
+                    tls_config_builder = tls_config_builder
+                        .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
                 }
-                let mut combined_roots = load_system_root_certificates(backend)?;
-                combined_roots.extend(roots);
-                if combined_roots.is_empty() {
-                    return Err(tls_config_error(
-                        backend,
-                        "failed to load system root certificates",
-                    ));
+                #[cfg(not(any(
+                    feature = "blocking-tls-rustls-ring",
+                    feature = "blocking-tls-rustls-aws-lc-rs"
+                )))]
+                {
+                    return Err(crate::error::Error::TlsBackendUnavailable {
+                        backend: backend.as_str(),
+                    });
                 }
-                tls_config_builder = tls_config_builder
-                    .root_certs(ureq::tls::RootCerts::new_with_certs(&combined_roots));
             }
         }
         TlsRootStore::Specific => {
-            if roots.is_empty() {
-                return Err(tls_config_error(
-                    backend,
-                    "tls_root_store(TlsRootStore::Specific) requires at least one root CA",
-                ));
-            }
             tls_config_builder =
                 tls_config_builder.root_certs(ureq::tls::RootCerts::new_with_certs(&roots));
         }
@@ -519,6 +604,25 @@ mod rustls_tls_config_tests {
             other => panic!("unexpected root cert config: {other:?}"),
         }
     }
+
+    #[test]
+    fn webpki_root_store_rejects_invalid_custom_root() {
+        let options = TlsOptions {
+            root_store: TlsRootStore::WebPki,
+            root_certificates: vec![TlsRootCertificate::Der(vec![1, 2, 3, 4])],
+            ..TlsOptions::default()
+        };
+
+        let error = build_sync_tls_config(test_tls_backend(), &options)
+            .expect_err("invalid custom root should fail before webpki roots are added");
+
+        match error {
+            crate::error::Error::TlsConfig { message, .. } => {
+                assert!(message.contains("failed to parse custom root certificate"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "blocking-tls-native"))]
@@ -571,6 +675,25 @@ mod native_tls_config_tests {
         match error {
             Error::TlsConfig { message, .. } => {
                 assert!(message.contains("cannot combine system roots"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn native_tls_specific_rejects_invalid_custom_root() {
+        let options = TlsOptions {
+            root_store: TlsRootStore::Specific,
+            root_certificates: vec![crate::tls::TlsRootCertificate::Der(vec![1, 2, 3, 4])],
+            ..TlsOptions::default()
+        };
+
+        let error = build_sync_tls_config(TlsBackend::NativeTls, &options)
+            .expect_err("native-tls should reject invalid custom roots during config build");
+
+        match error {
+            Error::TlsConfig { message, .. } => {
+                assert!(message.contains("failed to parse custom root certificate"));
             }
             other => panic!("unexpected error: {other}"),
         }

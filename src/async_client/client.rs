@@ -141,30 +141,87 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(feature = "async-tls-native")]
-fn extract_pem_certificate_blocks(pem_bundle: &[u8]) -> Vec<Vec<u8>> {
+fn contains_pem_marker(haystack: &[u8], marker: &[u8]) -> bool {
+    find_subslice(haystack, marker).is_some()
+}
+
+#[cfg(feature = "async-tls-native")]
+fn extract_pem_certificate_blocks(pem_bundle: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
+    const PEM_BEGIN_PREFIX: &[u8] = b"-----BEGIN ";
+    const PEM_END_PREFIX: &[u8] = b"-----END ";
     const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
     const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
 
     let mut blocks = Vec::new();
     let mut cursor = 0usize;
-    while let Some(begin_offset) = find_subslice(&pem_bundle[cursor..], PEM_BEGIN) {
-        let begin = cursor + begin_offset;
-        let end_search_start = begin + PEM_BEGIN.len();
-        let Some(end_offset) = find_subslice(&pem_bundle[end_search_start..], PEM_END) else {
-            break;
-        };
-        let end = end_search_start + end_offset + PEM_END.len();
-        let mut block_end = end;
-        while block_end < pem_bundle.len()
-            && (pem_bundle[block_end] == b'\n' || pem_bundle[block_end] == b'\r')
-        {
-            block_end += 1;
+    loop {
+        let remaining = &pem_bundle[cursor..];
+        let next_begin = find_subslice(remaining, PEM_BEGIN_PREFIX);
+        let next_end = find_subslice(remaining, PEM_END_PREFIX);
+
+        match (next_begin, next_end) {
+            (None, None) => break,
+            (None, Some(_)) => {
+                return Err(tls_config_error(
+                    TlsBackend::NativeTls,
+                    "PEM root certificate contains an end marker without a matching begin marker",
+                ));
+            }
+            (Some(begin_offset), Some(end_offset)) if end_offset < begin_offset => {
+                return Err(tls_config_error(
+                    TlsBackend::NativeTls,
+                    "PEM root certificate contains an end marker without a matching begin marker",
+                ));
+            }
+            (Some(begin_offset), _) => {
+                let begin = cursor + begin_offset;
+                if !pem_bundle[begin..].starts_with(PEM_BEGIN) {
+                    return Err(tls_config_error(
+                        TlsBackend::NativeTls,
+                        "PEM root certificate contains a non-certificate block",
+                    ));
+                }
+
+                let end_search_start = begin + PEM_BEGIN.len();
+                let Some(end_offset) = find_subslice(&pem_bundle[end_search_start..], PEM_END)
+                else {
+                    return Err(tls_config_error(
+                        TlsBackend::NativeTls,
+                        "PEM root certificate block is missing its END CERTIFICATE marker",
+                    ));
+                };
+
+                if contains_pem_marker(
+                    &pem_bundle[end_search_start..end_search_start + end_offset],
+                    PEM_BEGIN_PREFIX,
+                ) {
+                    return Err(tls_config_error(
+                        TlsBackend::NativeTls,
+                        "PEM root certificate contains a nested begin marker",
+                    ));
+                }
+
+                let end = end_search_start + end_offset + PEM_END.len();
+                let mut block_end = end;
+                while block_end < pem_bundle.len()
+                    && (pem_bundle[block_end] == b'\n' || pem_bundle[block_end] == b'\r')
+                {
+                    block_end += 1;
+                }
+                blocks.push(pem_bundle[begin..block_end].to_vec());
+                cursor = block_end;
+            }
         }
-        blocks.push(pem_bundle[begin..block_end].to_vec());
-        cursor = block_end;
     }
 
-    blocks
+    if blocks.is_empty() {
+        return Err(tls_config_error(
+            TlsBackend::NativeTls,
+            "no certificate blocks found in PEM root certificate",
+        ));
+    }
+
+    Ok(blocks)
 }
 
 #[cfg(any(
@@ -182,7 +239,7 @@ fn add_custom_rustls_root_certificates(
     for certificate in &tls_options.root_certificates {
         match certificate {
             TlsRootCertificate::Pem(pem) => {
-                let mut parsed = Vec::new();
+                let mut parsed_any = false;
                 for item in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
                     let certificate = item.map_err(|source| {
                         tls_config_error(
@@ -190,22 +247,21 @@ fn add_custom_rustls_root_certificates(
                             format!("failed to parse PEM root certificate: {source}"),
                         )
                     })?;
-                    parsed.push(certificate);
+                    root_store.add(certificate).map_err(|source| {
+                        tls_config_error(
+                            tls_backend,
+                            format!("failed to add PEM root certificate: {source}"),
+                        )
+                    })?;
+                    added_total = added_total.saturating_add(1);
+                    parsed_any = true;
                 }
-                if parsed.is_empty() {
+                if !parsed_any {
                     return Err(tls_config_error(
                         tls_backend,
                         "no certificate blocks found in PEM root certificate",
                     ));
                 }
-                let (added, _ignored) = root_store.add_parsable_certificates(parsed);
-                if added == 0 {
-                    return Err(tls_config_error(
-                        tls_backend,
-                        "failed to parse PEM root certificate(s)",
-                    ));
-                }
-                added_total = added_total.saturating_add(added);
             }
             TlsRootCertificate::Der(der) => {
                 root_store
@@ -712,13 +768,7 @@ fn build_native_tls_connector(
     for certificate in &tls_options.root_certificates {
         match certificate {
             TlsRootCertificate::Pem(pem) => {
-                let certificate_blocks = extract_pem_certificate_blocks(pem);
-                if certificate_blocks.is_empty() {
-                    return Err(tls_config_error(
-                        TlsBackend::NativeTls,
-                        "no certificate blocks found in PEM root certificate",
-                    ));
-                }
+                let certificate_blocks = extract_pem_certificate_blocks(pem)?;
                 for certificate_block in certificate_blocks {
                     let certificate = hyper_tls::native_tls::Certificate::from_pem(
                         &certificate_block,
@@ -972,6 +1022,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy, SystemClock};
+    #[cfg(feature = "async-tls-native")]
+    use crate::error::Error;
 
     #[tokio::test]
     async fn adaptive_controller_unblocks_waiter_after_release() {
@@ -999,6 +1051,48 @@ mod tests {
 
         let completed = waiter.await.expect("waiter task should join");
         assert!(completed, "waiter should acquire after permit release");
+    }
+
+    #[cfg(feature = "async-tls-native")]
+    #[test]
+    fn native_tls_pem_root_parser_rejects_unterminated_certificate_tail() {
+        let pem = concat!(
+            "-----BEGIN CERTIFICATE-----\n",
+            "AQIDBA==\n",
+            "-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\n",
+            "AQIDBA==\n",
+        );
+
+        let error = super::extract_pem_certificate_blocks(pem.as_bytes())
+            .expect_err("unterminated certificate block must not be silently ignored");
+
+        match error {
+            Error::TlsConfig { message, .. } => {
+                assert!(message.contains("missing its END CERTIFICATE marker"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(feature = "async-tls-native")]
+    #[test]
+    fn native_tls_pem_root_parser_rejects_non_certificate_blocks() {
+        let pem = concat!(
+            "-----BEGIN PRIVATE KEY-----\n",
+            "AQIDBA==\n",
+            "-----END PRIVATE KEY-----\n",
+        );
+
+        let error = super::extract_pem_certificate_blocks(pem.as_bytes())
+            .expect_err("root CA PEM must not accept non-certificate PEM blocks");
+
+        match error {
+            Error::TlsConfig { message, .. } => {
+                assert!(message.contains("non-certificate block"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
 

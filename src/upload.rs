@@ -582,6 +582,7 @@ pub trait BlockingResumableUploadBackend {
 }
 
 /// Backend contract for async resumable uploads.
+#[cfg(feature = "_async")]
 #[cfg_attr(
     docsrs,
     doc(cfg(any(
