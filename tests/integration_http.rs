@@ -3809,6 +3809,6 @@ async fn interceptor_on_error_is_invoked_for_decode_failure() {
     }
 
     assert_eq!(request_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(response_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(response_hits.load(Ordering::SeqCst), 1);
     assert_eq!(error_hits.load(Ordering::SeqCst), 1);
 }

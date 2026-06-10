@@ -2888,6 +2888,10 @@ impl Client {
                 }
             }
 
+            response_progress.run_response_interceptors_if_needed(|| {
+                self.run_response_interceptors(&context, status, &response_headers);
+            });
+
             let Some(read_timeout) = execution.phase_timeout() else {
                 let error = execution.deadline_error();
                 attempts.mark_failure();
@@ -2924,9 +2928,6 @@ impl Client {
                     "request completed"
                 );
             }
-            response_progress.run_response_interceptors_if_needed(|| {
-                self.run_response_interceptors(&context, status, &response_headers);
-            });
 
             if !status.is_success() {
                 if execution.should_return_non_success_response() && response_mode.is_buffered() {

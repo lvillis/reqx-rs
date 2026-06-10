@@ -8,7 +8,7 @@ mod enabled {
     use opentelemetry::KeyValue;
     use opentelemetry::global;
     use opentelemetry::metrics::{Counter, Histogram};
-    use opentelemetry::trace::{Span, SpanKind, Tracer};
+    use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 
     use crate::error::Error;
     use crate::extensions::OtelPathNormalizer;
@@ -203,6 +203,7 @@ mod enabled {
             for attribute in error_span_attributes(error) {
                 span.set_attribute(attribute);
             }
+            span.set_status(error_span_status(error));
             if let Some(mut span) = request_span.span.take() {
                 span.end();
             }
@@ -250,11 +251,22 @@ mod enabled {
         attributes
     }
 
-    fn error_span_attributes(error: &Error) -> [KeyValue; 1] {
-        [KeyValue::new(
+    fn error_span_attributes(error: &Error) -> Vec<KeyValue> {
+        let mut attributes = vec![KeyValue::new(
             "error.type",
             error.code().as_str().to_owned(),
-        )]
+        )];
+        if let Error::HttpStatus { status, .. } = error {
+            attributes.push(KeyValue::new(
+                "http.response.status_code",
+                i64::from(*status),
+            ));
+        }
+        attributes
+    }
+
+    fn error_span_status(error: &Error) -> Status {
+        Status::error(error.code().as_str().to_owned())
     }
 
     fn base_attributes(inner: &OtelInner) -> [KeyValue; 1] {
@@ -263,9 +275,10 @@ mod enabled {
 
     #[cfg(test)]
     mod tests {
-        use super::{error_span_attributes, request_span_attributes};
+        use super::{error_span_attributes, error_span_status, request_span_attributes};
         use crate::error::{Error, TimeoutPhase};
         use crate::extensions::{OtelPathNormalizer, StandardOtelPathNormalizer};
+        use opentelemetry::trace::Status;
 
         struct FixedPathNormalizer;
 
@@ -329,6 +342,39 @@ mod enabled {
                 .collect::<Vec<_>>();
             assert!(keys.contains(&"error.type"));
             assert!(!keys.contains(&"error.message"));
+        }
+
+        #[test]
+        fn error_span_attributes_include_http_status_for_status_errors() {
+            let error = Error::HttpStatus {
+                status: 503,
+                method: http::Method::GET,
+                uri: "https://api.example.com/v1/items".to_owned(),
+                headers: Box::new(http::HeaderMap::new()),
+                body: String::new(),
+            };
+            let attributes = error_span_attributes(&error);
+            let status = attributes
+                .iter()
+                .find(|item| item.key.as_str() == "http.response.status_code")
+                .map(|item| item.value.to_string());
+
+            assert_eq!(status.as_deref(), Some("503"));
+        }
+
+        #[test]
+        fn error_span_status_uses_stable_error_code() {
+            let error = Error::Timeout {
+                phase: TimeoutPhase::Transport,
+                timeout_ms: 10,
+                method: http::Method::GET,
+                uri: "https://api.example.com/v1/items".to_owned(),
+            };
+
+            assert_eq!(
+                error_span_status(&error),
+                Status::error(error.code().as_str().to_owned())
+            );
         }
 
         #[test]

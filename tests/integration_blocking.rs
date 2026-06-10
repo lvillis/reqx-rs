@@ -4516,3 +4516,41 @@ fn blocking_interceptor_can_mutate_headers_and_observe_lifecycle() {
     assert_eq!(response_hits.load(Ordering::SeqCst), 1);
     assert_eq!(error_hits.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn blocking_interceptor_observes_response_before_decode_failure() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Encoding", "x-custom")],
+        b"abc".to_vec(),
+    )]);
+
+    let request_hits = Arc::new(AtomicUsize::new(0));
+    let response_hits = Arc::new(AtomicUsize::new(0));
+    let error_hits = Arc::new(AtomicUsize::new(0));
+    let interceptor = Arc::new(BlockingHeaderInterceptor {
+        request_hits: Arc::clone(&request_hits),
+        response_hits: Arc::clone(&response_hits),
+        error_hits: Arc::clone(&error_hits),
+    });
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .interceptor_arc(interceptor)
+        .build()
+        .expect("client should build");
+
+    let error = client
+        .get("/v1/decode-fail")
+        .send()
+        .expect_err("unknown content-encoding should fail");
+    match error {
+        Error::DecodeContentEncoding { encoding, .. } => assert_eq!(encoding, "x-custom"),
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    assert_eq!(request_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(error_hits.load(Ordering::SeqCst), 1);
+}
