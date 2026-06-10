@@ -1552,6 +1552,119 @@ async fn form_helper_sets_content_type_and_encoded_body() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_helper_replaces_stale_content_length_from_previous_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let payload = json!({ "name": "demo" });
+    let expected = serde_json::to_vec(&payload).expect("json payload should serialize");
+    let response = client
+        .post("/v1/json")
+        .body_reader_with_length(tokio::io::empty(), 1)
+        .expect("reader content-length should parse")
+        .json(&payload)
+        .expect("json serialization should succeed")
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, expected);
+    assert_ne!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_body_ignores_default_content_length() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .default_header(CONTENT_LENGTH, http::HeaderValue::from_static("1"))
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/body")
+        .body(Bytes::from_static(b"hello"))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"hello".to_vec());
+    assert_ne!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_stream_replaces_stale_content_length_from_previous_reader_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        "ok",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let body_stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+        b"streamed",
+    ))]);
+
+    let response = client
+        .post("/v1/upload")
+        .body_reader_with_length(tokio::io::empty(), 1)
+        .expect("reader content-length should parse")
+        .body_stream(body_stream)
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_ne!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn body_stream_uploads_chunked_data_with_declared_length() {
     let server = MockServer::start(vec![MockResponse::new(
         200,
@@ -1582,6 +1695,13 @@ async fn body_stream_uploads_chunked_data_with_declared_length() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, b"hello world".to_vec());
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("11")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3169,6 +3289,51 @@ async fn redirect_policy_follows_relative_location() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/v1/old");
     assert_eq!(requests[1].path, "/v1/new");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_policy_follows_network_path_location() {
+    let target = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        r#"{"ok":true}"#,
+        Duration::ZERO,
+    )]);
+    let target_authority = target
+        .base_url
+        .strip_prefix("http://")
+        .expect("target base url should include http scheme")
+        .to_owned();
+    let source = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![(
+            "Location",
+            format!("//{target_authority}/v1/new?via=network"),
+        )],
+        "redirect",
+        Duration::ZERO,
+    )]);
+    let client = Client::builder(source.base_url.clone())
+        .request_timeout(Duration::from_millis(300))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .get("/v1/old")
+        .send_json()
+        .await
+        .expect("network-path redirect should be followed");
+    assert_eq!(body["ok"], Value::Bool(true));
+
+    let source_requests = source.requests();
+    assert_eq!(source_requests.len(), 1);
+    assert_eq!(source_requests[0].path, "/v1/old");
+
+    let target_requests = target.requests();
+    assert_eq!(target_requests.len(), 1);
+    assert_eq!(target_requests[0].path, "/v1/new?via=network");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

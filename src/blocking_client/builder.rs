@@ -31,8 +31,8 @@ use crate::retry::{
 };
 use crate::tls::{TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore};
 use crate::util::{
-    parse_header_name, parse_header_value, redact_uri_for_logs, validate_base_url,
-    validate_http_proxy_uri,
+    mark_sensitive_header_value, parse_header_name, parse_header_value, redact_uri_for_logs,
+    validate_base_url, validate_http_proxy_uri,
 };
 
 use super::transport::{TransportAgents, backend_is_available, default_tls_backend, make_agent};
@@ -231,7 +231,8 @@ impl ClientBuilder {
     }
 
     /// Adds a default header included with every request.
-    pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+    pub fn default_header(mut self, name: HeaderName, mut value: HeaderValue) -> Self {
+        mark_sensitive_header_value(&name, &mut value);
         self.default_headers.insert(name, value);
         self
     }

@@ -56,6 +56,18 @@ impl BlockingSemaphore {
         }
     }
 
+    fn try_acquire(self: &Arc<Self>) -> Option<BlockingSemaphorePermit> {
+        let mut state = lock_unpoisoned(&self.state);
+        if *state == 0 {
+            return None;
+        }
+        *state -= 1;
+        Some(BlockingSemaphorePermit {
+            semaphore: Arc::clone(self),
+            released: false,
+        })
+    }
+
     fn acquire(
         self: &Arc<Self>,
         deadline_at: Option<Instant>,
@@ -162,7 +174,7 @@ impl RequestLimiters {
         let host = host.and_then(normalize_host_key);
         let permit = match (self.per_host_limit, host) {
             (Some(limit), Some(host)) => {
-                let semaphore = {
+                let wait_for_semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
                     let now = self.clock.now_monotonic();
                     cleanup_stale_per_host_limiters(
@@ -177,9 +189,14 @@ impl RequestLimiters {
                         last_used_at: now,
                     });
                     entry.last_used_at = now;
+                    if let Some(permit) = entry.semaphore.try_acquire() {
+                        return Ok(HostRequestPermit {
+                            _permit: Some(permit),
+                        });
+                    }
                     Arc::clone(&entry.semaphore)
                 };
-                Some(semaphore.acquire(deadline_at)?)
+                Some(wait_for_semaphore.acquire(deadline_at)?)
             }
             _ => None,
         };

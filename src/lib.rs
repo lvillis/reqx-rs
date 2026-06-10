@@ -108,6 +108,8 @@
 //! - Rustls backends append custom root CAs to [`TlsRootStore::WebPki`]'s
 //!   bundled Mozilla roots. [`TlsRootStore::Specific`] trusts only explicit
 //!   custom roots.
+//! - PEM root CA and certificate-chain inputs must contain only `CERTIFICATE`
+//!   blocks; pass private keys through the dedicated identity key parameter.
 //! - Blocking `native-tls` cannot merge custom root CAs into the system trust
 //!   store; use [`TlsRootStore::Specific`] when adding explicit roots there.
 

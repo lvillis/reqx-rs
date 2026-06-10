@@ -149,6 +149,22 @@ enum StreamCompletionState {
     Canceled,
 }
 
+fn atomic_saturating_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(delta))
+    });
+}
+
+fn atomic_saturating_sub(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(delta))
+    });
+}
+
+fn atomic_saturating_increment(counter: &AtomicU64) {
+    atomic_saturating_add(counter, 1);
+}
+
 impl ClientMetrics {
     pub(crate) fn with_options(metrics_enabled: bool, otel: OtelTelemetry) -> Self {
         Self {
@@ -188,7 +204,7 @@ impl ClientMetrics {
 
     pub(crate) fn record_request_started(&self) {
         if let Some(inner) = &self.inner {
-            inner.requests_started.fetch_add(1, Ordering::Relaxed);
+            atomic_saturating_increment(&inner.requests_started);
         }
         self.otel.record_request_started();
     }
@@ -196,7 +212,7 @@ impl ClientMetrics {
     pub(crate) fn enter_in_flight(&self) -> InFlightGuard {
         match &self.inner {
             Some(inner) => {
-                inner.in_flight.fetch_add(1, Ordering::Relaxed);
+                atomic_saturating_increment(&inner.in_flight);
                 InFlightGuard {
                     inner: Some(Arc::clone(inner)),
                 }
@@ -207,7 +223,7 @@ impl ClientMetrics {
 
     pub(crate) fn record_retry(&self) {
         if let Some(inner) = &self.inner {
-            inner.retries.fetch_add(1, Ordering::Relaxed);
+            atomic_saturating_increment(&inner.retries);
         }
         self.otel.record_retry();
     }
@@ -246,7 +262,7 @@ impl ClientMetrics {
 
     pub(crate) fn record_request_completed_error(&self, error: &Error, latency: Duration) {
         if let Some(inner) = &self.inner {
-            inner.requests_failed.fetch_add(1, Ordering::Relaxed);
+            atomic_saturating_increment(&inner.requests_failed);
         }
         self.record_latency(latency);
         self.otel.record_request_failed(error);
@@ -258,10 +274,10 @@ impl ClientMetrics {
                 if let Some(inner) = &self.inner {
                     match phase {
                         TimeoutPhase::Transport => {
-                            inner.timeout_transport.fetch_add(1, Ordering::Relaxed);
+                            atomic_saturating_increment(&inner.timeout_transport);
                         }
                         TimeoutPhase::ResponseBody => {
-                            inner.timeout_response_body.fetch_add(1, Ordering::Relaxed);
+                            atomic_saturating_increment(&inner.timeout_response_body);
                         }
                     }
                 }
@@ -269,35 +285,33 @@ impl ClientMetrics {
             }
             Error::DeadlineExceeded { .. } => {
                 if let Some(inner) = &self.inner {
-                    inner.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.deadline_exceeded);
                 }
             }
             Error::Transport { kind, .. } => {
                 if let Some(inner) = &self.inner {
-                    inner.transport_errors.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.transport_errors);
                 }
                 self.add_transport_error_kind_count(*kind);
             }
             Error::ReadBody { .. } => {
                 if let Some(inner) = &self.inner {
-                    inner.read_body_errors.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.read_body_errors);
                 }
             }
             Error::WriteBody { .. } => {
                 if let Some(inner) = &self.inner {
-                    inner.write_body_errors.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.write_body_errors);
                 }
             }
             Error::ResponseBodyTooLarge { .. } => {
                 if let Some(inner) = &self.inner {
-                    inner
-                        .response_body_too_large
-                        .fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.response_body_too_large);
                 }
             }
             Error::HttpStatus { status, .. } => {
                 if let Some(inner) = &self.inner {
-                    inner.http_status_errors.fetch_add(1, Ordering::Relaxed);
+                    atomic_saturating_increment(&inner.http_status_errors);
                 }
                 self.add_status_count(*status);
                 self.add_http_status_error_count(*status);
@@ -338,7 +352,7 @@ impl ClientMetrics {
 
     pub(crate) fn record_request_completed_canceled(&self, latency: Duration) {
         if let Some(inner) = &self.inner {
-            inner.requests_canceled.fetch_add(1, Ordering::Relaxed);
+            atomic_saturating_increment(&inner.requests_canceled);
         }
         self.record_latency(latency);
         self.otel.record_request_canceled();
@@ -346,7 +360,7 @@ impl ClientMetrics {
 
     fn record_request_completed_success(&self, status: u16, latency: Duration) {
         if let Some(inner) = &self.inner {
-            inner.requests_succeeded.fetch_add(1, Ordering::Relaxed);
+            atomic_saturating_increment(&inner.requests_succeeded);
         }
         self.add_status_count(status);
         self.otel.record_request_succeeded(status);
@@ -426,10 +440,10 @@ impl ClientMetrics {
         let Some(inner) = &self.inner else {
             return;
         };
-        inner.latency_samples.fetch_add(1, Ordering::Relaxed);
-        inner.latency_total_ms.fetch_add(
+        atomic_saturating_increment(&inner.latency_samples);
+        atomic_saturating_add(
+            &inner.latency_total_ms,
             latency.as_millis().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
         );
     }
 
@@ -438,7 +452,8 @@ impl ClientMetrics {
             return;
         };
         let mut status_counts = lock_unpoisoned(&inner.status_counts);
-        *status_counts.entry(status).or_insert(0) += 1;
+        let count = status_counts.entry(status).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     fn add_error_code_count(&self, error_code: ErrorCode) {
@@ -446,7 +461,8 @@ impl ClientMetrics {
             return;
         };
         let mut error_code_counts = lock_unpoisoned(&inner.error_code_counts);
-        *error_code_counts.entry(error_code).or_insert(0) += 1;
+        let count = error_code_counts.entry(error_code).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     fn add_timeout_phase_count(&self, phase: TimeoutPhase) {
@@ -454,7 +470,8 @@ impl ClientMetrics {
             return;
         };
         let mut timeout_phase_counts = lock_unpoisoned(&inner.timeout_phase_counts);
-        *timeout_phase_counts.entry(phase).or_insert(0) += 1;
+        let count = timeout_phase_counts.entry(phase).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     fn add_transport_error_kind_count(&self, kind: TransportErrorKind) {
@@ -462,7 +479,8 @@ impl ClientMetrics {
             return;
         };
         let mut transport_error_kind_counts = lock_unpoisoned(&inner.transport_error_kind_counts);
-        *transport_error_kind_counts.entry(kind).or_insert(0) += 1;
+        let count = transport_error_kind_counts.entry(kind).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     fn add_http_status_error_count(&self, status: u16) {
@@ -470,14 +488,15 @@ impl ClientMetrics {
             return;
         };
         let mut http_status_error_counts = lock_unpoisoned(&inner.http_status_error_counts);
-        *http_status_error_counts.entry(status).or_insert(0) += 1;
+        let count = http_status_error_counts.entry(status).or_insert(0);
+        *count = count.saturating_add(1);
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(inner) = &self.inner {
-            inner.in_flight.fetch_sub(1, Ordering::Relaxed);
+            atomic_saturating_sub(&inner.in_flight, 1);
         }
     }
 }
@@ -528,5 +547,69 @@ impl StreamCompletion {
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
         self.complete_canceled();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use crate::error::ErrorCode;
+    use crate::otel::OtelTelemetry;
+    use crate::util::lock_unpoisoned;
+
+    use super::{ClientMetrics, InFlightGuard};
+
+    #[test]
+    fn scalar_metrics_saturate_instead_of_wrapping() {
+        let metrics = ClientMetrics::with_options(true, OtelTelemetry::disabled());
+        let inner = metrics.inner.as_ref().expect("metrics should be enabled");
+        inner.requests_started.store(u64::MAX, Ordering::Relaxed);
+        inner
+            .latency_total_ms
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        inner.latency_samples.store(u64::MAX, Ordering::Relaxed);
+
+        metrics.record_request_started();
+        metrics.record_latency(Duration::from_millis(10));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests.started, u64::MAX);
+        assert_eq!(snapshot.latency.total_ms, u64::MAX);
+        assert_eq!(snapshot.latency.samples, u64::MAX);
+    }
+
+    #[test]
+    fn keyed_metrics_saturate_instead_of_wrapping() {
+        let metrics = ClientMetrics::with_options(true, OtelTelemetry::disabled());
+        let inner = metrics.inner.as_ref().expect("metrics should be enabled");
+        lock_unpoisoned(&inner.status_counts).insert(503, u64::MAX);
+        lock_unpoisoned(&inner.error_code_counts).insert(ErrorCode::Transport, u64::MAX);
+
+        metrics.add_status_count(503);
+        metrics.add_error_code_count(ErrorCode::Transport);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.responses.status_counts.get(&503), Some(&u64::MAX));
+        assert_eq!(
+            snapshot.errors.by_code.get(&ErrorCode::Transport),
+            Some(&u64::MAX)
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_release_saturates_at_zero() {
+        let metrics = ClientMetrics::with_options(true, OtelTelemetry::disabled());
+        let inner = metrics
+            .inner
+            .as_ref()
+            .expect("metrics should be enabled")
+            .clone();
+
+        drop(InFlightGuard { inner: Some(inner) });
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests.in_flight, 0);
     }
 }

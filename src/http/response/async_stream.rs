@@ -15,7 +15,7 @@ use crate::body::decode_content_encoded_body_limited;
 use crate::content_encoding::should_decode_content_encoded_body;
 use crate::error::{Error, TimeoutPhase};
 use crate::limiters::{GlobalRequestPermit, HostRequestPermit};
-use crate::util::duration_from_millis_saturating;
+use crate::util::{duration_from_millis_saturating, saturating_u64_to_usize};
 
 use super::{
     Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
@@ -346,7 +346,8 @@ impl StreamBody {
         if let Some(chunk) = pending_chunk {
             copied = copied.saturating_add(chunk.len() as u64);
             if copied > max_bytes as u64 {
-                let error = self.response_body_too_large_error(max_bytes, copied as usize);
+                let error =
+                    self.response_body_too_large_error(max_bytes, saturating_u64_to_usize(copied));
                 self.complete_error(&error);
                 return Err(error);
             }
@@ -362,7 +363,8 @@ impl StreamBody {
         } {
             copied = copied.saturating_add(chunk.len() as u64);
             if copied > max_bytes as u64 {
-                let error = self.response_body_too_large_error(max_bytes, copied as usize);
+                let error =
+                    self.response_body_too_large_error(max_bytes, saturating_u64_to_usize(copied));
                 self.complete_error(&error);
                 return Err(error);
             }
@@ -403,7 +405,6 @@ impl std::fmt::Debug for StreamBody {
     }
 }
 
-#[derive(Debug)]
 /// Streaming async response body with request metadata.
 ///
 /// Use this when you want to process large response bodies incrementally
@@ -437,6 +438,18 @@ pub struct ResponseStream {
     headers: HeaderMap,
     uri_raw: String,
     body: StreamBody,
+}
+
+impl std::fmt::Debug for ResponseStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseStream")
+            .field("status", &self.status)
+            .field("headers_len", &self.headers.len())
+            .field("uri_redacted", &self.body.uri_redacted())
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl ResponseStream {

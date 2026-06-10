@@ -1,6 +1,12 @@
 use std::time::Duration;
 
-use reqx::prelude::{Client, TlsBackend, TlsRootStore, TlsVersion};
+#[cfg(any(
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+use reqx::prelude::TlsBackend;
+use reqx::prelude::{Client, TlsRootStore, TlsVersion};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -29,16 +29,22 @@ use crate::extensions::{
     EndpointSelector, OtelPathNormalizer, StandardOtelPathNormalizer, SystemClock,
 };
 use crate::proxy::{NoProxyRule, normalize_tunnel_target_uri, should_bypass_proxy_uri};
+#[cfg(feature = "_blocking")]
+use crate::response::BlockingResponseStreamContext;
 use crate::response::Response;
 use crate::retry::{RetryDecision, RetryPolicy, RetryReason, request_supports_retry};
-use crate::tls::{TlsBackend, TlsOptions, TlsRootStore, TlsVersion, tls_version_bounds};
+use crate::tls::{
+    TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, TlsVersion,
+    tls_version_bounds,
+};
 #[cfg(feature = "_blocking")]
 use crate::util::is_timeout_io_error;
+use crate::util::mark_sensitive_headers;
 use crate::util::{
     append_query_pairs, bounded_retry_delay, default_port, ensure_accept_encoding_async,
-    join_base_path, parse_retry_after, rate_limit_bucket_key, redact_uri_for_logs,
-    redact_uri_without_url_normalization, resolve_redirect_uri, resolve_uri, same_origin,
-    sanitize_headers_for_redirect,
+    join_base_path, parse_header_value, parse_retry_after, rate_limit_bucket_key,
+    redact_uri_for_logs, redact_uri_like_text_for_logs, redact_uri_without_url_normalization,
+    resolve_redirect_uri, resolve_uri, same_origin, sanitize_headers_for_redirect,
 };
 #[cfg(feature = "_async")]
 use crate::util::{
@@ -358,6 +364,21 @@ fn resolve_redirect_uri_rejects_userinfo_location() {
 }
 
 #[test]
+fn resolve_redirect_uri_accepts_network_path_reference() {
+    let current: http::Uri = "https://api.example.com/v1/old"
+        .parse()
+        .expect("current uri should parse");
+    let redirected =
+        resolve_redirect_uri(&current, "//cdn.example.com/v1/new?token=public#section")
+            .expect("network-path redirect location should resolve");
+
+    assert_eq!(
+        redirected.to_string(),
+        "https://cdn.example.com/v1/new?token=public"
+    );
+}
+
+#[test]
 fn resolve_redirect_uri_rejects_malformed_http_absolute_location() {
     let current: http::Uri = "https://api.example.com/v1/old"
         .parse()
@@ -450,6 +471,28 @@ fn sanitize_headers_for_redirect_removes_proxy_authorization() {
 }
 
 #[test]
+fn sanitize_headers_for_cross_origin_redirect_removes_credentials() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        "Bearer token".parse().expect("authorization should parse"),
+    );
+    headers.insert(COOKIE, "session=abc".parse().expect("cookie should parse"));
+    headers.insert(
+        PROXY_AUTHORIZATION,
+        "Basic dXNlcjpwYXNz"
+            .parse()
+            .expect("proxy-authorization should parse"),
+    );
+
+    sanitize_headers_for_redirect(&mut headers, false, false);
+
+    assert!(!headers.contains_key(AUTHORIZATION));
+    assert!(!headers.contains_key(COOKIE));
+    assert!(!headers.contains_key(PROXY_AUTHORIZATION));
+}
+
+#[test]
 fn sanitize_headers_for_redirect_removes_hop_by_hop_headers() {
     let mut headers = HeaderMap::new();
     let connection_option = HeaderName::from_static("x-connection-option");
@@ -499,6 +542,49 @@ fn sanitize_headers_for_redirect_removes_hop_by_hop_headers() {
 }
 
 #[test]
+fn parse_header_value_marks_standard_sensitive_headers_for_debug() {
+    for (name, value, secret) in [
+        ("authorization", "Bearer secret-token", "secret-token"),
+        ("Cookie", "session=secret-cookie", "secret-cookie"),
+        (
+            "proxy-authorization",
+            "Basic secret-proxy-token",
+            "secret-proxy-token",
+        ),
+    ] {
+        let value = parse_header_value(name, value).expect("sensitive header value should parse");
+        let debug = format!("{value:?}");
+
+        assert!(debug.contains("Sensitive"));
+        assert!(!debug.contains(secret));
+    }
+}
+
+#[test]
+fn mark_sensitive_headers_marks_interceptor_inserted_values_for_debug() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        "Bearer interceptor-token"
+            .parse()
+            .expect("authorization should parse"),
+    );
+    headers.insert(
+        COOKIE,
+        "session=interceptor-cookie"
+            .parse()
+            .expect("cookie should parse"),
+    );
+
+    mark_sensitive_headers(&mut headers);
+
+    let debug = format!("{headers:?}");
+    assert!(debug.contains("Sensitive"));
+    assert!(!debug.contains("interceptor-token"));
+    assert!(!debug.contains("interceptor-cookie"));
+}
+
+#[test]
 fn standard_otel_path_normalizer_truncates_on_segment_boundary() {
     let input = format!(
         "/{}",
@@ -519,6 +605,24 @@ fn standard_otel_path_normalizer_truncates_on_segment_boundary() {
 }
 
 #[test]
+fn standard_otel_path_normalizer_reduces_short_numeric_segments() {
+    let normalizer = StandardOtelPathNormalizer;
+    let normalized = normalizer.normalize_path("/v1/users/42/orders/12345");
+
+    assert_eq!(normalized, "/v1/users/:int/orders/:int");
+}
+
+#[test]
+fn standard_otel_path_normalizer_drops_partial_first_segment() {
+    let input = format!("/{}", "secret%2Ftoken".repeat(20));
+    let normalizer = StandardOtelPathNormalizer;
+    let normalized = normalizer.normalize_path(&input);
+
+    assert_eq!(normalized, "/");
+    assert!(!normalized.contains("secret"));
+}
+
+#[test]
 fn redact_uri_for_logs_masks_credential_like_path_segments_and_removes_query() {
     let redacted = redact_uri_for_logs(
         "https://api.telegram.org/bot123456:AAABBBCCCDDDEE/getUpdates?offset=10",
@@ -527,6 +631,18 @@ fn redact_uri_for_logs_masks_credential_like_path_segments_and_removes_query() {
         redacted,
         "https://api.telegram.org/bot123456:redacted/getUpdates"
     );
+}
+
+#[test]
+fn redact_uri_for_logs_masks_percent_encoded_credential_path_separator() {
+    let redacted = redact_uri_for_logs(
+        "https://api.telegram.org/bot123456%3AAAABBBCCCDDDEE/getUpdates?offset=10",
+    );
+    assert_eq!(
+        redacted,
+        "https://api.telegram.org/bot123456:redacted/getUpdates"
+    );
+    assert!(!redacted.contains("AAABBBCCCDDDEE"));
 }
 
 #[test]
@@ -564,6 +680,32 @@ fn redact_uri_for_logs_masks_non_authority_credentials() {
 fn redact_uri_for_logs_keeps_unknown_non_authority_uri_shape() {
     let redacted = redact_uri_for_logs("urn:example:foo@bar?token=secret");
     assert_eq!(redacted, "urn:example:foo@bar");
+}
+
+#[test]
+fn redact_uri_like_text_for_logs_redacts_embedded_uri_tokens() {
+    let redacted = redact_uri_like_text_for_logs(
+        "connect failed: url=https://user:pass@api.example.com/v1?token=secret#frag, proxy=http://proxy-user:proxy-pass@proxy.example.com:badport/tunnel?secret=1",
+    );
+
+    assert!(!redacted.contains("user:pass"));
+    assert!(!redacted.contains("proxy-user:proxy-pass"));
+    assert!(!redacted.contains("token=secret"));
+    assert!(!redacted.contains("secret=1"));
+    assert!(redacted.contains("url=https://api.example.com/v1,"));
+    assert!(redacted.contains("proxy=http://proxy.example.com:badport/tunnel"));
+}
+
+#[test]
+fn redact_uri_like_text_for_logs_redacts_adjacent_uri_tokens_without_whitespace() {
+    let redacted = redact_uri_like_text_for_logs(
+        "connect failed:url=https://api.example.com/v1,proxy=http://proxy-user:proxy-pass@proxy.example.com/tunnel",
+    );
+
+    assert!(!redacted.contains("proxy-user:proxy-pass"));
+    assert!(
+        redacted.contains("url=https://api.example.com/v1,proxy=http://proxy.example.com/tunnel")
+    );
 }
 
 #[test]
@@ -629,6 +771,49 @@ fn response_json_decode_error_contains_body() {
 }
 
 #[test]
+fn response_debug_omits_body_contents() {
+    let response = Response::new(
+        http::StatusCode::OK,
+        http::HeaderMap::new(),
+        bytes::Bytes::from_static(b"secret-response-body"),
+    );
+
+    let debug = format!("{response:?}");
+
+    assert!(debug.contains("body_len"));
+    assert!(!debug.contains("secret-response-body"));
+}
+
+#[cfg(feature = "_blocking")]
+#[test]
+fn blocking_response_stream_debug_omits_raw_uri_query() {
+    let stream = crate::response::BlockingResponseStream::new(
+        http::StatusCode::OK,
+        http::HeaderMap::new(),
+        ureq::Body::builder().data("body"),
+        BlockingResponseStreamContext {
+            method: http::Method::GET,
+            uri_raw: "https://api.example.com/v1/items?token=secret-token".to_owned(),
+            uri_redacted: "https://api.example.com/v1/items".to_owned(),
+            timeout_ms: 1000,
+            total_timeout_ms: None,
+            deadline_at: None,
+            deadline_slack: Duration::from_millis(10),
+            lifecycle: None,
+            global_permit: None,
+            host_permit: None,
+        },
+    );
+
+    let debug = format!("{stream:?}");
+
+    assert!(debug.contains("uri_redacted"));
+    assert!(debug.contains("https://api.example.com/v1/items"));
+    assert!(!debug.contains("uri_raw"));
+    assert!(!debug.contains("secret-token"));
+}
+
+#[test]
 fn retry_policy_backoff_is_capped() {
     let retry_policy = RetryPolicy::standard()
         .base_backoff(Duration::from_millis(100))
@@ -645,6 +830,23 @@ fn retry_policy_backoff_is_capped() {
     assert_eq!(
         retry_policy.backoff_for_retry(3),
         Duration::from_millis(250)
+    );
+}
+
+#[test]
+fn retry_policy_backoff_preserves_sub_millisecond_durations() {
+    let retry_policy = RetryPolicy::standard()
+        .base_backoff(Duration::from_micros(500))
+        .max_backoff(Duration::from_micros(900))
+        .jitter_ratio(0.0);
+
+    assert_eq!(
+        retry_policy.backoff_for_retry(1),
+        Duration::from_micros(500)
+    );
+    assert_eq!(
+        retry_policy.backoff_for_retry(2),
+        Duration::from_micros(900)
     );
 }
 
@@ -1070,6 +1272,33 @@ fn error_display_redacts_query_from_request_uri() {
     assert!(display.contains("/v1/items"));
 }
 
+#[test]
+fn transport_error_display_redacts_uri_like_source_messages() {
+    let source = TestNestedError::with_source(
+        "connect failed for https://user:pass@api.example.com/v1/items?token=secret#frag",
+        TestNestedError::new(
+            "proxy handshake failed via http://proxy-user:proxy-pass@proxy.example.com:badport/tunnel?secret=1",
+        ),
+    );
+    let error = transport_error(
+        TransportErrorKind::Connect,
+        http::Method::GET,
+        "https://api.example.com/v1/items".to_owned(),
+        source,
+    );
+
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for rendered in [display, debug] {
+        assert!(!rendered.contains("user:pass"));
+        assert!(!rendered.contains("proxy-user:proxy-pass"));
+        assert!(!rendered.contains("token=secret"));
+        assert!(!rendered.contains("secret=1"));
+        assert!(rendered.contains("https://api.example.com/v1/items"));
+        assert!(rendered.contains("http://proxy.example.com:badport/tunnel"));
+    }
+}
+
 #[derive(Debug)]
 struct TestNestedError {
     message: &'static str,
@@ -1153,6 +1382,45 @@ fn tls_version_bounds_validate_range() {
         }
         Err(other) => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn tls_options_debug_omits_key_material_and_passwords() {
+    let pem_options = TlsOptions {
+        root_store: TlsRootStore::Specific,
+        root_certificates: vec![
+            TlsRootCertificate::Pem(b"secret-root-ca-pem".to_vec()),
+            TlsRootCertificate::Der(b"secret-root-ca-der".to_vec()),
+        ],
+        client_identity: Some(TlsClientIdentity::Pem {
+            cert_chain_pem: b"secret-cert-chain".to_vec(),
+            private_key_pem: b"secret-private-key".to_vec(),
+        }),
+        min_protocol_version: Some(TlsVersion::V1_2),
+        max_protocol_version: Some(TlsVersion::V1_3),
+    };
+    let debug = format!("{pem_options:?}");
+
+    assert!(debug.contains("root_certificates"));
+    assert!(debug.contains("private_key_pem_len"));
+    assert!(!debug.contains("secret-root-ca-pem"));
+    assert!(!debug.contains("secret-root-ca-der"));
+    assert!(!debug.contains("secret-cert-chain"));
+    assert!(!debug.contains("secret-private-key"));
+
+    let pkcs12_options = TlsOptions {
+        client_identity: Some(TlsClientIdentity::Pkcs12 {
+            identity_der: b"secret-pkcs12-identity".to_vec(),
+            password: "secret-password".to_owned(),
+        }),
+        ..TlsOptions::default()
+    };
+    let debug = format!("{pkcs12_options:?}");
+
+    assert!(debug.contains("identity_der_len"));
+    assert!(debug.contains("password_len"));
+    assert!(!debug.contains("secret-pkcs12-identity"));
+    assert!(!debug.contains("secret-password"));
 }
 
 #[cfg(feature = "async-tls-rustls-ring")]
@@ -1732,6 +2000,34 @@ fn write_body_error_accessors_expose_request_context() {
 }
 
 #[test]
+fn read_and_write_body_error_display_omit_source_messages() {
+    let read_error = Error::ReadBody {
+        source: Box::new(std::io::Error::other(
+            "upstream leaked https://api.example.com/v1?token=secret",
+        )),
+    };
+    let write_error = Error::WriteBody {
+        method: http::Method::GET,
+        uri: "https://api.example.com/v1/download".to_owned(),
+        source: Box::new(std::io::Error::other(
+            "sink leaked https://api.example.com/v1?token=secret",
+        )),
+    };
+
+    let read_display = read_error.to_string();
+    let read_debug = format!("{read_error:?}");
+    let write_display = write_error.to_string();
+    let write_debug = format!("{write_error:?}");
+
+    assert!(!read_display.contains("token=secret"));
+    assert!(!read_debug.contains("token=secret"));
+    assert!(!write_display.contains("token=secret"));
+    assert!(!write_debug.contains("token=secret"));
+    assert!(!read_display.contains("upstream leaked"));
+    assert!(!write_display.contains("sink leaked"));
+}
+
+#[test]
 fn build_rejects_invalid_adaptive_concurrency_policy() {
     let policy = AdaptiveConcurrencyPolicy::standard()
         .min_limit(10)
@@ -1959,6 +2255,74 @@ fn custom_root_ca_requires_explicit_root_store() {
     }
 }
 
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
+#[test]
+fn async_rustls_root_ca_pem_rejects_non_certificate_blocks() {
+    #[cfg(feature = "async-tls-rustls-ring")]
+    let backend = TlsBackend::RustlsRing;
+    #[cfg(all(
+        not(feature = "async-tls-rustls-ring"),
+        feature = "async-tls-rustls-aws-lc-rs"
+    ))]
+    let backend = TlsBackend::RustlsAwsLcRs;
+
+    let result = Client::builder("https://api.example.com")
+        .tls_backend(backend)
+        .tls_root_store(TlsRootStore::WebPki)
+        .tls_root_ca_pem(
+            b"-----BEGIN PRIVATE KEY-----\nAQIDBA==\n-----END PRIVATE KEY-----\n".to_vec(),
+        )
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("root CA PEM should reject non-certificate PEM blocks"),
+        Err(error) => error,
+    };
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("non-certificate block"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[cfg(any(
+    feature = "blocking-tls-rustls-ring",
+    feature = "blocking-tls-rustls-aws-lc-rs"
+))]
+#[test]
+fn blocking_rustls_root_ca_pem_rejects_non_certificate_blocks() {
+    #[cfg(feature = "blocking-tls-rustls-ring")]
+    let backend = TlsBackend::RustlsRing;
+    #[cfg(all(
+        not(feature = "blocking-tls-rustls-ring"),
+        feature = "blocking-tls-rustls-aws-lc-rs"
+    ))]
+    let backend = TlsBackend::RustlsAwsLcRs;
+
+    let result = crate::blocking::Client::builder("https://api.example.com")
+        .tls_backend(backend)
+        .tls_root_store(TlsRootStore::WebPki)
+        .tls_root_ca_pem(
+            b"-----BEGIN PRIVATE KEY-----\nAQIDBA==\n-----END PRIVATE KEY-----\n".to_vec(),
+        )
+        .build();
+
+    let error = match result {
+        Ok(_) => panic!("root CA PEM should reject non-certificate PEM blocks"),
+        Err(error) => error,
+    };
+    match error {
+        Error::TlsConfig { message, .. } => {
+            assert!(message.contains("non-certificate block"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
 #[test]
 fn rustls_backend_rejects_pkcs12_identity_configuration() {
     #[cfg(feature = "async-tls-rustls-ring")]
@@ -2053,6 +2417,14 @@ fn blocking_native_tls_webpki_root_store_is_rejected() {
 #[test]
 fn no_proxy_rule_matches_domain_and_subdomain() {
     let rule = NoProxyRule::parse(".example.com").expect("valid rule");
+    assert!(rule.matches("example.com", None));
+    assert!(rule.matches("api.example.com", None));
+    assert!(!rule.matches("another.com", None));
+}
+
+#[test]
+fn no_proxy_rule_treats_leading_wildcard_as_domain_suffix() {
+    let rule = NoProxyRule::parse("*.example.com").expect("valid wildcard suffix rule");
     assert!(rule.matches("example.com", None));
     assert!(rule.matches("api.example.com", None));
     assert!(!rule.matches("another.com", None));
@@ -2182,6 +2554,23 @@ fn no_proxy_rule_rejects_url_with_path_query_or_userinfo() {
     assert!(NoProxyRule::parse("https://api.example.com/v1").is_none());
     assert!(NoProxyRule::parse("https://api.example.com?scope=one").is_none());
     assert!(NoProxyRule::parse("https://user:pass@api.example.com").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_plain_rule_with_path_query_fragment_or_userinfo() {
+    assert!(NoProxyRule::parse("api.example.com/v1").is_none());
+    assert!(NoProxyRule::parse("api.example.com?scope=one").is_none());
+    assert!(NoProxyRule::parse("api.example.com#fragment").is_none());
+    assert!(NoProxyRule::parse("user@api.example.com").is_none());
+    assert!(NoProxyRule::parse("api example.com").is_none());
+    assert!(NoProxyRule::parse(r"api.example.com\v1").is_none());
+}
+
+#[test]
+fn no_proxy_rule_rejects_unsupported_wildcard_globs() {
+    assert!(NoProxyRule::parse("*example.com").is_none());
+    assert!(NoProxyRule::parse("api.*.example.com").is_none());
+    assert!(NoProxyRule::parse("example.*").is_none());
 }
 
 #[test]
@@ -2623,6 +3012,21 @@ fn decode_content_encoded_body_rejects_unknown_encoding() {
             .expect_err("unknown content-encoding should fail");
     match error {
         DecodeContentEncodingError::Decode { encoding, .. } => assert_eq!(encoding, "x-custom"),
+        other => panic!("unexpected decode error: {other:?}"),
+    }
+}
+
+#[test]
+fn decode_content_encoded_body_limited_rejects_unencoded_payload() {
+    let headers = http::HeaderMap::new();
+    let error =
+        decode_content_encoded_body_limited(bytes::Bytes::from_static(b"abcdef"), &headers, 4)
+            .expect_err("unencoded payload should still honor the decode limit");
+
+    match error {
+        DecodeContentEncodingError::TooLarge { actual_bytes } => {
+            assert_eq!(actual_bytes, 6);
+        }
         other => panic!("unexpected decode error: {other:?}"),
     }
 }

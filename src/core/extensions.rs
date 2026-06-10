@@ -183,7 +183,7 @@ fn truncate_path_at_segment_boundary(path: &str, max_len: usize) -> String {
     }
     if let Some(last_separator) = prefix.rfind('/') {
         if last_separator == 0 {
-            prefix.to_owned()
+            "/".to_owned()
         } else {
             prefix[..last_separator].to_owned()
         }
@@ -196,11 +196,11 @@ fn normalize_path_segment(segment: &str) -> &str {
     if is_uuid_like(segment) {
         return ":uuid";
     }
+    if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
+        return ":int";
+    }
     if segment.len() >= 16 && segment.chars().all(|c| c.is_ascii_hexdigit()) {
         return ":hex";
-    }
-    if segment.len() >= 12 && segment.chars().all(|c| c.is_ascii_digit()) {
-        return ":int";
     }
     if segment.len() >= 24 && looks_like_token(segment) {
         return ":token";

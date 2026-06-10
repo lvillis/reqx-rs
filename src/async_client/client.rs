@@ -90,13 +90,24 @@ use crate::retry::{
 use crate::tls::tls_config_error;
 use crate::tls::{
     TlsBackend, TlsClientIdentity, TlsOptions, TlsRootCertificate, TlsRootStore, TlsVersion,
-    tls_version_bounds,
 };
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs",
+    feature = "async-tls-native"
+))]
+use crate::tls::{parse_pem_certificate_blocks, tls_version_bounds};
+#[cfg(any(
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs",
+    feature = "async-tls-native"
+))]
+use crate::util::classify_transport_error;
 use crate::util::{
-    bounded_retry_delay, classify_transport_error, deadline_exceeded_error,
-    duration_millis_u64_saturating, ensure_accept_encoding_async, lock_unpoisoned,
-    parse_header_name, parse_header_value, redact_uri_for_logs, total_timeout_deadline,
-    validate_base_url, validate_http_proxy_uri,
+    bounded_retry_delay, deadline_exceeded_error, duration_millis_u64_saturating,
+    ensure_accept_encoding_async, lock_unpoisoned, mark_sensitive_header_value,
+    mark_sensitive_headers, parse_header_name, parse_header_value, redact_uri_for_logs,
+    total_timeout_deadline, validate_base_url, validate_http_proxy_uri,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -130,100 +141,6 @@ fn default_tls_backend() -> TlsBackend {
     DEFAULT_TLS_BACKEND
 }
 
-#[cfg(feature = "async-tls-native")]
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-#[cfg(feature = "async-tls-native")]
-fn contains_pem_marker(haystack: &[u8], marker: &[u8]) -> bool {
-    find_subslice(haystack, marker).is_some()
-}
-
-#[cfg(feature = "async-tls-native")]
-fn extract_pem_certificate_blocks(pem_bundle: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
-    const PEM_BEGIN_PREFIX: &[u8] = b"-----BEGIN ";
-    const PEM_END_PREFIX: &[u8] = b"-----END ";
-    const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-    const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
-
-    let mut blocks = Vec::new();
-    let mut cursor = 0usize;
-    loop {
-        let remaining = &pem_bundle[cursor..];
-        let next_begin = find_subslice(remaining, PEM_BEGIN_PREFIX);
-        let next_end = find_subslice(remaining, PEM_END_PREFIX);
-
-        match (next_begin, next_end) {
-            (None, None) => break,
-            (None, Some(_)) => {
-                return Err(tls_config_error(
-                    TlsBackend::NativeTls,
-                    "PEM root certificate contains an end marker without a matching begin marker",
-                ));
-            }
-            (Some(begin_offset), Some(end_offset)) if end_offset < begin_offset => {
-                return Err(tls_config_error(
-                    TlsBackend::NativeTls,
-                    "PEM root certificate contains an end marker without a matching begin marker",
-                ));
-            }
-            (Some(begin_offset), _) => {
-                let begin = cursor + begin_offset;
-                if !pem_bundle[begin..].starts_with(PEM_BEGIN) {
-                    return Err(tls_config_error(
-                        TlsBackend::NativeTls,
-                        "PEM root certificate contains a non-certificate block",
-                    ));
-                }
-
-                let end_search_start = begin + PEM_BEGIN.len();
-                let Some(end_offset) = find_subslice(&pem_bundle[end_search_start..], PEM_END)
-                else {
-                    return Err(tls_config_error(
-                        TlsBackend::NativeTls,
-                        "PEM root certificate block is missing its END CERTIFICATE marker",
-                    ));
-                };
-
-                if contains_pem_marker(
-                    &pem_bundle[end_search_start..end_search_start + end_offset],
-                    PEM_BEGIN_PREFIX,
-                ) {
-                    return Err(tls_config_error(
-                        TlsBackend::NativeTls,
-                        "PEM root certificate contains a nested begin marker",
-                    ));
-                }
-
-                let end = end_search_start + end_offset + PEM_END.len();
-                let mut block_end = end;
-                while block_end < pem_bundle.len()
-                    && (pem_bundle[block_end] == b'\n' || pem_bundle[block_end] == b'\r')
-                {
-                    block_end += 1;
-                }
-                blocks.push(pem_bundle[begin..block_end].to_vec());
-                cursor = block_end;
-            }
-        }
-    }
-
-    if blocks.is_empty() {
-        return Err(tls_config_error(
-            TlsBackend::NativeTls,
-            "no certificate blocks found in PEM root certificate",
-        ));
-    }
-
-    Ok(blocks)
-}
-
 #[cfg(any(
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs"
@@ -239,14 +156,17 @@ fn add_custom_rustls_root_certificates(
     for certificate in &tls_options.root_certificates {
         match certificate {
             TlsRootCertificate::Pem(pem) => {
-                let mut parsed_any = false;
-                for item in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
-                    let certificate = item.map_err(|source| {
-                        tls_config_error(
-                            tls_backend,
-                            format!("failed to parse PEM root certificate: {source}"),
-                        )
-                    })?;
+                for certificate_block in
+                    parse_pem_certificate_blocks(tls_backend, pem, "root certificate")?
+                {
+                    let certificate =
+                        rustls::pki_types::CertificateDer::from_pem_slice(&certificate_block)
+                            .map_err(|source| {
+                                tls_config_error(
+                                    tls_backend,
+                                    format!("failed to parse PEM root certificate: {source}"),
+                                )
+                            })?;
                     root_store.add(certificate).map_err(|source| {
                         tls_config_error(
                             tls_backend,
@@ -254,13 +174,6 @@ fn add_custom_rustls_root_certificates(
                         )
                     })?;
                     added_total = added_total.saturating_add(1);
-                    parsed_any = true;
-                }
-                if !parsed_any {
-                    return Err(tls_config_error(
-                        tls_backend,
-                        "no certificate blocks found in PEM root certificate",
-                    ));
                 }
             }
             TlsRootCertificate::Der(der) => {
@@ -401,20 +314,19 @@ fn build_rustls_tls_config(
             private_key_pem,
         }) => {
             let mut cert_chain = Vec::new();
-            for item in rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem) {
-                let certificate = item.map_err(|source| {
+            for certificate_block in
+                parse_pem_certificate_blocks(tls_backend, cert_chain_pem, "mTLS certificate chain")?
+            {
+                let certificate = rustls::pki_types::CertificateDer::from_pem_slice(
+                    &certificate_block,
+                )
+                .map_err(|source| {
                     tls_config_error(
                         tls_backend,
                         format!("failed to parse mTLS certificate chain PEM: {source}"),
                     )
                 })?;
                 cert_chain.push(certificate);
-            }
-            if cert_chain.is_empty() {
-                return Err(tls_config_error(
-                    tls_backend,
-                    "mTLS certificate chain PEM is empty or invalid",
-                ));
             }
             let private_key = rustls::pki_types::PrivateKeyDer::from_pem_slice(private_key_pem)
                 .map_err(|source| {
@@ -477,7 +389,7 @@ impl TransportClient {
     async fn request(
         &self,
         request: Request<ReqBody>,
-    ) -> Result<HttpResponse<Incoming>, hyper_util::client::legacy::Error> {
+    ) -> Result<HttpResponse<Incoming>, TransportRequestError> {
         #[cfg(any(
             feature = "async-tls-native",
             feature = "async-tls-rustls-ring",
@@ -489,9 +401,15 @@ impl TransportClient {
                     feature = "async-tls-rustls-ring",
                     feature = "async-tls-rustls-aws-lc-rs"
                 ))]
-                Self::Rustls(client) => client.request(request).await,
+                Self::Rustls(client) => client
+                    .request(request)
+                    .await
+                    .map_err(TransportRequestError::Transport),
                 #[cfg(feature = "async-tls-native")]
-                Self::Native(client) => client.request(request).await,
+                Self::Native(client) => client
+                    .request(request)
+                    .await
+                    .map_err(TransportRequestError::Transport),
             }
         }
         #[cfg(not(any(
@@ -500,22 +418,41 @@ impl TransportClient {
             feature = "async-tls-rustls-aws-lc-rs"
         )))]
         {
+            let _ = self;
             let _ = request;
-            match self {
-                _ => unreachable!("no TLS transport backend is compiled"),
-            }
+            Err(TransportRequestError::TlsBackendUnavailable {
+                backend: default_tls_backend().as_str(),
+            })
         }
     }
 }
 
 enum TransportRequestError {
+    #[cfg(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    ))]
     Transport(hyper_util::client::legacy::Error),
     Timeout,
+    #[cfg(not(any(
+        feature = "async-tls-rustls-ring",
+        feature = "async-tls-rustls-aws-lc-rs",
+        feature = "async-tls-native"
+    )))]
+    TlsBackendUnavailable {
+        backend: &'static str,
+    },
 }
 
 impl TransportRequestError {
     fn into_error(self, execution: &RequestExecutionState, transport_timeout: Duration) -> Error {
         match self {
+            #[cfg(any(
+                feature = "async-tls-rustls-ring",
+                feature = "async-tls-rustls-aws-lc-rs",
+                feature = "async-tls-native"
+            ))]
             Self::Transport(source) => transport_error(
                 classify_transport_error(&source),
                 execution.current_method().clone(),
@@ -523,6 +460,12 @@ impl TransportRequestError {
                 source,
             ),
             Self::Timeout => execution.transport_timeout_error(transport_timeout.as_millis()),
+            #[cfg(not(any(
+                feature = "async-tls-rustls-ring",
+                feature = "async-tls-rustls-aws-lc-rs",
+                feature = "async-tls-native"
+            )))]
+            Self::TlsBackendUnavailable { backend } => Error::TlsBackendUnavailable { backend },
         }
     }
 }
@@ -768,7 +711,8 @@ fn build_native_tls_connector(
     for certificate in &tls_options.root_certificates {
         match certificate {
             TlsRootCertificate::Pem(pem) => {
-                let certificate_blocks = extract_pem_certificate_blocks(pem)?;
+                let certificate_blocks =
+                    parse_pem_certificate_blocks(TlsBackend::NativeTls, pem, "root certificate")?;
                 for certificate_block in certificate_blocks {
                     let certificate = hyper_tls::native_tls::Certificate::from_pem(
                         &certificate_block,
@@ -1021,9 +965,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy, SystemClock};
-    #[cfg(feature = "async-tls-native")]
-    use crate::error::Error;
+    use http::HeaderValue;
+    use http::header::{AUTHORIZATION, COOKIE};
+
+    use super::{
+        AdaptiveConcurrencyController, AdaptiveConcurrencyPolicy, ClientBuilder, SystemClock,
+    };
 
     #[tokio::test]
     async fn adaptive_controller_unblocks_waiter_after_release() {
@@ -1053,46 +1000,19 @@ mod tests {
         assert!(completed, "waiter should acquire after permit release");
     }
 
-    #[cfg(feature = "async-tls-native")]
     #[test]
-    fn native_tls_pem_root_parser_rejects_unterminated_certificate_tail() {
-        let pem = concat!(
-            "-----BEGIN CERTIFICATE-----\n",
-            "AQIDBA==\n",
-            "-----END CERTIFICATE-----\n",
-            "-----BEGIN CERTIFICATE-----\n",
-            "AQIDBA==\n",
-        );
+    fn default_header_marks_sensitive_values_for_debug() {
+        let builder = ClientBuilder::new("https://api.example.com")
+            .default_header(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer secret-token"),
+            )
+            .default_header(COOKIE, HeaderValue::from_static("session=secret-cookie"));
 
-        let error = super::extract_pem_certificate_blocks(pem.as_bytes())
-            .expect_err("unterminated certificate block must not be silently ignored");
-
-        match error {
-            Error::TlsConfig { message, .. } => {
-                assert!(message.contains("missing its END CERTIFICATE marker"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[cfg(feature = "async-tls-native")]
-    #[test]
-    fn native_tls_pem_root_parser_rejects_non_certificate_blocks() {
-        let pem = concat!(
-            "-----BEGIN PRIVATE KEY-----\n",
-            "AQIDBA==\n",
-            "-----END PRIVATE KEY-----\n",
-        );
-
-        let error = super::extract_pem_certificate_blocks(pem.as_bytes())
-            .expect_err("root CA PEM must not accept non-certificate PEM blocks");
-
-        match error {
-            Error::TlsConfig { message, .. } => {
-                assert!(message.contains("non-certificate block"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        let debug = format!("{:?}", builder.default_headers);
+        assert!(debug.contains("Sensitive"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("secret-cookie"));
     }
 }
 
@@ -1360,7 +1280,8 @@ impl ClientBuilder {
     }
 
     /// Adds a default header included with every request.
-    pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+    pub fn default_header(mut self, name: HeaderName, mut value: HeaderValue) -> Self {
+        mark_sensitive_header_value(&name, &mut value);
         self.default_headers.insert(name, value);
         self
     }
@@ -2445,8 +2366,7 @@ impl Client {
         request: Request<ReqBody>,
     ) -> Result<HttpResponse<Incoming>, TransportRequestError> {
         match timeout(transport_timeout, self.transport.request(request)).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(source)) => Err(TransportRequestError::Transport(source)),
+            Ok(result) => result,
             Err(_) => Err(TransportRequestError::Timeout),
         }
     }
@@ -2795,6 +2715,7 @@ impl Client {
             attempts.set_adaptive(adaptive_attempt);
             let mut attempt_headers = execution.current_headers().clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
+            mark_sensitive_headers(&mut attempt_headers);
             // Never forward hop-by-hop proxy credentials to origin servers.
             attempt_headers.remove(PROXY_AUTHORIZATION);
             self.apply_http_proxy_auth_header(execution.current_uri(), &mut attempt_headers);

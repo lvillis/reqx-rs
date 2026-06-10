@@ -14,7 +14,7 @@ use crate::core::request_builder::{
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::response::{BlockingResponseStream, Response};
 use crate::retry::RetryPolicy;
-use crate::util::{parse_header_name, parse_header_value};
+use crate::util::{mark_sensitive_header_value, parse_header_name, parse_header_value};
 
 use super::{Client, RequestBody};
 
@@ -60,7 +60,8 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Adds a header to this request.
-    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: HeaderName, mut value: HeaderValue) -> Self {
+        mark_sensitive_header_value(&name, &mut value);
         self.headers.insert(name, value);
         self
     }
@@ -114,6 +115,7 @@ impl<'a> RequestBuilder<'a> {
 
     /// Sets a fully buffered request body.
     pub fn body(mut self, body: impl Into<Bytes>) -> Self {
+        self.headers.remove(CONTENT_LENGTH);
         self.body = Some(RequestBody::Buffered(body.into()));
         self
     }
@@ -123,6 +125,7 @@ impl<'a> RequestBuilder<'a> {
     where
         R: Read + Send + 'static,
     {
+        self.headers.remove(CONTENT_LENGTH);
         self.body = Some(RequestBody::Reader(Box::new(reader)));
         self
     }
@@ -142,6 +145,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     fn body_bytes(mut self, body: Bytes) -> Self {
+        self.headers.remove(CONTENT_LENGTH);
         self.body = Some(RequestBody::Buffered(body));
         self
     }

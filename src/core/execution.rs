@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http::header::CONTENT_LENGTH;
 use http::{HeaderMap, Method, StatusCode, Uri};
 
 use crate::core::request_builder::{
@@ -66,7 +67,11 @@ pub(crate) fn prepare_retry_request_input<Body>(
     let (uri_text, uri) = resolve_uri(&base_url, &path)?;
     let redacted_uri_text = redact_uri_for_logs(&uri_text);
     let execution_options = execution_options.resolve(defaults)?;
+    let has_request_content_length = headers.contains_key(CONTENT_LENGTH);
     let mut merged_headers = merge_headers(default_headers, &headers);
+    if !has_request_content_length {
+        merged_headers.remove(CONTENT_LENGTH);
+    }
     if execution_options.auto_accept_encoding {
         ensure_auto_accept_encoding(&method, &mut merged_headers);
     }
@@ -821,7 +826,11 @@ pub(crate) fn status_retry_delay(
     max_delay: Duration,
 ) -> Duration {
     // Keep Retry-After and fallback aligned with the configured retry delay ceiling.
-    let retry_after_cap = max_delay.max(Duration::from_millis(1));
+    let retry_after_cap = if max_delay.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        max_delay
+    };
     let fallback = fallback.min(retry_after_cap);
     parse_retry_after_capped(headers, clock.now_system(), retry_after_cap).unwrap_or(fallback)
 }
@@ -1405,7 +1414,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use http::HeaderMap;
-    use http::header::{ACCEPT_ENCODING, HeaderName, HeaderValue, USER_AGENT};
+    use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HeaderName, HeaderValue, USER_AGENT};
 
     use super::{
         AttemptDisposition, BodyReadFailure, RedirectAction, RedirectInput,
@@ -1594,6 +1603,63 @@ mod tests {
         assert!(!prepared.merged_headers.contains_key(ACCEPT_ENCODING));
     }
 
+    #[test]
+    fn prepare_retry_request_input_drops_default_content_length() {
+        let retry_policy = RetryPolicy::disabled();
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+
+        let prepared = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: &PrimaryEndpointSelector,
+                configured_base_url: "https://api.example.com",
+                method: http::Method::POST,
+                path: "/v1/items".to_owned(),
+                default_headers: &default_headers,
+                headers: HeaderMap::new(),
+                body: Some("request-body"),
+                execution_options: empty_execution_options(),
+                defaults: execution_defaults(&retry_policy, false),
+            },
+            || "empty",
+            |_method, _headers| panic!("auto accept-encoding should be disabled"),
+        )
+        .expect("request preparation should succeed");
+
+        assert!(!prepared.merged_headers.contains_key(CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn prepare_retry_request_input_preserves_request_content_length() {
+        let retry_policy = RetryPolicy::disabled();
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(CONTENT_LENGTH, HeaderValue::from_static("12"));
+
+        let prepared = prepare_retry_request_input(
+            RequestExecutionPreparation {
+                endpoint_selector: &PrimaryEndpointSelector,
+                configured_base_url: "https://api.example.com",
+                method: http::Method::POST,
+                path: "/v1/items".to_owned(),
+                default_headers: &default_headers,
+                headers: request_headers,
+                body: Some("request-body"),
+                execution_options: empty_execution_options(),
+                defaults: execution_defaults(&retry_policy, false),
+            },
+            || "empty",
+            |_method, _headers| panic!("auto accept-encoding should be disabled"),
+        )
+        .expect("request preparation should succeed");
+
+        assert_eq!(
+            prepared.merged_headers.get(CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("12"))
+        );
+    }
+
     fn test_execution_state(
         method: http::Method,
         body_replayable: bool,
@@ -1637,6 +1703,24 @@ mod tests {
         );
 
         assert_eq!(delay, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn status_retry_delay_preserves_sub_millisecond_max_delay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("120"),
+        );
+
+        let delay = status_retry_delay(
+            &SystemClock,
+            &headers,
+            std::time::Duration::from_micros(250),
+            std::time::Duration::from_micros(500),
+        );
+
+        assert_eq!(delay, std::time::Duration::from_micros(500));
     }
 
     #[test]

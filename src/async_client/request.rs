@@ -18,7 +18,14 @@ use crate::core::request_builder::{
 };
 use crate::policy::{RedirectPolicy, StatusPolicy};
 use crate::retry::RetryPolicy;
-use crate::util::{parse_header_name, parse_header_value};
+use crate::util::{mark_sensitive_header_value, parse_header_name, parse_header_value};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentLengthSource {
+    None,
+    RequestHelper,
+    User,
+}
 
 /// Builds and executes a single request against an existing [`Client`].
 ///
@@ -67,6 +74,7 @@ pub struct RequestBuilder<'a> {
     query_pairs: Vec<(String, String)>,
     headers: HeaderMap,
     body: Option<RequestBody>,
+    content_length_source: ContentLengthSource,
     execution_overrides: RequestExecutionOverrides,
 }
 
@@ -79,6 +87,7 @@ impl<'a> RequestBuilder<'a> {
             query_pairs: Vec::new(),
             headers: HeaderMap::new(),
             body: None,
+            content_length_source: ContentLengthSource::None,
             execution_overrides: RequestExecutionOverrides::default(),
         }
     }
@@ -86,7 +95,11 @@ impl<'a> RequestBuilder<'a> {
     /// Adds a header to this request.
     ///
     /// See also `examples/request_helpers.rs`.
-    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: HeaderName, mut value: HeaderValue) -> Self {
+        mark_sensitive_header_value(&name, &mut value);
+        if name == CONTENT_LENGTH {
+            self.content_length_source = ContentLengthSource::User;
+        }
         self.headers.insert(name, value);
         self
     }
@@ -140,6 +153,7 @@ impl<'a> RequestBuilder<'a> {
 
     /// Sets a fully buffered request body.
     pub fn body(mut self, body: impl Into<Bytes>) -> Self {
+        self.clear_content_length();
         self.body = Some(RequestBody::Buffered(body.into()));
         self
     }
@@ -150,6 +164,9 @@ impl<'a> RequestBuilder<'a> {
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
         E: StdError + Send + Sync + 'static,
     {
+        if self.content_length_source == ContentLengthSource::RequestHelper {
+            self.clear_content_length();
+        }
         self.body = Some(RequestBody::Streaming(stream_req_body(stream)));
         self
     }
@@ -161,7 +178,9 @@ impl<'a> RequestBuilder<'a> {
     where
         R: AsyncRead + Send + 'static,
     {
-        self.body_stream(ReaderStream::new(reader))
+        let mut builder = self;
+        builder.clear_content_length();
+        builder.body_stream(ReaderStream::new(reader))
     }
 
     /// Streams an async reader as the request body and sets `Content-Length`.
@@ -175,12 +194,25 @@ impl<'a> RequestBuilder<'a> {
                 source,
             }
         })?;
-        Ok(self.body_reader(reader).header(CONTENT_LENGTH, value))
+        let mut builder = self.body_reader(reader);
+        builder.set_helper_content_length(value);
+        Ok(builder)
     }
 
     fn body_bytes(mut self, body: Bytes) -> Self {
+        self.clear_content_length();
         self.body = Some(RequestBody::Buffered(body));
         self
+    }
+
+    fn clear_content_length(&mut self) {
+        self.headers.remove(CONTENT_LENGTH);
+        self.content_length_source = ContentLengthSource::None;
+    }
+
+    fn set_helper_content_length(&mut self, value: HeaderValue) {
+        self.headers.insert(CONTENT_LENGTH, value);
+        self.content_length_source = ContentLengthSource::RequestHelper;
     }
 
     /// Serializes `payload` as JSON and sets `Content-Type: application/json`.

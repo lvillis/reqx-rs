@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http::Uri;
-use http::header::{HeaderName, HeaderValue, USER_AGENT};
+use http::header::{CONTENT_LENGTH, HeaderName, HeaderValue, USER_AGENT};
 use reqx::advanced::{
     AdaptiveConcurrencyPolicy, BodyCodec, CircuitBreakerPolicy, Clock, Interceptor, Observer,
     RateLimitPolicy, RequestContext, RetryBudgetPolicy, ServerThrottleScope, StatusPolicy,
@@ -683,6 +683,78 @@ fn blocking_get_json_succeeds_and_sets_accept_encoding() {
             .get("accept-encoding")
             .map(String::as_str),
         Some("gzip, br, deflate, zstd")
+    );
+}
+
+#[test]
+fn blocking_json_helper_replaces_stale_content_length_from_previous_body() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let payload = serde_json::json!({ "name": "demo" });
+    let expected = serde_json::to_vec(&payload).expect("json payload should serialize");
+    let response = client
+        .post("/v1/json")
+        .body_reader_with_length(Cursor::new(Vec::<u8>::new()), 1)
+        .expect("reader content-length should parse")
+        .json(&payload)
+        .expect("json serialization should succeed")
+        .send()
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, expected);
+    assert_ne!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
+fn blocking_request_body_ignores_default_content_length() {
+    let server = MockServer::start(vec![MockResponse::new(
+        200,
+        Vec::<(String, String)>::new(),
+        b"ok".to_vec(),
+    )]);
+
+    let client = Client::builder(server.base_url.clone())
+        .default_header(CONTENT_LENGTH, HeaderValue::from_static("1"))
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .build()
+        .expect("client should build");
+
+    let response = client
+        .post("/v1/body")
+        .body(Bytes::from_static(b"hello"))
+        .send()
+        .expect("request should succeed");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"hello".to_vec());
+    assert_ne!(
+        requests[0]
+            .headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("1")
     );
 }
 
@@ -3817,6 +3889,49 @@ fn blocking_redirect_policy_follows_relative_location() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/v1/old");
     assert_eq!(requests[1].path, "/v1/new");
+}
+
+#[test]
+fn blocking_redirect_policy_follows_network_path_location() {
+    let target = MockServer::start(vec![MockResponse::new(
+        200,
+        vec![("Content-Type", "application/json")],
+        br#"{"ok":true}"#.to_vec(),
+    )]);
+    let target_authority = target
+        .base_url
+        .strip_prefix("http://")
+        .expect("target base url should include http scheme")
+        .to_owned();
+    let source = MockServer::start(vec![MockResponse::new(
+        302,
+        vec![(
+            "Location",
+            format!("//{target_authority}/v1/new?via=network"),
+        )],
+        b"redirect".to_vec(),
+    )]);
+
+    let client = Client::builder(source.base_url.clone())
+        .request_timeout(Duration::from_secs(1))
+        .retry_policy(RetryPolicy::disabled())
+        .redirect_policy(RedirectPolicy::limited(3))
+        .build()
+        .expect("client should build");
+
+    let body: Value = client
+        .get("/v1/old")
+        .send_json()
+        .expect("network-path redirect should be followed");
+    assert_eq!(body["ok"], true);
+
+    let source_requests = source.requests();
+    assert_eq!(source_requests.len(), 1);
+    assert_eq!(source_requests[0].path, "/v1/old");
+
+    let target_requests = target.requests();
+    assert_eq!(target_requests.len(), 1);
+    assert_eq!(target_requests[0].path, "/v1/new?via=network");
 }
 
 #[test]

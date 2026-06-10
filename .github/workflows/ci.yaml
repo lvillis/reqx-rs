@@ -78,6 +78,10 @@ jobs:
             command: cargo nextest run --tests --no-default-features --features blocking-tls-native
           - name: hybrid-async-and-blocking
             command: cargo check --lib --tests --no-default-features --features async-tls-rustls-ring,blocking-tls-rustls-ring
+          - name: async-no-tls-fallback
+            command: cargo check --lib --no-default-features --features _async
+          - name: blocking-no-tls-fallback
+            command: cargo check --lib --no-default-features --features _blocking
 
     steps:
       - name: Checkout
@@ -125,9 +129,12 @@ jobs:
             fi
           }
 
+          expect_fail "strict-feature-guards"
+          expect_fail "strict-feature-guards,_async"
           expect_fail "strict-feature-guards,async-tls-rustls-ring,async-tls-rustls-aws-lc-rs"
           expect_fail "strict-feature-guards,async-tls-rustls-ring,async-tls-native"
           expect_fail "strict-feature-guards,async-tls-rustls-aws-lc-rs,async-tls-native"
+          expect_fail "strict-feature-guards,_blocking"
           expect_fail "strict-feature-guards,blocking-tls-rustls-ring,blocking-tls-rustls-aws-lc-rs"
           expect_fail "strict-feature-guards,blocking-tls-rustls-ring,blocking-tls-native"
           expect_fail "strict-feature-guards,blocking-tls-rustls-aws-lc-rs,blocking-tls-native"

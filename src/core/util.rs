@@ -4,14 +4,19 @@ use std::time::{Duration, Instant, SystemTime};
 
 use http::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    COOKIE, EXPECT, HOST, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, RETRY_AFTER, TE,
-    TRAILER, TRANSFER_ENCODING, UPGRADE,
+    COOKIE, EXPECT, HOST, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION, RETRY_AFTER,
+    SET_COOKIE, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use http::{HeaderMap, Method, StatusCode, Uri};
 use rand::RngExt;
 
 use crate::error::Error;
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 use crate::error::TransportErrorKind;
 
 const MAX_ERROR_BODY_LEN: usize = 2048;
@@ -80,33 +85,34 @@ pub(crate) fn exponential_backoff_with_jitter(
 ) -> Duration {
     let capped_exponent = retry_index.saturating_sub(1).min(31) as u32;
     let multiplier = 1_u128 << capped_exponent;
-    let base_ms = base_backoff.as_millis().max(1);
-    let max_ms = max_backoff.as_millis().max(base_ms);
-    let delay_ms = base_ms
-        .saturating_mul(multiplier)
-        .min(max_ms)
-        .min(u64::MAX as u128) as u64;
-    apply_backoff_jitter(Duration::from_millis(delay_ms), max_ms, jitter_ratio)
+    let base_nanos = base_backoff.as_nanos().max(1);
+    let max_nanos = max_backoff.as_nanos().max(base_nanos);
+    let delay_nanos = base_nanos.saturating_mul(multiplier).min(max_nanos);
+    apply_backoff_jitter(
+        duration_from_nanos_saturating(delay_nanos),
+        duration_from_nanos_saturating(max_nanos),
+        jitter_ratio,
+    )
 }
 
-fn apply_backoff_jitter(backoff: Duration, max_backoff_ms: u128, jitter_ratio: f64) -> Duration {
+fn apply_backoff_jitter(backoff: Duration, max_backoff: Duration, jitter_ratio: f64) -> Duration {
     let jitter_ratio = clamp_f64_or_fallback(jitter_ratio, 0.0, 1.0, 0.0);
     if jitter_ratio <= f64::EPSILON {
         return backoff;
     }
 
-    let backoff_ms = backoff.as_millis().min(u64::MAX as u128) as u64;
-    if backoff_ms <= 1 {
+    let backoff_nanos = backoff.as_nanos();
+    if backoff_nanos <= 1 {
         return backoff;
     }
 
-    let max_backoff_ms = max_backoff_ms.min(u64::MAX as u128) as u64;
-    let jitter_span = ((backoff_ms as f64) * jitter_ratio).round().max(1.0) as u64;
-    let low = backoff_ms.saturating_sub(jitter_span);
-    let high = backoff_ms.saturating_add(jitter_span).max(low);
+    let max_backoff_nanos = max_backoff.as_nanos().max(1);
+    let jitter_span = ((backoff_nanos as f64) * jitter_ratio).round().max(1.0) as u128;
+    let low = backoff_nanos.saturating_sub(jitter_span);
+    let high = backoff_nanos.saturating_add(jitter_span).max(low);
     let mut rng = rand::rng();
-    let sampled_ms = rng.random_range(low..=high).min(max_backoff_ms.max(1));
-    Duration::from_millis(sampled_ms)
+    let sampled_nanos = rng.random_range(low..=high).min(max_backoff_nanos);
+    duration_from_nanos_saturating(sampled_nanos)
 }
 
 pub(crate) fn merge_headers(default_headers: &HeaderMap, request_headers: &HeaderMap) -> HeaderMap {
@@ -265,8 +271,22 @@ fn is_token_like(segment: &str) -> bool {
     !segment.is_empty() && segment.chars().all(is_token_char)
 }
 
+fn credential_separator(segment: &str) -> Option<(usize, usize)> {
+    let plain = segment.find(':').map(|index| (index, 1));
+    let lower = segment.to_ascii_lowercase();
+    let encoded = lower.find("%3a").map(|index| (index, 3));
+
+    match (plain, encoded) {
+        (Some(plain), Some(encoded)) => Some(if plain.0 <= encoded.0 { plain } else { encoded }),
+        (Some(separator), None) | (None, Some(separator)) => Some(separator),
+        (None, None) => None,
+    }
+}
+
 fn split_credential_like_segment(segment: &str) -> Option<(&str, &str)> {
-    let (left, right) = segment.split_once(':')?;
+    let (separator_index, separator_len) = credential_separator(segment)?;
+    let left = &segment[..separator_index];
+    let right = &segment[separator_index + separator_len..];
     if left.is_empty() || right.is_empty() {
         return None;
     }
@@ -338,6 +358,87 @@ pub(crate) fn redact_uri_for_logs(uri_text: &str) -> String {
     let serialized = parsed.to_string();
     let authority_redacted = redact_userinfo_in_authority(&serialized);
     redact_non_authority_credentials(&authority_redacted)
+}
+
+fn find_uri_like_start(lower: &str, offset: usize) -> Option<(usize, usize)> {
+    ["https://", "http://", "mailto:", "sips:", "sip:"]
+        .into_iter()
+        .filter_map(|pattern| {
+            lower
+                .get(offset..)?
+                .find(pattern)
+                .map(|index| (offset + index, pattern.len()))
+        })
+        .min_by_key(|(index, _)| *index)
+}
+
+fn uri_like_span_end(core: &str, lower: &str, uri_start: usize, pattern_len: usize) -> usize {
+    let Some((next_uri_start, _)) = find_uri_like_start(lower, uri_start + pattern_len) else {
+        return core.len();
+    };
+
+    core[uri_start..next_uri_start]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            matches!(character, ',' | ';' | '|').then_some(uri_start + index)
+        })
+        .unwrap_or(next_uri_start)
+}
+
+fn redact_uri_like_core_for_logs(core: &str) -> String {
+    let lower = core.to_ascii_lowercase();
+    let mut redacted = String::with_capacity(core.len());
+    let mut copied_until = 0;
+    let mut search_from = 0;
+
+    while let Some((uri_start, pattern_len)) = find_uri_like_start(&lower, search_from) {
+        redacted.push_str(&core[copied_until..uri_start]);
+        let uri_end = uri_like_span_end(core, &lower, uri_start, pattern_len);
+        redacted.push_str(&redact_uri_for_logs(&core[uri_start..uri_end]));
+        copied_until = uri_end;
+        search_from = uri_end;
+    }
+
+    redacted.push_str(&core[copied_until..]);
+    redacted
+}
+
+fn redact_uri_like_token_for_logs(token: &str) -> String {
+    const LEADING_PUNCTUATION: &[char] = &['(', '[', '{', '<', '"', '\''];
+    const TRAILING_PUNCTUATION: &[char] = &[')', ']', '}', '>', '"', '\'', ',', ';'];
+
+    let leading_len = token
+        .char_indices()
+        .find_map(|(index, character)| (!LEADING_PUNCTUATION.contains(&character)).then_some(index))
+        .unwrap_or(token.len());
+    let (leading, without_leading) = token.split_at(leading_len);
+
+    let trailing_start = without_leading
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            (!TRAILING_PUNCTUATION.contains(&character)).then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let (core, trailing) = without_leading.split_at(trailing_start);
+
+    if find_uri_like_start(&core.to_ascii_lowercase(), 0).is_none() {
+        return token.to_owned();
+    }
+
+    format!("{leading}{}{trailing}", redact_uri_like_core_for_logs(core))
+}
+
+pub(crate) fn redact_uri_like_text_for_logs(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    for token in text.split_inclusive(char::is_whitespace) {
+        let trim_len = token.trim_end_matches(char::is_whitespace).len();
+        let (body, whitespace) = token.split_at(trim_len);
+        redacted.push_str(&redact_uri_like_token_for_logs(body));
+        redacted.push_str(whitespace);
+    }
+    redacted
 }
 
 fn looks_like_malformed_http_absolute_uri(value: &str) -> bool {
@@ -611,7 +712,11 @@ fn build_query_string(existing: &[(String, String)], appended: &[(String, String
     serializer.finish()
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 pub(crate) fn classify_transport_error(
     error: &hyper_util::client::legacy::Error,
 ) -> TransportErrorKind {
@@ -629,7 +734,12 @@ pub(crate) fn classify_transport_error(
     classify_transport_error_text(&text, error.is_connect())
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn classify_transport_error_source_chain(
     error: &(dyn std::error::Error + 'static),
     is_connect_path: bool,
@@ -644,7 +754,12 @@ fn classify_transport_error_source_chain(
     None
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn classify_transport_error_source(
     error: &(dyn std::error::Error + 'static),
     is_connect_path: bool,
@@ -697,7 +812,12 @@ fn classify_transport_error_source(
     None
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn classify_io_transport_error_kind(
     kind: io::ErrorKind,
     is_connect_path: bool,
@@ -723,7 +843,12 @@ fn classify_io_transport_error_kind(
     }
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn classify_transport_error_text(text: &str, is_connect_path: bool) -> TransportErrorKind {
     const DNS_MARKERS: &[&str] = &[
         "name or service not known",
@@ -798,12 +923,22 @@ fn classify_transport_error_text(text: &str, is_connect_path: bool) -> Transport
     TransportErrorKind::Other
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn contains_marker(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| text.contains(marker))
 }
 
-#[cfg(feature = "_async")]
+#[cfg(any(
+    all(test, feature = "_async"),
+    feature = "async-tls-native",
+    feature = "async-tls-rustls-ring",
+    feature = "async-tls-rustls-aws-lc-rs"
+))]
 fn contains_word(text: &str, word: &str) -> bool {
     text.split(|character: char| !character.is_ascii_alphanumeric())
         .any(|token| token == word)
@@ -857,11 +992,38 @@ pub(crate) fn parse_header_name(name: &str) -> Result<HeaderName, Error> {
     })
 }
 
+fn is_sensitive_header_name(name: &HeaderName) -> bool {
+    *name == AUTHORIZATION || *name == COOKIE || *name == PROXY_AUTHORIZATION || *name == SET_COOKIE
+}
+
+fn is_sensitive_header_name_text(name: &str) -> bool {
+    let Ok(name) = name.parse::<HeaderName>() else {
+        return false;
+    };
+    is_sensitive_header_name(&name)
+}
+
+pub(crate) fn mark_sensitive_header_value(name: &HeaderName, value: &mut HeaderValue) {
+    if is_sensitive_header_name(name) {
+        value.set_sensitive(true);
+    }
+}
+
+pub(crate) fn mark_sensitive_headers(headers: &mut HeaderMap) {
+    for (name, value) in headers.iter_mut() {
+        mark_sensitive_header_value(name, value);
+    }
+}
+
 pub(crate) fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue, Error> {
-    value.parse().map_err(|source| Error::InvalidHeaderValue {
+    let mut value: HeaderValue = value.parse().map_err(|source| Error::InvalidHeaderValue {
         name: name.to_owned(),
         source,
-    })
+    })?;
+    if is_sensitive_header_name_text(name) {
+        value.set_sensitive(true);
+    }
+    Ok(value)
 }
 
 pub(crate) fn phase_timeout(
@@ -889,6 +1051,25 @@ pub(crate) fn duration_millis_u64_saturating(duration: Duration) -> u64 {
 
 pub(crate) fn duration_from_millis_saturating(milliseconds: u128) -> Duration {
     Duration::from_millis(milliseconds.min(u64::MAX as u128) as u64)
+}
+
+pub(crate) fn duration_from_nanos_saturating(nanoseconds: u128) -> Duration {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+    let seconds = nanoseconds / NANOS_PER_SECOND;
+    if seconds > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+
+    Duration::new(seconds as u64, (nanoseconds % NANOS_PER_SECOND) as u32)
+}
+
+pub(crate) const fn saturating_u64_to_usize(value: u64) -> usize {
+    if value > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        value as usize
+    }
 }
 
 pub(crate) fn duration_from_secs_f64_saturating(seconds: f64) -> Duration {
@@ -1071,14 +1252,18 @@ fn remove_hop_by_hop_redirect_headers(headers: &mut HeaderMap) {
 pub(crate) fn resolve_redirect_uri(current_uri: &Uri, location: &str) -> Option<Uri> {
     match location.parse::<Uri>() {
         Ok(uri) if uri.host().is_some() => {
-            let scheme = uri.scheme_str()?;
-            if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+            if let Some(scheme) = uri.scheme_str() {
+                if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+                    return None;
+                }
+                if uri_has_userinfo(&uri) || !is_valid_absolute_http_uri_text(location) {
+                    return None;
+                }
+                return Some(uri);
+            }
+            if !location.starts_with("//") {
                 return None;
             }
-            if uri_has_userinfo(&uri) || !is_valid_absolute_http_uri_text(location) {
-                return None;
-            }
-            return Some(uri);
         }
         Ok(uri) if uri.scheme_str().is_some() => return None,
         Err(_) if looks_like_malformed_http_absolute_uri(location) => return None,

@@ -708,7 +708,10 @@ async fn no_proxy_bypasses_proxy_for_matching_host() {
         .expect("request should bypass proxy and succeed");
     assert_eq!(response.status().as_u16(), 200);
 
-    assert_eq!(upstream.served_count(), 1);
+    assert_eq!(
+        upstream.wait_for_served_count(1, Duration::from_millis(200)),
+        1
+    );
     assert!(proxy.tunnel_targets().is_empty());
 }
 

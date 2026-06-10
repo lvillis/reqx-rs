@@ -23,7 +23,7 @@ use crate::retry::RetryDecision;
 use crate::tls::TlsBackend;
 use crate::util::{
     bounded_retry_delay, deadline_exceeded_error, ensure_accept_encoding_blocking,
-    is_timeout_io_error, redact_uri_for_logs, total_timeout_deadline,
+    is_timeout_io_error, mark_sensitive_headers, redact_uri_for_logs, total_timeout_deadline,
 };
 
 use super::limiters::{AcquirePermitError, GlobalRequestPermit, HostRequestPermit};
@@ -992,6 +992,7 @@ impl Client {
 
             let mut attempt_headers = execution.current_headers().clone();
             self.run_request_interceptors(&context, &mut attempt_headers);
+            mark_sensitive_headers(&mut attempt_headers);
             // Never forward hop-by-hop proxy credentials to origin servers.
             attempt_headers.remove(http::header::PROXY_AUTHORIZATION);
             let current_uri_text = execution.current_uri().to_string();

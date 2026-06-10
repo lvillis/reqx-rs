@@ -1,7 +1,7 @@
 use http::{HeaderMap, Method};
 use std::time::{Duration, SystemTime};
 
-use crate::util::parse_retry_after;
+use crate::util::{parse_retry_after, redact_uri_like_text_for_logs};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub(crate) fn summarize_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -9,7 +9,7 @@ pub(crate) fn summarize_error_chain(error: &(dyn std::error::Error + 'static)) -
     let mut current = Some(error);
 
     while let Some(source) = current {
-        let message = source.to_string();
+        let message = redact_uri_like_text_for_logs(&source.to_string());
         if messages.last() != Some(&message) {
             messages.push(message);
         }
@@ -454,14 +454,14 @@ pub enum Error {
         uri: String,
     },
     /// Reading a buffered response body failed.
-    #[error("failed to read response body: {source}")]
+    #[error("failed to read response body")]
     ReadBody {
         #[source]
         /// Underlying body read error.
         source: BoxError,
     },
     /// Writing a streamed response body to a sink failed.
-    #[error("failed to write response body for {method} {uri}: {source}")]
+    #[error("failed to write response body for {method} {uri}")]
     WriteBody {
         /// Request method.
         method: Method,

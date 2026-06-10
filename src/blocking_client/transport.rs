@@ -6,13 +6,16 @@ use http::{HeaderMap, Uri};
 
 use crate::error::TransportErrorKind;
 use crate::proxy::ProxyConfig;
-use crate::tls::{TlsBackend, TlsOptions, tls_version_bounds};
+use crate::tls::{TlsBackend, TlsOptions};
 #[cfg(any(
     feature = "blocking-tls-rustls-ring",
     feature = "blocking-tls-rustls-aws-lc-rs",
     feature = "blocking-tls-native"
 ))]
-use crate::tls::{TlsClientIdentity, TlsRootCertificate, TlsRootStore, tls_config_error};
+use crate::tls::{
+    TlsClientIdentity, TlsRootCertificate, TlsRootStore, parse_pem_certificate_blocks,
+    tls_config_error, tls_version_bounds,
+};
 use crate::util::read_retry_interrupted;
 
 #[cfg(feature = "blocking-tls-rustls-aws-lc-rs")]
@@ -70,20 +73,12 @@ fn parse_pem_certificates(
     context: &str,
 ) -> crate::Result<Vec<ureq::tls::Certificate<'static>>> {
     let mut certificates = Vec::new();
-    for item in ureq::tls::parse_pem(pem_bundle) {
-        match item.map_err(|source| {
-            tls_config_error(backend, format!("failed to parse PEM {context}: {source}"))
-        })? {
-            ureq::tls::PemItem::Certificate(certificate) => certificates.push(certificate),
-            ureq::tls::PemItem::PrivateKey(_) => {}
-            _ => {}
-        }
-    }
-    if certificates.is_empty() {
-        return Err(tls_config_error(
-            backend,
-            format!("no certificate blocks found in PEM {context}"),
-        ));
+    for certificate_block in parse_pem_certificate_blocks(backend, pem_bundle, context)? {
+        let certificate =
+            ureq::tls::Certificate::from_pem(&certificate_block).map_err(|source| {
+                tls_config_error(backend, format!("failed to parse PEM {context}: {source}"))
+            })?;
+        certificates.push(certificate);
     }
     Ok(certificates)
 }

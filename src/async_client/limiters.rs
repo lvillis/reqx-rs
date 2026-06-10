@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::core::limiters::{
     PER_HOST_LIMITER_ENTRY_TTL, PER_HOST_LIMITER_MAX_ENTRIES,
@@ -92,7 +92,7 @@ impl RequestLimiters {
         let host = host.and_then(normalize_host_key);
         let permit = match (self.per_host_limit, host) {
             (Some(limit), Some(host)) => {
-                let semaphore = {
+                let wait_for_semaphore = {
                     let mut guard = lock_unpoisoned(&self.per_host);
                     let now = self.clock.now_monotonic();
                     cleanup_stale_per_host_limiters(
@@ -107,10 +107,20 @@ impl RequestLimiters {
                         last_used_at: now,
                     });
                     entry.last_used_at = now;
-                    entry.semaphore.clone()
+                    match Arc::clone(&entry.semaphore).try_acquire_owned() {
+                        Ok(permit) => {
+                            return Ok(HostRequestPermit {
+                                _permit: Some(permit),
+                            });
+                        }
+                        Err(TryAcquireError::NoPermits) => Arc::clone(&entry.semaphore),
+                        Err(TryAcquireError::Closed) => {
+                            return Err(Error::ConcurrencyLimitClosed);
+                        }
+                    }
                 };
                 Some(
-                    semaphore
+                    wait_for_semaphore
                         .acquire_owned()
                         .await
                         .map_err(|_| Error::ConcurrencyLimitClosed)?,

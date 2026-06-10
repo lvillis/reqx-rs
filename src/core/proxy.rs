@@ -1,3 +1,13 @@
+#![cfg_attr(
+    all(
+        feature = "_async",
+        not(feature = "async-tls-native"),
+        not(feature = "async-tls-rustls-ring"),
+        not(feature = "async-tls-rustls-aws-lc-rs")
+    ),
+    allow(dead_code)
+)]
+
 #[cfg(feature = "_async")]
 use std::error::Error as StdError;
 #[cfg(feature = "_async")]
@@ -60,6 +70,19 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse().ok()
 }
 
+fn plain_no_proxy_host_is_valid(host: &str) -> bool {
+    if host.is_empty()
+        || host.contains(['/', '?', '#', '@', '\\', '*'])
+        || host.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    if host.contains(':') {
+        return host.parse::<IpAddr>().is_ok();
+    }
+    true
+}
+
 fn host_matches_no_proxy_rule(host: &str, rule_host: &str) -> bool {
     let host_ip = parse_ip_literal(host);
     let rule_ip = parse_ip_literal(rule_host);
@@ -115,7 +138,11 @@ impl NoProxyRule {
         } else if looks_like_url_rule(&candidate) {
             return None;
         }
-        candidate = candidate.trim_start_matches('.').to_owned();
+        candidate = if let Some(host) = candidate.strip_prefix("*.") {
+            host.to_owned()
+        } else {
+            candidate.trim_start_matches('.').to_owned()
+        };
         if candidate.is_empty() {
             return None;
         }
@@ -141,6 +168,9 @@ impl NoProxyRule {
             }
             port = Some(raw_port.parse::<u16>().ok()?);
             candidate = host.to_owned();
+        }
+        if !plain_no_proxy_host_is_valid(&candidate) {
+            return None;
         }
         Some(Self::Domain {
             host: normalize_no_proxy_host(&candidate)?,

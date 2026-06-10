@@ -5,6 +5,14 @@ use crate::error::Error;
 use crate::extensions::Clock;
 use crate::util::{clamp_f64_or_fallback, lock_unpoisoned, normalize_usize_at_least_one};
 
+fn nonzero_duration_or_fallback(duration: Duration, fallback: Duration) -> Duration {
+    if duration.is_zero() {
+        fallback
+    } else {
+        duration
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 /// Limits how many retries can be spent relative to recent successful traffic.
 pub struct RetryBudgetPolicy {
@@ -87,7 +95,7 @@ impl RetryBudgetPolicy {
 
     fn normalize_for_runtime(self) -> Self {
         Self {
-            window: self.window.max(Duration::from_millis(1)),
+            window: nonzero_duration_or_fallback(self.window, Duration::from_millis(1)),
             retry_ratio: clamp_f64_or_fallback(self.retry_ratio, 0.0, 1.0, 0.0),
             min_retries_per_window: self.min_retries_per_window,
         }
@@ -231,7 +239,7 @@ impl CircuitBreakerPolicy {
                 open_timeout_ms: self.open_timeout.as_millis(),
                 half_open_max_requests: self.half_open_max_requests,
                 half_open_success_threshold: self.half_open_success_threshold,
-                message: "open_timeout must be >= 1ms",
+                message: "open_timeout must be greater than zero",
             });
         }
         if self.half_open_max_requests == 0 {
@@ -258,7 +266,7 @@ impl CircuitBreakerPolicy {
     fn normalize_for_runtime(self) -> Self {
         Self {
             failure_threshold: normalize_usize_at_least_one(self.failure_threshold),
-            open_timeout: self.open_timeout.max(Duration::from_millis(1)),
+            open_timeout: nonzero_duration_or_fallback(self.open_timeout, Duration::from_millis(1)),
             half_open_max_requests: normalize_usize_at_least_one(self.half_open_max_requests),
             half_open_success_threshold: normalize_usize_at_least_one(
                 self.half_open_success_threshold,
@@ -607,7 +615,7 @@ impl AdaptiveConcurrencyPolicy {
                 min_limit: self.min_limit,
                 initial_limit: self.initial_limit,
                 max_limit: self.max_limit,
-                message: "high_latency_threshold must be >= 1ms",
+                message: "high_latency_threshold must be greater than zero",
             });
         }
         if !self.decrease_ratio.is_finite() || !(0.0..1.0).contains(&self.decrease_ratio) {
@@ -687,7 +695,10 @@ impl AdaptiveConcurrencyPolicy {
             } else {
                 Self::standard().decrease_ratio
             },
-            high_latency_threshold: self.high_latency_threshold.max(Duration::from_millis(1)),
+            high_latency_threshold: nonzero_duration_or_fallback(
+                self.high_latency_threshold,
+                Duration::from_millis(1),
+            ),
         }
     }
 }
@@ -859,6 +870,27 @@ mod tests {
     }
 
     #[test]
+    fn retry_budget_runtime_preserves_sub_millisecond_window() {
+        let clock = Arc::new(TestClock::default());
+        let budget = RetryBudget::new(
+            RetryBudgetPolicy::standard()
+                .window(Duration::from_micros(500))
+                .retry_ratio(0.0)
+                .min_retries_per_window(1),
+            clock.clone(),
+        );
+
+        assert!(budget.try_consume_retry());
+        assert!(!budget.try_consume_retry());
+
+        clock.advance(Duration::from_micros(600));
+        assert!(
+            budget.try_consume_retry(),
+            "runtime normalization should not round a nonzero sub-millisecond window up to 1ms"
+        );
+    }
+
+    #[test]
     fn retry_budget_validate_rejects_nan_retry_ratio() {
         let policy = RetryBudgetPolicy::standard().retry_ratio(f64::NAN);
 
@@ -971,6 +1003,30 @@ mod tests {
         let policy = CircuitBreakerPolicy::standard().half_open_success_threshold(0);
 
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_runtime_preserves_sub_millisecond_open_timeout() {
+        let clock = Arc::new(TestClock::default());
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerPolicy::standard()
+                .failure_threshold(1)
+                .open_timeout(Duration::from_micros(500))
+                .half_open_max_requests(1)
+                .half_open_success_threshold(1),
+            clock.clone(),
+        ));
+
+        breaker
+            .begin()
+            .expect("closed attempt should be allowed")
+            .mark_failure();
+        clock.advance(Duration::from_micros(600));
+
+        assert!(
+            breaker.begin().is_ok(),
+            "runtime normalization should not round a nonzero sub-millisecond open timeout up to 1ms"
+        );
     }
 
     #[test]
@@ -1227,6 +1283,28 @@ mod tests {
         assert!(
             state.try_acquire(),
             "runtime normalization should not classify the minimum threshold sample as high latency"
+        );
+    }
+
+    #[test]
+    fn adaptive_concurrency_runtime_preserves_sub_millisecond_latency_threshold() {
+        let policy = AdaptiveConcurrencyPolicy::standard()
+            .min_limit(1)
+            .initial_limit(1)
+            .max_limit(2)
+            .high_latency_threshold(Duration::from_micros(500));
+        let mut state = AdaptiveConcurrencyState::new(policy);
+
+        assert!(state.try_acquire());
+        state.release_and_record(
+            policy,
+            AdaptiveConcurrencyOutcome::Success,
+            Duration::from_micros(750),
+        );
+
+        assert_eq!(
+            state.current_limit, 1,
+            "runtime normalization should not round a nonzero sub-millisecond threshold up to 1ms"
         );
     }
 }

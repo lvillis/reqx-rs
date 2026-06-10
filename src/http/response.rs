@@ -17,12 +17,23 @@ use crate::error::Error;
 use crate::metrics::StreamCompletion;
 use crate::util::truncate_body;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Fully buffered HTTP response body and metadata.
 pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers_len", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl Response {

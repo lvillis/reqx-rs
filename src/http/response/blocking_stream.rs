@@ -11,7 +11,7 @@ use crate::content_encoding::{
     decode_content_encoded_body_limited, should_decode_content_encoded_body,
 };
 use crate::error::{Error, TimeoutPhase};
-use crate::util::{duration_from_millis_saturating, is_timeout_io_error};
+use crate::util::{duration_from_millis_saturating, is_timeout_io_error, saturating_u64_to_usize};
 
 use super::{
     Response, StreamCompletion, StreamLifecycle, deadline_elapsed, deadline_limits_wait,
@@ -332,7 +332,8 @@ impl BlockingResponseStream {
             }
             copied = copied.saturating_add(read as u64);
             if copied > max_bytes as u64 {
-                let error = self.response_body_too_large_error(max_bytes, copied as usize);
+                let error =
+                    self.response_body_too_large_error(max_bytes, saturating_u64_to_usize(copied));
                 self.complete_error(&error);
                 return Err(error);
             }
@@ -453,9 +454,8 @@ impl std::fmt::Debug for BlockingResponseStream {
         formatter
             .debug_struct("BlockingResponseStream")
             .field("status", &self.status)
-            .field("headers", &self.headers)
+            .field("headers_len", &self.headers.len())
             .field("method", &self.method)
-            .field("uri_raw", &self.uri_raw)
             .field("uri_redacted", &self.uri_redacted)
             .field("timeout_ms", &self.timeout_ms)
             .field("total_timeout_ms", &self.total_timeout_ms)

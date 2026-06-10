@@ -345,7 +345,7 @@ impl Default for ResumableUploadOptions {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 /// Error returned by a resumable upload operation.
 pub enum ResumableUploadError<E>
 where
@@ -370,7 +370,7 @@ where
         message: &'static str,
     },
     /// Creating the remote upload session failed.
-    #[error("failed to create resumable upload: {source}")]
+    #[error("failed to create resumable upload")]
     CreateFailed {
         #[source]
         /// Source error returned by the backend.
@@ -419,7 +419,7 @@ where
         checkpoint: ResumableUploadCheckpoint,
     },
     /// Uploading a part failed after exhausting retries.
-    #[error("upload part {part_number} failed after {attempts} attempts: {source}")]
+    #[error("upload part {part_number} failed after {attempts} attempts")]
     PartUploadFailed {
         /// One-based part number.
         part_number: u32,
@@ -484,7 +484,7 @@ where
         checkpoint: ResumableUploadCheckpoint,
     },
     /// Completing the remote upload session failed.
-    #[error("failed to complete resumable upload: {source}")]
+    #[error("failed to complete resumable upload")]
     CompleteFailed {
         /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
@@ -515,6 +515,18 @@ where
         /// Last known checkpoint state.
         checkpoint: ResumableUploadCheckpoint,
     },
+}
+
+impl<E> std::fmt::Debug for ResumableUploadError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumableUploadError")
+            .field("message", &self.to_string())
+            .finish()
+    }
 }
 
 impl<E> ResumableUploadError<E>
@@ -875,16 +887,17 @@ impl<'a> ResumableUploadSession<'a> {
         let part_number = self.current_part_number::<E>()?;
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         let expected_checksum = self.options.expected_checksum(&chunk);
-        if let Some(existing) = self.checkpoint.completed_parts.get(&part_number)
-            && checkpoint_part_matches(
+        if let Some(existing) = self.checkpoint.completed_parts.get(&part_number) {
+            if checkpoint_part_matches(
                 existing,
                 chunk.len(),
                 expected_checksum.as_deref(),
                 self.options.verify_remote_etag(),
-            )
-        {
-            self.advance_part_number();
-            return Ok(UploadChunkAction::Skip);
+            ) {
+                self.advance_part_number();
+                return Ok(UploadChunkAction::Skip);
+            }
+            self.checkpoint.completed_parts.remove(&part_number);
         }
 
         Ok(UploadChunkAction::Upload(UploadPartPlan {
@@ -1386,6 +1399,47 @@ mod tests {
             Self {
                 message: message.into(),
             }
+        }
+    }
+
+    #[test]
+    fn backend_error_display_and_debug_omit_source_messages() {
+        let secret_url = "https://uploads.example.test/object?token=secret";
+        let checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        let errors = [
+            ResumableUploadError::CreateFailed {
+                source: MockError::new(format!("create failed at {secret_url}")),
+            },
+            ResumableUploadError::PartUploadFailed {
+                part_number: 1,
+                attempts: 2,
+                checkpoint: checkpoint.clone(),
+                source: MockError::new(format!("part failed at {secret_url}")),
+            },
+            ResumableUploadError::CompleteFailed {
+                checkpoint,
+                source: MockError::new(format!("complete failed at {secret_url}")),
+            },
+        ];
+
+        for error in errors {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+
+            assert!(
+                !display.contains("token=secret"),
+                "display should omit backend source details: {display}"
+            );
+            assert!(
+                !debug.contains("token=secret"),
+                "debug should omit backend source details: {debug}"
+            );
+
+            let source = std::error::Error::source(&error).expect("source should be retained");
+            assert!(
+                source.to_string().contains("token=secret"),
+                "source chain should preserve backend error details"
+            );
         }
     }
 
@@ -1906,6 +1960,54 @@ mod tests {
     }
 
     #[test]
+    fn blocking_failed_reupload_drops_stale_checkpoint_part() {
+        let backend = BlockingMockBackend::default();
+        backend.fail_once_for_part(1);
+        let uploader = BlockingResumableUploader::new(
+            ResumableUploadOptions::new()
+                .with_part_size(4)
+                .with_part_checksum_algorithm(PartChecksumAlgorithm::Md5)
+                .with_verify_remote_etag(true)
+                .with_max_attempts(1)
+                .with_jitter_ratio(0.0),
+        );
+
+        let mut checkpoint = ResumableUploadCheckpoint::new("upload-1", 4);
+        checkpoint.checksum_algorithm = Some(PartChecksumAlgorithm::Md5);
+        checkpoint.completed_parts.insert(
+            1,
+            UploadedPart {
+                part_number: 1,
+                etag: "stale-etag".to_owned(),
+                size: 4,
+                checksum: Some(PartChecksumAlgorithm::Md5.compute_hex(b"abcd")),
+            },
+        );
+
+        let mut reader = std::io::Cursor::new(b"abcdefgh".to_vec());
+        let error = uploader
+            .resume(&backend, &mut reader, checkpoint)
+            .expect_err("failed reupload should return repairable checkpoint");
+
+        match error {
+            ResumableUploadError::PartUploadFailed {
+                part_number,
+                attempts,
+                checkpoint,
+                ..
+            } => {
+                assert_eq!(part_number, 1);
+                assert_eq!(attempts, 1);
+                assert!(
+                    !checkpoint.completed_parts.contains_key(&1),
+                    "stale checkpoint part must not be returned after failed reupload"
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
     fn blocking_resume_normalizes_checkpoint_part_numbers_before_completion() {
         let backend = BlockingMockBackend::default();
         let uploader = BlockingResumableUploader::new(
@@ -2307,6 +2409,17 @@ mod tests {
             let backoff = options.backoff_for_retry(4);
             assert!(backoff <= Duration::from_millis(80));
         }
+    }
+
+    #[test]
+    fn resumable_upload_backoff_preserves_sub_millisecond_durations() {
+        let options = ResumableUploadOptions::new()
+            .with_base_backoff(Duration::from_micros(500))
+            .with_max_backoff(Duration::from_micros(900))
+            .with_jitter_ratio(0.0);
+
+        assert_eq!(options.backoff_for_retry(1), Duration::from_micros(500));
+        assert_eq!(options.backoff_for_retry(2), Duration::from_micros(900));
     }
 
     #[test]
