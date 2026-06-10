@@ -1,8 +1,18 @@
+## [0.1.41] - 2026-06-10
+
+### 🐛 Bug Fixes
+
+- Harden HTTP transport edge cases
+- Correct response hooks and otel error spans
 ## [0.1.40] - 2026-06-03
 
 ### 🐛 Bug Fixes
 
 - *(tls)* Reject invalid custom root CAs
+
+### ⚙️ Miscellaneous Tasks
+
+- Release reqx version 0.1.40
 ## [0.1.39] - 2026-05-26
 
 ### 🚀 Features
